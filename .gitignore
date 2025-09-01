@@ -1,0 +1,21 @@
+# Ignorar dependências
+node_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build
+dist/
+build/
+
+# Expo / React Native cache
+.expo/
+.expo-shared/
+.expo/*
+*.expo
+
+# Config do sistema
+.DS_Store
+Thumbs.db

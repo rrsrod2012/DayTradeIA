@@ -1,0 +1,99 @@
+// SQLite
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// NOTE: SQLite connector (Prisma) não dá suporte a Json nem enums nativos.
+// Usamos strings para representar enums e string para params (JSON serializado).
+
+model Instrument {
+  id           Int      @id @default(autoincrement())
+  symbol       String   @unique
+  name         String
+  candles      Candle[]
+  trades       Trade[]
+  backtests    BacktestRun[]
+}
+
+model Candle {
+  id            Int        @id @default(autoincrement())
+  instrument    Instrument @relation(fields: [instrumentId], references: [id])
+  instrumentId  Int
+  timeframe     String     // 'M1' | 'M5' | 'M15' | 'M30' | 'H1'
+  time          DateTime
+  open          Float
+  high          Float
+  low           Float
+  close         Float
+  volume        Float
+  indicators    IndicatorValue[]
+  patterns      Pattern[]
+  signals       Signal[]
+
+  @@unique([instrumentId, timeframe, time])
+}
+
+model IndicatorValue {
+  id        Int      @id @default(autoincrement())
+  candle    Candle   @relation(fields: [candleId], references: [id])
+  candleId  Int
+  key       String
+  value     Float
+}
+
+model Pattern {
+  id        Int      @id @default(autoincrement())
+  candle    Candle   @relation(fields: [candleId], references: [id])
+  candleId  Int
+  type      String   // ex.: 'DOJI' | 'HAMMER' | ...
+  strength  Float
+}
+
+model Signal {
+  id          Int      @id @default(autoincrement())
+  candle      Candle   @relation(fields: [candleId], references: [id])
+  candleId    Int
+  signalType  String   // 'ENTRY' | 'EXIT'
+  side        String   // 'BUY' | 'SELL' | 'FLAT'
+  score       Float
+  reason      String
+
+  // back relations for Trade
+  entryOf     Trade[]  @relation("EntrySignal")
+  exitOf      Trade[]  @relation("ExitSignal")
+}
+
+model Trade {
+  id             Int        @id @default(autoincrement())
+  instrument     Instrument @relation(fields: [instrumentId], references: [id])
+  instrumentId   Int
+  timeframe      String     // 'M1' | 'M5' | ...
+  entrySignal    Signal     @relation("EntrySignal", fields: [entrySignalId], references: [id])
+  entrySignalId  Int
+  exitSignal     Signal?    @relation("ExitSignal", fields: [exitSignalId], references: [id])
+  exitSignalId   Int?
+  qty            Int
+  entryPrice     Float
+  exitPrice      Float?
+  pnlPoints      Float?
+  pnlMoney       Float?
+  backtestRun    BacktestRun? @relation(fields: [backtestRunId], references: [id])
+  backtestRunId  Int?
+}
+
+model BacktestRun {
+  id           Int        @id @default(autoincrement())
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  instrumentId Int
+  timeframe    String
+  startedAt    DateTime   @default(now())
+  finishedAt   DateTime?
+  params       String     // JSON serializado
+  trades       Trade[]
+  totalPnL     Float?
+}
