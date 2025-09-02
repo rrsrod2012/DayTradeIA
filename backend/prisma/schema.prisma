@@ -58,14 +58,17 @@ model Signal {
   id          Int      @id @default(autoincrement())
   candle      Candle   @relation(fields: [candleId], references: [id])
   candleId    Int
-  signalType  String   // 'ENTRY' | 'EXIT'
+  signalType  String   // 'ENTRY' | 'EXIT' | 'EMA_CROSS' ...
   side        String   // 'BUY' | 'SELL' | 'FLAT'
-  score       Float
-  reason      String
+  score       Float?   // opcional para evitar erro no create/update
+  reason      String?  // opcional (o worker nem sempre envia)
 
   // back relations for Trade
   entryOf     Trade[]  @relation("EntrySignal")
   exitOf      Trade[]  @relation("ExitSignal")
+
+  @@index([candleId])
+  @@unique([candleId, signalType, side], name: "candleId_signalType_side")
 }
 
 model Trade {

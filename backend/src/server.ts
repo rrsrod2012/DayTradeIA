@@ -4,11 +4,14 @@ import { createServer } from "http";
 import routes from "./routes";
 import adminRoutes from "./routesAdmin";
 import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
-import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
+import {
+  bootConfirmedSignalsWorker,
+  backfillSignals,
+} from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
 import logger from "./logger";
 
-// ==== deps extras para o /api/backtest inline ====
+// ==== deps extras para o /api/backtest ====
 import { prisma } from "./prisma";
 import { DateTime } from "luxon";
 
@@ -24,6 +27,7 @@ app.use((req, _res, next) => {
 
 // =================== Utils locais (para /api/backtest) ===================
 const ZONE = "America/Sao_Paulo";
+const SERVER_VERSION = "server:v4-backtest-m1-signals-bucket+backfill";
 
 function toUtcRange(from?: string, to?: string): { gte?: Date; lte?: Date } {
   const out: { gte?: Date; lte?: Date } = {};
@@ -41,11 +45,73 @@ function toUtcRange(from?: string, to?: string): { gte?: Date; lte?: Date } {
   if (to) out.lte = parse(to, true)!;
   return out;
 }
-
 const toLocalDateStr = (d: Date) =>
   DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd");
 
-// =================== Lógica compartilhada do Backtest ===================
+function tfToMinutes(tf: string): number {
+  const s = String(tf || "").toUpperCase();
+  if (s.startsWith("M")) return parseInt(s.slice(1), 10) || 1;
+  if (s.startsWith("H")) return (parseInt(s.slice(1), 10) || 1) * 60;
+  if (s === "D1" || s === "D") return 24 * 60;
+  return 1;
+}
+function bucketStartUTC(d: Date, tfMin: number): number {
+  const y = d.getUTCFullYear(),
+    m = d.getUTCMonth(),
+    day = d.getUTCDate(),
+    H = d.getUTCHours(),
+    M = d.getUTCMinutes();
+  const bucketMin = Math.floor(M / tfMin) * tfMin;
+  return Date.UTC(y, m, day, H, bucketMin, 0, 0);
+}
+type RawCandle = {
+  id?: number;
+  time: Date;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number | null;
+};
+function aggregateFromM1(base: RawCandle[], tf: string): RawCandle[] {
+  const tfMin = tfToMinutes(tf);
+  if (tfMin <= 1) return base.slice();
+  const map = new Map<number, RawCandle>();
+  for (const c of base) {
+    const b = bucketStartUTC(c.time, tfMin);
+    const prev = map.get(b);
+    if (!prev) {
+      map.set(b, {
+        time: new Date(b),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume ?? null,
+      });
+    } else {
+      prev.high = Math.max(prev.high, c.high);
+      prev.low = Math.min(prev.low, c.low);
+      prev.close = c.close;
+      if (prev.volume != null || c.volume != null)
+        prev.volume = (prev.volume ?? 0) + (c.volume ?? 0);
+    }
+  }
+  const out = Array.from(map.values());
+  out.sort((a, b) => a.time.getTime() - b.time.getTime());
+  return out;
+}
+function lowerBound(arr: number[], x: number) {
+  let lo = 0,
+    hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 type Side = "BUY" | "SELL";
 interface Trade {
   entryIdx: number;
@@ -66,7 +132,7 @@ async function handleBacktest(params: any) {
     to: _to,
     dateFrom,
     dateTo,
-    exitMode = "opposite", // "opposite" | "bars"
+    exitMode = "opposite",
     barsHold = 3,
     initialCapital = 0,
     limit = 0,
@@ -74,39 +140,87 @@ async function handleBacktest(params: any) {
 
   const from = _from ?? dateFrom;
   const to = _to ?? dateTo;
-
-  const barsHoldNum = Math.max(1, Number(barsHold) || 3);
+  const barsHoldNum = Number(barsHold) || 3;
   const initialCap = Number(initialCapital) || 0;
+  const pointValue = Number(process.env.CONTRACT_POINT_VALUE || 1);
+  const tf = String(timeframe).toUpperCase();
+  const tfMin = tfToMinutes(tf);
 
   const range = toUtcRange(
     from as string | undefined,
     to as string | undefined
   );
 
-  // 1) Carrega candles
   const candleWhere: any = {
     instrument: { is: { symbol: String(symbol).toUpperCase() } },
-    timeframe: String(timeframe).toUpperCase(),
+    timeframe: tf,
     ...(range.gte || range.lte ? { time: range } : {}),
   };
 
-  const candles = await prisma.candle.findMany({
+  let candles: RawCandle[] = await prisma.candle.findMany({
     where: candleWhere,
     orderBy: { time: "asc" },
     take:
       Number(limit) > 0 && !(range.gte || range.lte)
         ? Number(limit)
         : undefined,
-    select: { id: true, time: true, close: true },
+    select: {
+      id: true,
+      time: true,
+      open: true,
+      high: true,
+      low: true,
+      close: true,
+    },
   });
 
-  logger.info(`[BACKTEST] Candles carregados: ${candles.length}`);
+  if (candles.length === 0 && tf !== "M1") {
+    const baseM1 = await prisma.candle.findMany({
+      where: {
+        instrument: { is: { symbol: String(symbol).toUpperCase() } },
+        timeframe: "M1",
+        ...(range.gte || range.lte ? { time: range } : {}),
+      },
+      orderBy: { time: "asc" },
+      select: { time: true, open: true, high: true, low: true, close: true },
+    });
+
+    logger.info("[BACKTEST] Fallback M1→TF", {
+      symbol,
+      timeframe: tf,
+      baseM1: baseM1.length,
+      version: SERVER_VERSION,
+    });
+
+    if (baseM1.length) {
+      candles = aggregateFromM1(
+        baseM1.map((c) => ({
+          time: c.time,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        })),
+        tf
+      );
+    }
+  }
+
+  logger.info(`[BACKTEST] Candles carregados: ${candles.length}`, {
+    version: SERVER_VERSION,
+    symbol,
+    timeframe: tf,
+    first: candles[0]?.time?.toISOString?.() ?? null,
+    last: candles[candles.length - 1]?.time?.toISOString?.() ?? null,
+  });
 
   if (candles.length === 0) {
     return {
+      pnlPoints: 0,
+      pnlMoney: 0,
       params: {
         symbol,
-        timeframe,
+        timeframe: tf,
         from,
         to,
         exitMode,
@@ -125,19 +239,23 @@ async function handleBacktest(params: any) {
       equityCurve: [],
       trades: [],
       note: "Sem candles no período informado.",
+      version: SERVER_VERSION,
     };
   }
 
+  const times = candles.map((c) => c.time.getTime());
+  const closes = candles.map((c) => c.close);
   const candleIndexById = new Map<string | number, number>();
-  candles.forEach((c, i) => candleIndexById.set(c.id as any, i));
+  candles.forEach((c, i) => {
+    if (c.id != null) candleIndexById.set(c.id as any, i);
+  });
 
-  // 2) Carrega sinais confirmados
-  const signals = await prisma.signal.findMany({
+  const signalsTF = await prisma.signal.findMany({
     where: {
       candle: {
         is: {
           instrument: { is: { symbol: String(symbol).toUpperCase() } },
-          timeframe: String(timeframe).toUpperCase(),
+          timeframe: tf,
           ...(range.gte || range.lte ? { time: range } : {}),
         },
       },
@@ -146,13 +264,110 @@ async function handleBacktest(params: any) {
     orderBy: { candle: { time: "asc" } },
   });
 
-  logger.info(`[BACKTEST] Sinais carregados: ${signals.length}`);
+  logger.info(`[BACKTEST] Sinais carregados: ${signalsTF.length}`, {
+    version: SERVER_VERSION,
+  });
 
-  if (signals.length === 0) {
+  type Sig = { idx: number; side: Side };
+  let sList: Sig[] = [];
+
+  if (signalsTF.length > 0) {
+    sList = signalsTF.map((s) => {
+      let idx = candleIndexById.get(s.candleId as any);
+      if (idx === undefined) {
+        const t = s.candle!.time.getTime();
+        idx = Math.min(lowerBound(times, t), times.length - 1);
+      }
+      return { idx, side: (s.side as Side) || "BUY" };
+    });
+  } else if (tf !== "M1") {
+    const signalsM1 = await prisma.signal.findMany({
+      where: {
+        candle: {
+          is: {
+            instrument: { is: { symbol: String(symbol).toUpperCase() } },
+            timeframe: "M1",
+            ...(range.gte || range.lte ? { time: range } : {}),
+          },
+        },
+      },
+      include: { candle: true },
+      orderBy: { candle: { time: "asc" } },
+    });
+
+    if (signalsM1.length > 0) {
+      const tfMin = tfToMinutes(tf);
+      const bucketLast = new Map<number, { side: Side; when: number }>();
+      for (const s of signalsM1) {
+        const t = s.candle!.time;
+        const b = bucketStartUTC(t, tfMin);
+        const prev = bucketLast.get(b);
+        const tMs = t.getTime();
+        const side = (s.side as Side) || "BUY";
+        if (!prev || tMs >= prev.when) bucketLast.set(b, { side, when: tMs });
+      }
+      const buckets = Array.from(bucketLast.entries()).sort(
+        (a, b) => a[0] - b[0]
+      );
+      for (const [b, info] of buckets) {
+        const idx = Math.min(lowerBound(times, b), times.length - 1);
+        sList.push({ idx, side: info.side });
+      }
+      const compact: Sig[] = [];
+      for (const s of sList.sort((a, b) => a.idx - b.idx)) {
+        const last = compact[compact.length - 1];
+        if (!last || last.idx !== s.idx || last.side !== s.side)
+          compact.push(s);
+      }
+      sList = compact;
+      logger.info("[BACKTEST] Usando sinais confirmados M1 agregados", {
+        count: sList.length,
+        timeframe: tf,
+        version: SERVER_VERSION,
+      });
+    }
+  }
+
+  if (sList.length === 0) {
+    const ema = (arr: number[], p: number) => {
+      if (p <= 1) return arr.slice();
+      const k = 2 / (p + 1);
+      const out: number[] = [];
+      let prev = arr[0] ?? 0;
+      out.push(prev);
+      for (let i = 1; i < arr.length; i++) {
+        const cur = arr[i] * k + prev * (1 - k);
+        out.push(cur);
+        prev = cur;
+      }
+      return out;
+    };
+    const f = ema(closes, 9);
+    const g = ema(closes, 21);
+    for (let i = 1; i < Math.min(f.length, g.length); i++) {
+      const prev = (f[i - 1] ?? 0) - (g[i - 1] ?? 0);
+      const cur = (f[i] ?? 0) - (g[i] ?? 0);
+      const side =
+        prev <= 0 && cur > 0 ? "BUY" : prev >= 0 && cur < 0 ? "SELL" : null;
+      if (!side) continue;
+      sList.push({ idx: i, side });
+    }
+    logger.info(
+      "[BACKTEST] Usando baseline EMA 9/21 (sem sinais confirmados)",
+      {
+        count: sList.length,
+        version: SERVER_VERSION,
+      }
+    );
+  }
+
+  if (sList.length === 0) {
     return {
+      pnlPoints: 0,
+      pnlMoney: 0,
       params: {
         symbol,
-        timeframe,
+        timeframe: tf,
         from,
         to,
         exitMode,
@@ -175,47 +390,37 @@ async function handleBacktest(params: any) {
         idx: i,
       })),
       trades: [],
-      note: "Sem sinais confirmados no período informado.",
+      note: "Sem sinais para backtest no período informado.",
+      version: SERVER_VERSION,
     };
   }
-
-  const sList = signals.map((s) => ({
-    side: (s.side as Side) || "BUY",
-    candleId: s.candleId as any,
-    time: s.candle!.time,
-  }));
 
   const trades: Trade[] = [];
   for (let i = 0; i < sList.length; i++) {
     const s = sList[i];
-    const entryIdx = candleIndexById.get(s.candleId);
-    if (entryIdx === undefined) continue;
+    const entryIdx = Math.max(0, Math.min(s.idx, candles.length - 1));
     const entryPrice = candles[entryIdx].close;
     const side = s.side;
 
     let exitIdx = -1;
     if (String(exitMode).toLowerCase() === "bars") {
+      exitIdx = Math.min(candles.length - 1, entryIdx + barsHoldNum);
+    } else {
+      let j = i + 1;
+      for (; j < sList.length; j++) {
+        if (sList[j].side !== side) break;
+      }
       exitIdx = Math.min(
         candles.length - 1,
-        entryIdx + (Number(barsHoldNum) || 3)
+        j < sList.length ? sList[j].idx : candles.length - 1
       );
-    } else {
-      // exitMode = "opposite"
-      for (let j = i + 1; j < sList.length; j++) {
-        if (sList[j].side !== side) {
-          const idx = candleIndexById.get(sList[j].candleId);
-          if (idx !== undefined) {
-            exitIdx = idx;
-            break;
-          }
-        }
-      }
-      if (exitIdx < 0) exitIdx = candles.length - 1;
     }
 
+    if (exitIdx <= entryIdx)
+      exitIdx = Math.min(entryIdx + 1, candles.length - 1);
     const exitPrice = candles[exitIdx].close;
-    const dir = side === "BUY" ? 1 : -1;
-    const pnl = (exitPrice - entryPrice) * dir;
+    const pnl =
+      side === "BUY" ? exitPrice - entryPrice : entryPrice - exitPrice;
 
     trades.push({
       entryIdx,
@@ -225,37 +430,21 @@ async function handleBacktest(params: any) {
       side,
       entryPrice,
       exitPrice,
-      pnl,
+      pnl: Number(pnl.toFixed(2)),
     });
   }
 
-  // 4) Equity curve e métricas
-  const equityCurve: {
-    time: string;
-    date: string;
-    equity: number;
-    idx: number;
-  }[] = [];
-  let equity = initialCap;
-
-  const closePnLByIdx = new Map<number, number>();
-  trades.forEach((t) => {
-    const prev = closePnLByIdx.get(t.exitIdx) || 0;
-    closePnLByIdx.set(t.exitIdx, prev + t.pnl);
-  });
-
-  for (let i = 0; i < candles.length; i++) {
-    if (closePnLByIdx.has(i)) {
-      equity += closePnLByIdx.get(i)!;
-    }
-    const c = candles[i];
-    equityCurve.push({
+  const equityCurve = trades.map((t, k) => {
+    const equity =
+      trades.slice(0, k + 1).reduce((a, b) => a + b.pnl, 0) + initialCap;
+    const c = candles[Math.min(candles.length - 1, Math.max(0, t.exitIdx))];
+    return {
       time: c.time.toISOString(),
       date: toLocalDateStr(c.time),
-      equity,
-      idx: i,
-    });
-  }
+      equity: Number(equity.toFixed(2)),
+      idx: t.exitIdx,
+    };
+  });
 
   const totalTrades = trades.length;
   const wins = trades.filter((t) => t.pnl > 0).length;
@@ -274,13 +463,17 @@ async function handleBacktest(params: any) {
   const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
 
   return {
+    pnlPoints: Number(totalPnl.toFixed(2)),
+    pnlMoney: Number(
+      (totalPnl * Number(process.env.CONTRACT_POINT_VALUE || 1)).toFixed(2)
+    ),
     params: {
       symbol,
-      timeframe,
+      timeframe: tf,
       from,
       to,
       exitMode,
-      barsHold: Number(barsHoldNum),
+      barsHold: barsHoldNum,
       initialCapital: initialCap,
     },
     summary: {
@@ -294,13 +487,16 @@ async function handleBacktest(params: any) {
     },
     equityCurve,
     trades,
+    version: SERVER_VERSION,
   };
 }
 
 // =================== ENDPOINTS INLINE PARA EVITAR 404 ===================
-// GET compatível (mantido)
 app.get("/api/backtest", async (req, res) => {
-  logger.info("[BACKTEST] GET /api/backtest acionado", { query: req.query });
+  logger.info("[BACKTEST] GET /api/backtest acionado", {
+    query: req.query,
+    version: SERVER_VERSION,
+  });
   try {
     const data = await handleBacktest(req.query || {});
     return res.json(data);
@@ -312,11 +508,13 @@ app.get("/api/backtest", async (req, res) => {
   }
 });
 
-// NOVO: POST compatível com o Dashboard
 app.post("/api/backtest", async (req, res) => {
-  logger.info("[BACKTEST] POST /api/backtest acionado", { body: req.body });
+  logger.info("[BACKTEST] POST /api/backtest acionado", {
+    body: req.body,
+    version: SERVER_VERSION,
+  });
   try {
-    const payload = { ...(req.query || {}), ...(req.body || {}) }; // aceita params no body e/ou query
+    const payload = { ...(req.query || {}), ...(req.body || {}) };
     const data = await handleBacktest(payload);
     return res.json(data);
   } catch (err: any) {
@@ -327,19 +525,53 @@ app.post("/api/backtest", async (req, res) => {
   }
 });
 
+// =================== ADMIN: Backfill de sinais confirmados ===================
+app.post("/admin/signals/backfill", async (req, res) => {
+  const { symbol, timeframe, from, to, emaFast, emaSlow } = req.body || {};
+  logger.info("[ADMIN] POST /admin/signals/backfill", {
+    symbol,
+    timeframe,
+    from,
+    to,
+    emaFast,
+    emaSlow,
+  });
+
+  if (!symbol || !timeframe) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "symbol e timeframe são obrigatórios" });
+  }
+  try {
+    const result = await backfillSignals({
+      symbol,
+      timeframe,
+      from,
+      to,
+      emaFast,
+      emaSlow,
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err: any) {
+    logger.error("[ADMIN][backfill] Erro", { error: err?.message || err });
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
 // =================== Montagem dos routers existentes ===================
 app.use("/api", routes);
 app.use("/admin", adminRoutes);
 
-const port = Number(process.env.PORT || 4000);
+// =================== Bootstraps/infra ===================
 const server = createServer(app);
+const PORT = Number(process.env.PORT || 4000);
 
-server.listen(port, () => {
-  logger.info({ msg: `API up on http://localhost:${port}` });
-  logger.info({
-    msg: "Endpoints prontos: GET/POST /api/backtest (inline), + rotas de /api/* via routes.ts",
+server.listen(PORT, () => {
+  logger.info(`[SERVER] ouvindo em http://localhost:${PORT}`, {
+    version: SERVER_VERSION,
   });
-
   try {
     bootCsvWatchersIfConfigured?.();
   } catch (e: any) {
@@ -347,7 +579,7 @@ server.listen(port, () => {
   }
 
   try {
-    bootConfirmedSignalsWorker?.(); // garante geração de sinais confirmados
+    bootConfirmedSignalsWorker?.();
   } catch (e: any) {
     logger.warn("[SignalsWorker] módulo não carregado", {
       err: e?.message || e,
@@ -355,7 +587,7 @@ server.listen(port, () => {
   }
 
   try {
-    setupWS?.(server); // streaming opcional para o CandleChart
+    setupWS?.(server);
   } catch (e: any) {
     logger.warn("[WS] módulo não iniciado", { err: e?.message || e });
   }
