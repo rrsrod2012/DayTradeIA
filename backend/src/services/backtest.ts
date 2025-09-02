@@ -1,60 +1,96 @@
-type Side = 'BUY'|'SELL'|'FLAT';
+// backend/src/services/backtest.ts
+export type Side = "BUY" | "SELL" | "FLAT";
 
 export type BacktestParams = {
-  qty?: number; slPoints?: number; tpPoints?: number; contractMultiplier?: number;
+  qty?: number;
+  slPoints?: number; // stop-loss (pts)
+  tpPoints?: number; // take-profit (pts)
+  contractMultiplier?: number; // R$ por ponto por contrato
 };
 
-export function runBacktest(ohlc: {o:number;h:number;l:number;c:number;}[], signals: {idx:number; side:Side}[], params: BacktestParams = {}) {
+/**
+ * Backtest minimalista:
+ * - Entra quando e9 cruza e21 (fora deste arquivo, você pode gerar um vetor "signals" com { idx, side }).
+ * - Stop e alvo fixos em pontos.
+ * - Fecha e reverte na próxima entrada contrária.
+ */
+export function runBacktest(
+  ohlc: { o: number[]; h: number[]; l: number[]; c: number[] },
+  signals: { idx: number; side: Side }[],
+  params: BacktestParams = {}
+) {
   const qty = params.qty ?? 1;
   const mult = params.contractMultiplier ?? 0.2;
   const sl = params.slPoints ?? 200;
   const tp = params.tpPoints ?? 300;
 
-  let position: Side = Side.FLAT;
-  let entryPrice = 0; let pnlMoney = 0; let pnlPoints = 0;
-  const trades: { entryIdx:number; exitIdx:number; side:Side; entry:number; exit:number; points:number; money:number }[] = [];
+  let position: Side = "FLAT";
+  let entryPrice = 0;
+  let pnlMoney = 0;
+  let pnlPoints = 0;
+
+  const trades: {
+    entryIdx: number;
+    exitIdx: number;
+    side: Side;
+    entry: number;
+    exit: number;
+    points: number;
+    money: number;
+  }[] = [];
 
   for (const s of signals) {
-    const price = ohlc[s.idx].c;
-    if (s.side === Side.BUY && position === Side.FLAT) {
-      position = Side.BUY; entryPrice = price;
-    } else if (s.side === Side.SELL && position === Side.FLAT) {
-      position = Side.SELL; entryPrice = price;
-    } else if (s.side === Side.FLAT && position !== Side.FLAT) {
-      const points = position === Side.BUY ? price - entryPrice : entryPrice - price;
-      const money = points * mult * qty;
-      pnlPoints += points; pnlMoney += money;
-      trades.push({ entryIdx: s.idx, exitIdx: s.idx, side: position, entry: entryPrice, exit: price, points, money });
-      position = Side.FLAT;
-    }
-
-    const { h, l } = ohlc[s.idx];
-    if (position !== Side.FLAT) {
-      if (position === Side.BUY) {
-        if (h - entryPrice >= tp) {
-          const exit = entryPrice + tp; const money = tp * mult * qty;
-          pnlPoints += tp; pnlMoney += money;
-          trades.push({ entryIdx: s.idx, exitIdx: s.idx, side: position, entry: entryPrice, exit, points: tp, money });
-          position = Side.FLAT;
-        } else if (entryPrice - l >= sl) {
-          const exit = entryPrice - sl; const money = -sl * mult * qty;
-          pnlPoints -= sl; pnlMoney += money;
-          trades.push({ entryIdx: s.idx, exitIdx: s.idx, side: position, entry: entryPrice, exit, points: -sl, money });
-          position = Side.FLAT;
+    const i = s.idx;
+    // Fecha posição atual antes de abrir outra
+    if (position !== "FLAT") {
+      // Stop/TP intrabar (simplificado): usa H/L da barra de entrada
+      if (position === "BUY") {
+        const tpHit = ohlc.h[i] >= entryPrice + tp;
+        const slHit = ohlc.l[i] <= entryPrice - sl;
+        if (tpHit || slHit) {
+          const exit = tpHit ? entryPrice + tp : entryPrice - sl;
+          const pts = tpHit ? tp : -sl;
+          const money = pts * mult * qty;
+          pnlPoints += pts;
+          pnlMoney += money;
+          trades.push({
+            entryIdx: i,
+            exitIdx: i,
+            side: position,
+            entry: entryPrice,
+            exit,
+            points: pts,
+            money,
+          });
+          position = "FLAT";
         }
-      } else {
-        if (entryPrice - l >= tp) {
-          const exit = entryPrice - tp; const money = tp * mult * qty;
-          pnlPoints += tp; pnlMoney += money;
-          trades.push({ entryIdx: s.idx, exitIdx: s.idx, side: position, entry: entryPrice, exit, points: tp, money });
-          position = Side.FLAT;
-        } else if (h - entryPrice >= sl) {
-          const exit = entryPrice + sl; const money = -sl * mult * qty;
-          pnlPoints -= sl; pnlMoney += money;
-          trades.push({ entryIdx: s.idx, exitIdx: s.idx, side: position, entry: entryPrice, exit, points: -sl, money });
-          position = Side.FLAT;
+      } else if (position === "SELL") {
+        const tpHit = ohlc.l[i] <= entryPrice - tp;
+        const slHit = ohlc.h[i] >= entryPrice + sl;
+        if (tpHit || slHit) {
+          const exit = tpHit ? entryPrice - tp : entryPrice + sl;
+          const pts = tpHit ? tp : -sl;
+          const money = pts * mult * qty;
+          pnlPoints += pts;
+          pnlMoney += money;
+          trades.push({
+            entryIdx: i,
+            exitIdx: i,
+            side: position,
+            entry: entryPrice,
+            exit,
+            points: pts,
+            money,
+          });
+          position = "FLAT";
         }
       }
+    }
+
+    // Abre nova posição (se estiver FLAT)
+    if (position === "FLAT" && (s.side === "BUY" || s.side === "SELL")) {
+      position = s.side;
+      entryPrice = ohlc.c[i];
     }
   }
 

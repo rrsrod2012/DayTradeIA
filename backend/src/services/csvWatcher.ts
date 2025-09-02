@@ -1,539 +1,524 @@
-import fs from "fs";
-import path from "path";
+// backend/src/services/csvWatcher.ts (v7 — watcher resiliente + fix ENOENT + anti-duplicatas sem skipDuplicates)
+// Novidades desta versão:
+// - Continua observando o **diretório** (evita ENOENT) e faz heartbeat periódico.
+// - Logs enxutos (sem payload enorme).
+// - Lê tudo do .env.
+// - **Anti-duplicatas robusto** para Prisma antigo:
+//   1) Tenta createMany com skipDuplicates (quando suportado).
+//   2) Se não suportar, tenta createMany **sem** skipDuplicates.
+//   3) Se der **Unique constraint failed**, cai em fallback por registro
+//      (create individual com **ignore de P2002**), com **concorrência limitada**.
+//      Assim não estoura e não imprime o array de dados inteiro.
+
 import chokidar from "chokidar";
+import { promises as fs } from "fs";
+import path from "path";
+import { DateTime } from "luxon";
 import { prisma } from "../prisma";
 import logger from "../logger";
+import dotenv from "dotenv";
 
-// ------------------------------------------------------------
-// Tipos de configuração
-// ------------------------------------------------------------
+dotenv.config();
+
 type WatchCfg = {
-  filePath: string;
-  symbol: string;
-  timeframe?: string; // ex: "M1" (default MT_TIMEFRAME)
-  delimiter?: string; // ex: "," ";" "\t" "|" (default MT_DELIMITER)
-  header?: string; // ex: "Time,Open,High,Low,Close,Volume" (default MT_HEADER)
-  tzOffset?: string; // ex: "-03:00" (default MT_TZ_OFFSET)
+  filePath: string; // caminho completo do arquivo alvo
+  symbol: string; // ex.: WIN, WDO
+  timeframe?: string; // ex.: M1, M5
+  delimiter?: string; // força "," ou ";"; se omitido, autodetecta
+  header?: string; // ex.: time,o,h,l,c,v (opcional)
+  tzOffset?: string; // "-03:00" ou "America/Sao_Paulo"
 };
 
-// Defaults vindos do .env
-const DEF_TF = (process.env.MT_TIMEFRAME || "M5").toUpperCase();
-const DEF_DELIM = process.env.MT_DELIMITER || ",";
-const DEF_HEADER = process.env.MT_HEADER || "Time,Open,High,Low,Close,Volume";
-const DEF_TZ = process.env.MT_TZ_OFFSET || "-03:00";
-
-// ------------------------------------------------------------
-// Utilitários
-// ------------------------------------------------------------
-
-// Normaliza números (aceita "143.210,50" e "143210.50")
-function parseNum(s: string): number {
-  if (s == null) return NaN;
-  let t = String(s).trim();
-  // remove espaços
-  t = t.replace(/\s+/g, "");
-  // se houver vírgula decimal e ponto milhar (ex: 1.234,56)
-  if (/[.,]/.test(t)) {
-    const lastComma = t.lastIndexOf(",");
-    const lastDot = t.lastIndexOf(".");
-    if (lastComma > lastDot) {
-      // vírgula é decimal -> remove pontos
-      t = t.replace(/\./g, "").replace(",", ".");
-    }
+// ==================== Carrega configuração de watchers ====================
+const ENV_JSON = (() => {
+  try {
+    const raw = process.env.MT_CSV_WATCHERS?.trim();
+    return raw ? (JSON.parse(raw) as WatchCfg[]) : [];
+  } catch {
+    return [];
   }
-  return Number(t);
+})();
+
+const FALLBACK_SINGLE: WatchCfg[] = process.env.MT_CSV_PATH
+  ? [
+      {
+        filePath: process.env.MT_CSV_PATH!,
+        symbol: (process.env.MT_SYMBOL || "WIN").toUpperCase(),
+        timeframe: (process.env.MT_TIMEFRAME || "M5").toUpperCase(),
+        delimiter: process.env.MT_DELIMITER || undefined,
+        header: process.env.MT_HEADER || undefined,
+        tzOffset: process.env.MT_TZ_OFFSET || "-03:00",
+      },
+    ]
+  : [];
+
+const WATCHERS: WatchCfg[] = (ENV_JSON.length ? ENV_JSON : FALLBACK_SINGLE).map(
+  (w) => ({
+    ...w,
+    symbol: (w.symbol || "WIN").toUpperCase(),
+    timeframe: (w.timeframe || "M5").toUpperCase(),
+    delimiter: w.delimiter || undefined,
+    header: w.header || undefined,
+    tzOffset: w.tzOffset || "-03:00",
+  })
+);
+
+// ==================== .env (com defaults seguros) ====================
+const LOG_SAMPLES = process.env.MT_CSV_LOG_SAMPLES === "1";
+const MAX_SAMPLES = Math.max(1, Number(process.env.MT_CSV_MAX_SAMPLES || 5));
+const USE_POLLING = process.env.CHOKIDAR_USEPOLLING === "1";
+const POLL_INTERVAL = Math.max(
+  250,
+  Number(process.env.CHOKIDAR_INTERVAL || 1000)
+);
+const HEARTBEAT_SECONDS = Math.max(
+  10,
+  Number(process.env.MT_HEARTBEAT_SEC || 45)
+);
+const MIN_INTERVAL_MS = Math.max(
+  500,
+  Number(process.env.MT_MIN_INTERVAL_MS || 4000)
+); // debounce entre imports
+const BATCH_SIZE = Math.max(200, Number(process.env.MT_CSV_BATCH_SIZE || 1000));
+const PRISMA_UPSERT_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.PRISMA_UPSERT_CONCURRENCY || 16)
+);
+const PRISMA_DEDUPE = process.env.PRISMA_SKIP_DUPLICATES !== "0"; // tenta usar skipDuplicates se possível
+
+// ==================== Utilitários CSV ====================
+function guessDelimiterFromHeader(headerLine: string): "," | ";" {
+  const commas = (headerLine.match(/,/g) || []).length;
+  const semis = (headerLine.match(/;/g) || []).length;
+  return semis > commas ? ";" : ",";
 }
 
-// Aceita:
-// - "2025-08-27 09:00:00"
-// - "2025.09.01 14:07"
-// - "2025-08-27T12:00:00Z"
-// - epoch (ms)
-// Retorna Date em UTC.
-function parseTimeToUTC(s: string, tzOffset: string): Date | null {
-  if (!s) return null;
-  const raw = String(s).trim();
-  // epoch ms?
-  if (/^\d{10,}$/.test(raw)) {
-    const ms = Number(raw.length === 10 ? Number(raw) * 1000 : Number(raw));
-    return new Date(ms);
-  }
-  // troca "." por "-" em datas com ponto (formato MetaTrader)
-  let norm = raw.replace(/\./g, "-");
-
-  // adereçar "YYYY-MM-DD HH:mm" ou "YYYY-MM-DD HH:mm:ss"
-  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(norm)) {
-    // aplica offset manual: cria como se fosse "local" naquele offset
-    // e converte para UTC subtraindo o offset.
-    // tzOffset exemplo "-03:00"
-    const m = tzOffset.match(/^([+-])(\d{2}):(\d{2})$/);
-    let offsetMin = 0;
-    if (m) {
-      const sign = m[1] === "-" ? -1 : 1;
-      offsetMin = sign * (Number(m[2]) * 60 + Number(m[3]));
-    }
-    const [datePart, timePart] = norm.split(/\s+/);
-    const [Y, M, D] = datePart.split("-").map(Number);
-    const [h, mi, s = "00"] = timePart.split(":").map(Number);
-    // cria em UTC e depois subtrai offset para cair na hora correta UTC
-    const dt = new Date(Date.UTC(Y, M - 1, D, h, mi, s));
-    // tzOffset -03:00 -> precisamos somar 3h para virar UTC
-    dt.setUTCMinutes(dt.getUTCMinutes() - offsetMin);
-    return dt;
-  }
-
-  // ISO já com Z
-  if (/Z$/.test(norm)) return new Date(norm);
-
-  // Tenta Date direto
-  const d = new Date(norm);
-  if (!isNaN(d.getTime())) return d;
-
-  return null;
-}
-
-function detectDelimiter(sample: string[]): string {
-  const candidates = [",", ";", "\t", "|"];
-  let best = DEF_DELIM;
-  let bestCount = 0;
-  for (const delim of candidates) {
-    const counts = sample.map(
-      (line) => (line.match(new RegExp(`\\${delim}`, "g")) || []).length
-    );
-    const sum = counts.reduce((a, b) => a + b, 0);
-    if (sum > bestCount) {
-      bestCount = sum;
-      best = delim;
-    }
-  }
-  return best;
-}
-
-function normalizeHeader(h: string): {
-  time: string;
-  o: string;
-  h: string;
-  l: string;
-  c: string;
-  v: string;
-} {
-  // aceita "Time,Open,High,Low,Close,Volume" e "time,o,h,l,c,v"
-  const raw = h.split(/[;,|\t]/).map((x) => x.trim());
-  if (raw.length >= 6) {
-    const lower = raw.map((x) => x.toLowerCase());
-    // tenta mapear variações
-    const timeIdx = lower.findIndex((x) => x === "time");
-    const openIdx = lower.findIndex((x) => x === "open" || x === "o");
-    const highIdx = lower.findIndex((x) => x === "high" || x === "h");
-    const lowIdx = lower.findIndex((x) => x === "low" || x === "l");
-    const closeIdx = lower.findIndex((x) => x === "close" || x === "c");
-    const volIdx = lower.findIndex((x) => x === "volume" || x === "v");
-
-    if (
-      timeIdx >= 0 &&
-      openIdx >= 0 &&
-      highIdx >= 0 &&
-      lowIdx >= 0 &&
-      closeIdx >= 0 &&
-      volIdx >= 0
-    ) {
-      return {
-        time: raw[timeIdx],
-        o: raw[openIdx],
-        h: raw[highIdx],
-        l: raw[lowIdx],
-        c: raw[closeIdx],
-        v: raw[volIdx],
-      } as any;
-    }
-  }
-  // fallback para apelidos
-  return { time: "time", o: "o", h: "h", l: "l", c: "c", v: "v" } as any;
-}
-
-async function getOrCreateInstrumentId(symbol: string): Promise<number> {
-  const s = symbol.toUpperCase();
-  let ins = await prisma.instrument.findUnique({ where: { symbol: s } });
-  if (!ins) {
-    ins = await prisma.instrument.create({
-      data: { symbol: s, name: s },
-    });
-  }
-  return ins.id;
-}
-
-// ------------------------------------------------------------
-// Agregação de M1 -> M5 / M15
-// ------------------------------------------------------------
-function floorToBucket(date: Date, minutes: number): Date {
-  const d = new Date(date);
-  const mm = d.getUTCMinutes();
-  const floored = mm - (mm % minutes);
-  d.setUTCMinutes(floored, 0, 0);
-  return d;
-}
-
-type CandleRow = {
-  time: Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
-
-async function aggregateFromM1(instrumentId: number, targetTf: "M5" | "M15") {
-  const bucketSize = targetTf === "M5" ? 5 : 15;
-
-  // Busca último agregado para fazer CDC incremental
-  const lastAgg = await prisma.candle.findFirst({
-    where: { instrumentId, timeframe: targetTf },
-    orderBy: { time: "desc" },
-    select: { time: true },
-  });
-
-  const whereM1: any = { instrumentId, timeframe: "M1" };
-  if (lastAgg?.time) {
-    // para evitar perder borda, traga 1h antes
-    const back = new Date(lastAgg.time.getTime() - 60 * 60 * 1000);
-    whereM1.time = { gte: back };
-  }
-
-  const m1 = await prisma.candle.findMany({
-    where: whereM1,
-    orderBy: { time: "asc" },
-    select: {
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-    },
-  });
-  if (!m1.length) return { upserts: 0 };
-
-  // Agrupa em buckets
-  const byBucket = new Map<number, CandleRow[]>();
-  for (const c of m1) {
-    const bucket = floorToBucket(c.time, bucketSize).getTime();
-    if (!byBucket.has(bucket)) byBucket.set(bucket, []);
-    byBucket.get(bucket)!.push({
-      time: c.time,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      volume: c.volume,
-    });
-  }
-
-  let upserts = 0;
-  const ops: any[] = [];
-
-  for (const [bucketMs, rows] of byBucket) {
-    if (!rows.length) continue;
-    // garante ordenação
-    rows.sort((a, b) => a.time.getTime() - b.time.getTime());
-    const time = new Date(bucketMs);
-    const open = rows[0].open;
-    const close = rows[rows.length - 1].close;
-    const high = Math.max(...rows.map((r) => r.high));
-    const low = Math.min(...rows.map((r) => r.low));
-    const volume = rows.reduce((s, r) => s + (r.volume || 0), 0);
-
-    ops.push(
-      prisma.candle.upsert({
-        where: {
-          instrumentId_timeframe_time: {
-            instrumentId,
-            timeframe: targetTf,
-            time,
-          },
-        },
-        update: { open, high, low, close, volume },
-        create: {
-          instrumentId,
-          timeframe: targetTf,
-          time,
-          open,
-          high,
-          low,
-          close,
-          volume,
-        },
-        select: { id: true },
-      })
-    );
-  }
-
-  if (ops.length) {
-    await prisma.$transaction(ops, { timeout: 30000 });
-    upserts = ops.length;
-  }
-  return { upserts };
-}
-
-// ------------------------------------------------------------
-// Importação CSV (pode ser chamada pelo watcher ou manual)
-// ------------------------------------------------------------
-export async function importCsvFile(cfg: WatchCfg) {
-  const filePath = cfg.filePath;
-  const symbol = cfg.symbol.toUpperCase();
-  const timeframe = (cfg.timeframe || DEF_TF).toUpperCase();
-  let delimiter = cfg.delimiter || DEF_DELIM;
-  const headerCfg = cfg.header || DEF_HEADER;
-  const tzOffset = cfg.tzOffset || DEF_TZ;
-
-  if (!fs.existsSync(filePath)) {
-    logger.warn(`[CSVWatcher] arquivo não encontrado: ${filePath}`);
-    return;
-  }
-
-  const instrumentId = await getOrCreateInstrumentId(symbol);
-
-  // Lê as linhas brutas
-  const rawText = fs.readFileSync(filePath, "utf8");
-  let lines = rawText.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (!lines.length) {
-    logger.warn(`[CSVWatcher] ${path.basename(filePath)}: arquivo vazio`);
-    return;
-  }
-
-  // Detecta delimitador (amostra)
-  const sample = lines.slice(0, Math.min(lines.length, 10));
-  const detected = detectDelimiter(sample);
-  if (detected !== delimiter) {
-    logger.info(
-      `[CSVWatcher] ${path.basename(
-        filePath
-      )}: delimitador auto-detectado "${detected}" (preferido era "${delimiter}")`
-    );
-    delimiter = detected;
-  }
-
-  // Header: se a 1ª linha contiver header, usamos; caso contrário usamos headerCfg.
-  let headerLine = lines[0];
-  let hasHeader = /time|Time/.test(headerLine);
-  let dataLines = hasHeader ? lines.slice(1) : lines.slice(0); // sem header no arquivo
-  const headerNorm = hasHeader ? headerLine : headerCfg;
-  const header = normalizeHeader(headerNorm);
-
-  logger.info(
-    `[CSVWatcher] ${path.basename(
-      filePath
-    )}: header usado = ${headerNorm}, registros = ${dataLines.length}`
+function normalizeHeaderTokens(tokens: string[]) {
+  const map: Record<string, string> = {
+    time: "time",
+    datetime: "time",
+    date: "time",
+    timestamp: "time",
+    open: "o",
+    o: "o",
+    high: "h",
+    h: "h",
+    low: "l",
+    l: "l",
+    close: "c",
+    c: "c",
+    volume: "v",
+    vol: "v",
+    v: "v",
+    qty: "v",
+    quantidade: "v",
+  };
+  return tokens.map(
+    (x) => map[x.trim().toLowerCase()] ?? x.trim().toLowerCase()
   );
+}
 
-  if (!dataLines.length) {
+function normalizeHeader(line: string, delim: "," | ";") {
+  const toks = line.split(delim).map((s) => s.trim());
+  return normalizeHeaderTokens(toks).join(",");
+}
+
+const DATE_FORMATS = [
+  "yyyy-LL-dd HH:mm:ss",
+  "yyyy-LL-dd HH:mm",
+  "yyyy-LL-dd'T'HH:mm:ss",
+  "yyyy-LL-dd'T'HH:mm",
+  "dd/LL/yyyy HH:mm:ss",
+  "dd/LL/yyyy HH:mm",
+  "dd/LL/yyyy",
+  "yyyy-LL-dd",
+  "yyyy.MM.dd HH:mm:ss",
+  "yyyy.MM.dd HH:mm",
+  "dd.MM.yyyy HH:mm:ss",
+  "dd.MM.yyyy HH:mm",
+];
+
+function parseTimeToISO(s: string, tzOffset?: string) {
+  let dt: DateTime | null = null;
+  for (const f of DATE_FORMATS) {
+    const candidate = DateTime.fromFormat(s, f);
+    if (candidate.isValid) {
+      dt = candidate;
+      break;
+    }
+  }
+  if (!dt) {
+    const iso = DateTime.fromISO(s);
+    if (iso.isValid) dt = iso;
+  }
+  if (!dt || !dt.isValid) return null;
+
+  const off = (tzOffset || "-03:00").trim();
+  const tz = /^([+-]\d{2}):?(\d{2})$/.test(off)
+    ? `UTC${off}`
+    : off.startsWith("UTC")
+    ? off
+    : off === "America/Sao_Paulo"
+    ? "America/Sao_Paulo"
+    : `UTC${off}`;
+
+  const withZone = dt.setZone(tz as any, { keepLocalTime: true });
+  if (!withZone.isValid) return null;
+  return withZone.toUTC().toISO();
+}
+
+function parseNum(s: string) {
+  const t = s.replace(/\./g, "").replace(",", ".");
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+async function ensureInstrumentId(symbol: string) {
+  const up = await prisma.instrument.upsert({
+    where: { symbol },
+    update: {},
+    create: { symbol, name: symbol },
+  });
+  return up.id;
+}
+
+// ==================== Importação ====================
+
+type CsvRow = {
+  time: string;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+};
+
+async function parseCsvFile(cfg: WatchCfg): Promise<CsvRow[]> {
+  const raw = await fs.readFile(cfg.filePath, "utf8");
+  const lines = raw.split(/\r?\n/).filter((ln) => ln.trim().length > 0);
+  if (lines.length < 2) return [];
+
+  const detected: "," | ";" =
+    cfg.delimiter === ";" || cfg.delimiter === ","
+      ? (cfg.delimiter as any)
+      : guessDelimiterFromHeader(lines[0]);
+
+  const headerLine = cfg.header ? cfg.header : lines[0];
+  const headerNorm = normalizeHeader(headerLine, detected);
+  const cols = headerNorm.split(",");
+  const idx = {
+    time: cols.indexOf("time"),
+    o: cols.indexOf("o"),
+    h: cols.indexOf("h"),
+    l: cols.indexOf("l"),
+    c: cols.indexOf("c"),
+    v: cols.indexOf("v"),
+  };
+  if (Object.values(idx).some((i) => i < 0)) {
     logger.warn(
-      `[CSVWatcher] ${path.basename(
-        filePath
-      )}: nenhum registro parseado (delim="${delimiter}")`
+      `[CSVWatcher] Cabeçalho inesperado: "${headerLine}" (detected ${detected})`
     );
-    return;
+    return [];
   }
 
-  // Parse linhas para objetos (aceita colunas longas ou curtas)
-  type RawRec = { [k: string]: string };
-  const records: {
-    time: Date;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-  }[] = [];
+  const out: CsvRow[] = [];
+  let badTime = 0,
+    badNum = 0;
+  const badSamples: string[] = [];
+  const dataStart = cfg.header ? 0 : 1;
 
-  for (const ln of dataLines) {
-    const parts = ln.split(delimiter);
-    if (parts.length < 6) continue;
+  for (let li = dataStart; li < lines.length; li++) {
+    const parts = lines[li].split(detected).map((s) => s.trim());
+    if (!parts.length || parts.length < cols.length) continue;
 
-    // tenta localizar índices conforme header
-    const cols = hasHeader
-      ? headerNorm.split(delimiter).map((s) => s.trim())
-      : headerCfg.split(/[;,|\t]/).map((s) => s.trim());
-    const lower = cols.map((c) => c.toLowerCase());
-
-    function getVal(key: string, alias: string[]) {
-      let idx = lower.findIndex((x) => x === key || alias.includes(x));
-      if (idx === -1) {
-        // fallback ao formato curto time,o,h,l,c,v
-        const shortIdx = ["time", "o", "h", "l", "c", "v"].indexOf(key);
-        idx = shortIdx >= 0 && shortIdx < parts.length ? shortIdx : -1;
-      }
-      return idx >= 0 ? parts[idx] : undefined;
-    }
-
-    const tStr = getVal("time", []);
-    const oStr = getVal("open", ["o"]);
-    const hStr = getVal("high", ["h"]);
-    const lStr = getVal("low", ["l"]);
-    const cStr = getVal("close", ["c"]);
-    const vStr = getVal("volume", ["v"]);
-
-    const t = tStr ? parseTimeToUTC(tStr, tzOffset) : null;
-    const o = parseNum(oStr || "");
-    const h = parseNum(hStr || "");
-    const l = parseNum(lStr || "");
-    const c = parseNum(cStr || "");
-    const v = parseNum(vStr || "");
-
-    if (!t || isNaN(o) || isNaN(h) || isNaN(l) || isNaN(c) || isNaN(v)) {
+    const iso = parseTimeToISO(parts[idx.time], cfg.tzOffset || "-03:00");
+    if (!iso) {
+      badTime++;
+      if (LOG_SAMPLES && badSamples.length < MAX_SAMPLES)
+        badSamples.push(`L${li + 1}:${parts[idx.time]}`);
       continue;
     }
-    records.push({ time: t, open: o, high: h, low: l, close: c, volume: v });
+
+    const o = parseNum(parts[idx.o]);
+    const h = parseNum(parts[idx.h]);
+    const l = parseNum(parts[idx.l]);
+    const c = parseNum(parts[idx.c]);
+    const v = parseNum(parts[idx.v]);
+    if ([o, h, l, c, v].some((n) => Number.isNaN(n))) {
+      badNum++;
+      continue;
+    }
+
+    out.push({ time: iso, o, h, l, c, v });
   }
 
-  if (!records.length) {
+  if (badTime || badNum) {
     logger.warn(
       `[CSVWatcher] ${path.basename(
-        filePath
-      )}: nenhum registro válido após parse`
+        cfg.filePath
+      )}: descartadas ${badTime} datas inválidas e ${badNum} valores numéricos inválidos.`
     );
-    return;
+    if (LOG_SAMPLES && badSamples.length)
+      logger.warn(
+        `[CSVWatcher] amostras (limit ${MAX_SAMPLES}): ${badSamples.join("; ")}`
+      );
   }
 
-  // Muitos CSV do MT vêm ordenados do último para o primeiro -> reordena ASC (mais antigo -> mais novo)
-  records.sort((a, b) => a.time.getTime() - b.time.getTime());
+  out.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  return out;
+}
 
-  // Upserts em transação (batch)
-  const ops: any[] = [];
-  for (const r of records) {
-    ops.push(
-      prisma.candle.upsert({
-        where: {
-          instrumentId_timeframe_time: {
+// ============== Inserção com dedupe (fallback por registro) ==============
+
+async function createManyWithFallback(
+  rows: CsvRow[],
+  instrumentId: number,
+  timeframe: string
+) {
+  // Primeiro tenta createMany com/sem skipDuplicates
+  try {
+    await prisma.candle.createMany({
+      data: rows.map((r) => ({
+        instrumentId,
+        timeframe,
+        time: new Date(r.time),
+        open: r.o,
+        high: r.h,
+        low: r.l,
+        close: r.c,
+        volume: r.v,
+      })),
+      ...(PRISMA_DEDUPE ? { skipDuplicates: true as any } : {}),
+    } as any);
+    return { inserted: rows.length, dedupFallback: false };
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/Unknown argument `skipDuplicates`/i.test(msg)) {
+      // Tenta novamente sem skipDuplicates (algumas versões antigas aceitam createMany puro)
+      try {
+        await prisma.candle.createMany({
+          data: rows.map((r) => ({
             instrumentId,
             timeframe,
-            time: r.time,
+            time: new Date(r.time),
+            open: r.o,
+            high: r.h,
+            low: r.l,
+            close: r.c,
+            volume: r.v,
+          })),
+        });
+        return { inserted: rows.length, dedupFallback: false };
+      } catch (e2: any) {
+        // Se mesmo assim houver violação de única, cai no fallback individual
+        if (/Unique constraint failed/i.test(String(e2?.message || e2))) {
+          const res = await createIndividuallyIgnoringDuplicates(
+            rows,
+            instrumentId,
+            timeframe
+          );
+          return { ...res, dedupFallback: true };
+        }
+        logger.error(
+          `[CSVWatcher] createMany falhou sem skipDuplicates: ${String(
+            e2?.message || e2
+          )}`
+        );
+        throw e2;
+      }
+    }
+    if (/Unique constraint failed/i.test(msg)) {
+      const res = await createIndividuallyIgnoringDuplicates(
+        rows,
+        instrumentId,
+        timeframe
+      );
+      return { ...res, dedupFallback: true };
+    }
+    logger.error(`[CSVWatcher] createMany falhou: ${msg}`);
+    throw e;
+  }
+}
+
+async function createIndividuallyIgnoringDuplicates(
+  rows: CsvRow[],
+  instrumentId: number,
+  timeframe: string
+) {
+  // Insere um a um, ignorando P2002 (duplicado) — com concorrência limitada
+  let ok = 0,
+    dup = 0,
+    fail = 0;
+  const limit = PRISMA_UPSERT_CONCURRENCY;
+  let i = 0;
+  async function worker() {
+    while (i < rows.length) {
+      const idx = i++;
+      const r = rows[idx];
+      try {
+        await prisma.candle.create({
+          data: {
+            instrumentId,
+            timeframe,
+            time: new Date(r.time),
+            open: r.o,
+            high: r.h,
+            low: r.l,
+            close: r.c,
+            volume: r.v,
           },
-        },
-        update: {
-          open: r.open,
-          high: r.high,
-          low: r.low,
-          close: r.close,
-          volume: r.volume,
-        },
-        create: {
-          instrumentId,
-          timeframe,
-          time: r.time,
-          open: r.open,
-          high: r.high,
-          low: r.low,
-          close: r.close,
-          volume: r.volume,
-        },
-        select: { id: true },
-      })
+        });
+        ok++;
+      } catch (e: any) {
+        // P2002 = Unique constraint failed
+        if (
+          String(e?.code) === "P2002" ||
+          /Unique constraint failed/i.test(String(e?.message || e))
+        ) {
+          dup++;
+        } else {
+          fail++;
+          logger.error(
+            `[CSVWatcher] create(individual) falhou: ${String(e?.message || e)}`
+          );
+        }
+      }
+    }
+  }
+  const workers = Array.from({ length: limit }, () => worker());
+  await Promise.all(workers);
+  if (dup)
+    logger.warn(`[CSVWatcher] ${dup} registros já existiam (ignorados).`);
+  return { inserted: ok, duplicates: dup, failed: fail };
+}
+
+async function insertCandles(
+  rows: CsvRow[],
+  instrumentId: number,
+  timeframe: string
+) {
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const slice = rows.slice(i, i + BATCH_SIZE);
+    const { inserted, duplicates } = await createManyWithFallback(
+      slice,
+      instrumentId,
+      timeframe
     );
-  }
-
-  // executa em lotes para não estourar a transação
-  const chunkSize = 500;
-  let upserts = 0;
-  for (let i = 0; i < ops.length; i += chunkSize) {
-    const slice = ops.slice(i, i + chunkSize);
-    const res = await prisma.$transaction(slice, { timeout: 60000 });
-    upserts += res.length;
-  }
-
-  logger.info(
-    `[CSVWatcher] ${path.basename(
-      filePath
-    )}: upserts=${upserts} (timeframe=${timeframe})`
-  );
-
-  // Agregação automática M1 -> M5/M15, se este arquivo é de M1
-  if (timeframe === "M1") {
-    const a5 = await aggregateFromM1(instrumentId, "M5");
-    const a15 = await aggregateFromM1(instrumentId, "M15");
     logger.info(
-      `[CSVWatcher] agregação: M5 upserts=${a5.upserts}, M15 upserts=${a15.upserts} (symbol=${symbol})`
+      `[CSVWatcher] lote processado: ${inserted} inseridos${
+        duplicates ? `, ${duplicates} duplicados` : ""
+      }`
     );
   }
 }
 
-// ------------------------------------------------------------
-// Boot do watcher a partir do MT_CSV_WATCHERS (JSON)
-// ------------------------------------------------------------
-export function bootCsvWatchersIfConfigured() {
-  let watchers: WatchCfg[] = [];
+// ==================== Ciclo de importação ====================
+
+type FileState = { mtimeMs: number; size: number; lastRun: number };
+const fileStates = new Map<string, FileState>();
+const missingWarned = new Set<string>(); // evita flood de ENOENT
+
+async function importIfChanged(cfg: WatchCfg) {
   try {
-    const raw = process.env.MT_CSV_WATCHERS || "[]";
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) {
-      watchers = arr as WatchCfg[];
+    const st = await fs.stat(cfg.filePath);
+    const prev = fileStates.get(cfg.filePath);
+    const now = Date.now();
+    if (prev && now - prev.lastRun < MIN_INTERVAL_MS) return; // debounce
+    if (!prev || prev.mtimeMs !== st.mtimeMs || prev.size !== st.size) {
+      const rows = await parseCsvFile(cfg);
+      if (rows.length) {
+        const instrumentId = await ensureInstrumentId(cfg.symbol);
+        const timeframe = cfg.timeframe || "M5";
+        await insertCandles(rows, instrumentId, timeframe);
+        logger.info(
+          `[CSVWatcher] importados ${rows.length} candles de ${path.basename(
+            cfg.filePath
+          )} (${cfg.symbol}/${timeframe})`
+        );
+      }
+      fileStates.set(cfg.filePath, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        lastRun: now,
+      });
     }
-  } catch (e) {
+    // se conseguiu stat, zera o aviso de ausente
+    missingWarned.delete(cfg.filePath);
+  } catch (e: any) {
+    if ((e as any)?.code === "ENOENT") {
+      if (!missingWarned.has(cfg.filePath)) {
+        missingWarned.add(cfg.filePath);
+        logger.warn(`[CSVWatcher] aguardando arquivo: ${cfg.filePath}`);
+      }
+      return;
+    }
     logger.warn(
-      "[CSVWatcher] MT_CSV_WATCHERS inválido (esperado JSON de objetos)."
+      `[CSVWatcher] importIfChanged falhou para ${cfg.filePath}: ${String(
+        e?.message || e
+      )}`
     );
-    watchers = [];
   }
+}
 
-  if (!watchers.length) {
-    logger.info(
-      "[CSVWatcher] nenhum watcher configurado (MT_CSV_WATCHERS vazio)."
+function watchOne(cfg: WatchCfg) {
+  const abs = path.resolve(cfg.filePath);
+  const dir = path.dirname(abs);
+  const base = path.basename(abs);
+
+  // Observa o DIRETÓRIO; filtra pelo nome do arquivo.
+  const watcher = chokidar.watch(dir, {
+    persistent: true,
+    ignoreInitial: false,
+    awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 200 },
+    usePolling: USE_POLLING,
+    interval: POLL_INTERVAL,
+    binaryInterval: POLL_INTERVAL,
+    ignorePermissionErrors: true,
+    depth: 0,
+  });
+
+  const onChange = async (changedPath: string) => {
+    if (path.basename(changedPath) !== base) return;
+    await importIfChanged({ ...cfg, filePath: path.join(dir, base) });
+  };
+
+  watcher
+    .on("add", onChange)
+    .on("change", onChange)
+    .on("unlink", (p) => {
+      if (path.basename(p) === base) missingWarned.add(abs);
+    })
+    .on("error", (e) => logger.error(`[CSVWatcher] erro no watcher: ${e}`))
+    .on("ready", () =>
+      logger.info(
+        `[CSVWatcher] pronto para ${base} em ${dir} (polling=${
+          USE_POLLING ? "on" : "off"
+        })`
+      )
     );
-    return;
-  }
 
-  logger.info(
-    "[CSVWatcher] Inicializando " + watchers.length + " watcher(s)..."
+  // Heartbeat (fallback): rescan periódico do arquivo alvo
+  const interval = setInterval(
+    () => importIfChanged({ ...cfg, filePath: path.join(dir, base) }),
+    HEARTBEAT_SECONDS * 1000
   );
 
-  for (const w of watchers) {
-    const filePath = w.filePath;
-    if (!filePath) continue;
+  // Primeira passada (se já existir)
+  importIfChanged({ ...cfg, filePath: path.join(dir, base) });
 
-    const dir = path.dirname(filePath);
-    const file = path.basename(filePath);
+  return () => {
+    clearInterval(interval);
+    watcher.close();
+  };
+}
 
-    logger.info(`[CSVWatcher] Watching dir: ${dir}\\ (file=${file})`);
-    logger.info(
-      `[CSVWatcher] Symbol=${w.symbol} Timeframe=${
-        w.timeframe || DEF_TF
-      } Delim="${w.delimiter || DEF_DELIM}" HeaderCfg="${
-        w.header || DEF_HEADER
-      }"`
-    );
-    logger.info(
-      `[CSVWatcher] options: usePolling=true interval=1000 awaitWriteFinish(stability=750, poll=200)`
-    );
-
-    const watcher = chokidar.watch(dir, {
-      persistent: true,
-      ignoreInitial: false,
-      usePolling: true,
-      interval: 1000,
-      awaitWriteFinish: { stabilityThreshold: 750, pollInterval: 200 },
-      depth: 0,
-    });
-
-    const handle = async (changedPath: string) => {
-      if (path.basename(changedPath) !== file) return;
-      try {
-        await importCsvFile(w);
-      } catch (err: any) {
-        logger.error("[CSVWatcher] erro ao importar", {
-          err: err?.message || err,
-        });
-      }
-    };
-
-    watcher.on("add", handle);
-    watcher.on("change", handle);
-
-    // Import inicial (se o arquivo já existe)
-    if (fs.existsSync(filePath)) {
-      importCsvFile(w).catch((err) =>
-        logger.error("[CSVWatcher] erro import inicial", {
-          err: err?.message || err,
-        })
-      );
-    }
+export function bootCsvWatchersIfConfigured() {
+  if (!WATCHERS.length) {
+    logger.info(`[CSVWatcher] módulo não configurado.`);
+    return;
   }
+  logger.info(`[CSVWatcher] Inicializando ${WATCHERS.length} watcher(s)...`);
+  const stops: Array<() => void> = [];
+  for (const cfg of WATCHERS) stops.push(watchOne(cfg));
+  return () => stops.forEach((s) => s());
 }

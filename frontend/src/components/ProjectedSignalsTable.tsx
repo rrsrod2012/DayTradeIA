@@ -1,258 +1,175 @@
-import React from "react";
-import {
-  Table,
-  Badge,
-  OverlayTrigger,
-  Tooltip,
-  ProgressBar,
-} from "react-bootstrap";
+import React, { useMemo } from "react";
+import { Table, Badge } from "react-bootstrap";
 
-type Projected = {
-  side: "BUY" | "SELL" | "FLAT";
-  suggestedEntry: number;
-  conditionText: string;
-  validCandles: number;
-  expiresAt?: string;
-  rationale: string;
-  stopSuggestion?: number;
-  takeProfitSuggestion?: number;
-  score?: number;
-  probHit?: number;
-  probCalibrated?: number;
-  expectedValuePoints?: number;
-  volatilityAtr?: number;
-  bbWidthNow?: number;
-  probModel?: number;
-  partialTake?: boolean;
-  trailAtr?: number | null;
-  timeoutCandles?: number | null;
-  hiQ20?: number;
-  hiQ50?: number;
-  hiQ80?: number;
-  loQ20?: number;
-  loQ50?: number;
-  loQ80?: number;
-  transitionRisk?: number;
-  meta?: {
-    trendBias: "UP" | "DOWN" | "SIDEWAYS";
-    volZ?: number;
-    todWindow?: string;
-    vwapNow?: number;
-    bbPercent?: number;
-    bucketKey?: string;
-  };
+type Item = {
+  time?: string | null; // ISO
+  date?: string | null; // yyyy-LL-dd
+  side?: "BUY" | "SELL" | "FLAT" | string | null;
+  suggestedEntry?: number | null;
+  stopSuggestion?: number | null;
+  takeProfitSuggestion?: number | null;
+  conditionText?: string | null;
+  score?: number | null;
+  probHit?: number | null;
+  probCalibrated?: number | null;
+  expectedValuePoints?: number | null;
 };
 
-type Props = { items: Projected[] };
+type Visible = {
+  date?: boolean;
+  time?: boolean;
+  side?: boolean;
+  entry?: boolean;
+  stop?: boolean;
+  take?: boolean;
+  cond?: boolean;
+  score?: boolean;
+  prob?: boolean;
+  ev?: boolean;
+};
 
-export default function ProjectedSignalsTable({ items }: Props) {
-  const fmt = (v?: number) =>
-    v !== undefined && v !== null && isFinite(v)
-      ? Math.round(v).toString()
-      : "—";
-  const fmt1 = (v?: number) =>
-    v !== undefined && v !== null && isFinite(v) ? v.toFixed(1) : "—";
-  const fmt2 = (v?: number, p = 2) =>
-    v !== undefined && v !== null && isFinite(v) ? v.toFixed(p) : "—";
-  const fmtDate = (iso?: string) => {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mm = String(d.getMinutes()).padStart(2, "0");
-    return `${hh}:${mm}`;
+type Props = { items?: Item[]; visibleCols?: Visible };
+
+function SideBadge({ side }: { side?: string | null }) {
+  const s = String(side || "").toUpperCase();
+  const variant =
+    s === "BUY" ? "success" : s === "SELL" ? "danger" : "secondary";
+  return <Badge bg={variant}>{s || "-"}</Badge>;
+}
+
+export default function ProjectedSignalsTable({
+  items = [],
+  visibleCols,
+}: Props) {
+  const v = {
+    date: true,
+    time: true,
+    side: true,
+    entry: true,
+    stop: true,
+    take: true,
+    cond: true,
+    score: true,
+    prob: true,
+    ev: true,
+    ...(visibleCols || {}),
   };
-  const pct = (v?: number) =>
-    v === undefined || v === null ? "—" : `${Math.round(v * 100)}%`;
-  const pctRange = (lo?: number, hi?: number) =>
-    lo === undefined || lo === null || hi === undefined || hi === null
-      ? "—"
-      : `${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
 
-  const semaphore = (prob?: number, ev?: number) => {
-    const p = prob ?? 0;
-    const e = ev ?? 0;
-    if (p >= 0.55 && e > 0) return <Badge bg="success">OK</Badge>;
-    if (p >= 0.5 && e >= -5)
-      return (
-        <Badge bg="warning" text="dark">
-          Médio
-        </Badge>
-      );
-    return <Badge bg="danger">Ruim</Badge>;
-  };
+  const rows = useMemo(() => {
+    const safe = Array.isArray(items) ? items : [];
+    return safe
+      .map((s) => ({
+        time: s?.time ?? null,
+        date: s?.date ?? null,
+        side: s?.side ?? "-",
+        suggestedEntry: Number.isFinite(s?.suggestedEntry as number)
+          ? (s!.suggestedEntry as number)
+          : null,
+        stopSuggestion: Number.isFinite(s?.stopSuggestion as number)
+          ? (s!.stopSuggestion as number)
+          : null,
+        takeProfitSuggestion: Number.isFinite(s?.takeProfitSuggestion as number)
+          ? (s!.takeProfitSuggestion as number)
+          : null,
+        conditionText: s?.conditionText ?? null,
+        score: Number.isFinite(s?.score as number)
+          ? (s!.score as number)
+          : null,
+        prob: Number.isFinite((s?.probCalibrated ?? s?.probHit) as number)
+          ? ((s!.probCalibrated ?? s!.probHit) as number)
+          : null,
+        ev: Number.isFinite(s?.expectedValuePoints as number)
+          ? (s!.expectedValuePoints as number)
+          : null,
+      }))
+      .sort((a, b) => {
+        const ta = a.time ? new Date(a.time).getTime() : 0;
+        const tb = b.time ? new Date(b.time).getTime() : 0;
+        return ta - tb;
+      });
+  }, [items]);
 
-  const riskBar = (r?: number) => {
-    const v = Math.max(0, Math.min(1, r ?? 0));
-    const now = Math.round(v * 100);
-    const variant = v < 0.33 ? "success" : v < 0.66 ? "warning" : "danger";
+  if (!rows.length) {
     return (
-      <OverlayTrigger overlay={<Tooltip>Risco de transição: {now}%</Tooltip>}>
-        <div>
-          <ProgressBar
-            now={now}
-            variant={variant}
-            style={{ minWidth: 80, height: 8 }}
-          />
-        </div>
-      </OverlayTrigger>
+      <div className="text-muted" style={{ fontSize: 14 }}>
+        Nenhuma projeção no período.
+      </div>
     );
-  };
-
-  const iconPartial = (flag?: boolean) =>
-    flag ? (
-      <Badge bg="info" text="dark">
-        ½
-      </Badge>
-    ) : (
-      <span className="text-muted">—</span>
-    );
-
-  const iconTrail = (atrMult?: number | null) =>
-    atrMult && atrMult > 0 ? (
-      <OverlayTrigger overlay={<Tooltip>Trailing ATR × {atrMult}</Tooltip>}>
-        <Badge bg="secondary">TRAIL</Badge>
-      </OverlayTrigger>
-    ) : (
-      <span className="text-muted">—</span>
-    );
-
-  const iconTimeout = (t?: number | null) =>
-    t && t > 0 ? (
-      <OverlayTrigger overlay={<Tooltip>Time-out: {t} cdl</Tooltip>}>
-        <Badge bg="dark">T/O</Badge>
-      </OverlayTrigger>
-    ) : (
-      <span className="text-muted">—</span>
-    );
+  }
 
   return (
-    <Table striped bordered hover size="sm" responsive>
-      <thead>
-        <tr>
-          <th>Dir</th>
-          <th>Entrada</th>
-          <th>Stop</th>
-          <th>Alvo</th>
-          <th>Prob</th>
-          <th>Prob (modelo)</th>
-          <th>EV (pts)</th>
-          <th>ATR</th>
-          <th>BBWidth</th>
-          <th>Regime</th>
-          <th>VWAP</th>
-          <th>%b</th>
-          <th>TTE</th>
-          <th>Expira</th>
-          <th>Score</th>
-          <th>Transição</th>
-          <th>Alta fut. q20/50/80</th>
-          <th>Baixa fut. q20/50/80</th>
-          <th>Parcial</th>
-          <th>Trail</th>
-          <th>Timeout</th>
-          <th>Condição</th>
-        </tr>
-      </thead>
-      <tbody>
-        {items.map((it, i) => {
-          const dir =
-            it.side === "BUY" ? (
-              <Badge bg="success">BUY</Badge>
-            ) : it.side === "SELL" ? (
-              <Badge bg="danger">SELL</Badge>
-            ) : (
-              <Badge bg="secondary">FLAT</Badge>
-            );
-
-          const cond = (
-            <OverlayTrigger overlay={<Tooltip>{it.rationale}</Tooltip>}>
-              <span style={{ cursor: "help" }}>{it.conditionText}</span>
-            </OverlayTrigger>
-          );
-
-          const probShown = it.probCalibrated ?? it.probHit;
-          const sem = semaphore(probShown, it.expectedValuePoints);
-          const hiTriplet = `${fmt1(it.hiQ20)} / ${fmt1(it.hiQ50)} / ${fmt1(
-            it.hiQ80
-          )}`;
-          const loTriplet = `${fmt1(it.loQ20)} / ${fmt1(it.loQ50)} / ${fmt1(
-            it.loQ80
-          )}`;
-
-          return (
-            <tr key={i}>
-              <td>{dir}</td>
-              <td>{fmt(it.suggestedEntry)}</td>
-              <td>{fmt(it.stopSuggestion)}</td>
-              <td>{fmt(it.takeProfitSuggestion)}</td>
-              <td>
-                <div className="d-flex gap-2 align-items-center">
-                  <b>{pct(probShown)}</b> {sem}
-                </div>
-              </td>
-              <td>{pct(it.probModel)}</td>
-              <td
-                className={
-                  Number(it.expectedValuePoints) > 0
-                    ? "text-success"
-                    : "text-danger"
-                }
-              >
-                {fmt2(it.expectedValuePoints, 1)}
-              </td>
-              <td>{fmt2(it.volatilityAtr, 0)}</td>
-              <td>{fmt2(it.bbWidthNow, 3)}</td>
-              <td>
-                <Badge bg="info" text="dark">
-                  {it.meta?.trendBias ?? "—"}
-                </Badge>{" "}
-                {it.meta?.todWindow && (
-                  <Badge bg="secondary">{it.meta.todWindow}</Badge>
-                )}
-              </td>
-              <td>{fmt1(it.meta?.vwapNow)}</td>
-              <td>{fmt2(it.meta?.bbPercent, 2)}</td>
-              <td>{it.validCandles} cdl</td>
-              <td>{fmtDate(it.expiresAt)}</td>
-              <td>{fmt2(it.score)}</td>
-              <td>{riskBar(it.transitionRisk)}</td>
-              <td>
-                <OverlayTrigger
-                  overlay={
-                    <Tooltip>
-                      Quantis de alcance de HIGH nos próximos candles
-                    </Tooltip>
-                  }
-                >
-                  <span>{hiTriplet}</span>
-                </OverlayTrigger>
-              </td>
-              <td>
-                <OverlayTrigger
-                  overlay={
-                    <Tooltip>
-                      Quantis de alcance de LOW nos próximos candles
-                    </Tooltip>
-                  }
-                >
-                  <span>{loTriplet}</span>
-                </OverlayTrigger>
-              </td>
-              <td className="text-center">{iconPartial(it.partialTake)}</td>
-              <td className="text-center">{iconTrail(it.trailAtr)}</td>
-              <td className="text-center">{iconTimeout(it.timeoutCandles)}</td>
-              <td style={{ minWidth: 260, maxWidth: 420 }}>{cond}</td>
-            </tr>
-          );
-        })}
-        {items.length === 0 && (
+    <div style={{ overflowX: "auto" }}>
+      <Table striped bordered hover size="sm">
+        <thead>
           <tr>
-            <td colSpan={22} className="text-center text-muted">
-              Nenhuma condição projetada encontrada para os filtros atuais.
-            </td>
+            {v.date && <th>Data</th>}
+            {v.time && <th>Hora</th>}
+            {v.side && <th>Side</th>}
+            {v.entry && <th>Entrada</th>}
+            {v.stop && <th>Stop</th>}
+            {v.take && <th>Alvo</th>}
+            {v.cond && <th>Condição</th>}
+            {v.score && <th>Score</th>}
+            {v.prob && <th>Prob.</th>}
+            {v.ev && <th>EV (pts)</th>}
           </tr>
-        )}
-      </tbody>
-    </Table>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              {v.date && (
+                <td>
+                  {r.date ??
+                    (r.time ? new Date(r.time).toLocaleDateString() : "-")}
+                </td>
+              )}
+              {v.time && (
+                <td>
+                  {r.time
+                    ? new Date(r.time).toLocaleTimeString().slice(0, 5)
+                    : "-"}
+                </td>
+              )}
+              {v.side && (
+                <td>
+                  <SideBadge side={r.side} />
+                </td>
+              )}
+              {v.entry && <td>{r.suggestedEntry ?? "-"}</td>}
+              {v.stop && <td>{r.stopSuggestion ?? "-"}</td>}
+              {v.take && <td>{r.takeProfitSuggestion ?? "-"}</td>}
+              {v.cond && (
+                <td
+                  title={r.conditionText ?? ""}
+                  style={{
+                    maxWidth: 360,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {r.conditionText ?? "-"}
+                </td>
+              )}
+              {v.score && (
+                <td>
+                  {typeof r.score === "number" ? r.score.toFixed(2) : "-"}
+                </td>
+              )}
+              {v.prob && (
+                <td>
+                  {typeof r.prob === "number"
+                    ? `${(r.prob * 100).toFixed(1)}%`
+                    : "-"}
+                </td>
+              )}
+              {v.ev && (
+                <td>{typeof r.ev === "number" ? r.ev.toFixed(2) : "-"}</td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </div>
   );
 }

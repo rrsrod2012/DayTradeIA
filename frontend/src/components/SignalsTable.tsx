@@ -1,173 +1,145 @@
 import React, { useMemo } from "react";
 import { Table, Badge } from "react-bootstrap";
 
-type Candle = {
-  time: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
+type ConfirmedSignal = {
+  time?: string | null; // ISO
+  date?: string | null; // yyyy-LL-dd
+  signalType?: string | null;
+  side?: string | null; // BUY | SELL | ...
+  price?: number | null;
+  reason?: string | null;
+  score?: number | null;
 };
-type Signal = {
-  time: string;
-  signalType: "ENTRY" | "EXIT";
-  side: "BUY" | "SELL" | "FLAT";
-  price: number;
-  reason?: string;
-  score?: number;
+
+type Visible = {
+  date?: boolean;
+  time?: boolean;
+  side?: boolean;
+  type?: boolean;
+  price?: boolean;
+  score?: boolean;
+  reason?: boolean;
 };
 
 type Props = {
-  signals: Signal[];
-  candles: Candle[];
+  items?: ConfirmedSignal[];
+  visibleCols?: Visible; // opcional: quais colunas mostrar
 };
 
-// Busca índice do candle pela data/hora (ISO ou "YYYY-MM-DD HH:mm:ss")
-function findCandleIndex(candles: Candle[], iso: string) {
-  const t = iso.includes(" ") ? iso.replace(" ", "T") : iso;
-  const target = new Date(t).getTime();
-  for (let i = 0; i < candles.length; i++) {
-    const ct = new Date(
-      candles[i].time.includes(" ")
-        ? candles[i].time.replace(" ", "T")
-        : candles[i].time
-    ).getTime();
-    if (ct === target) return i;
+function formatTime(iso?: string | null) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "-";
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function SideBadge({ side }: { side?: string | null }) {
+  const s = String(side || "").toUpperCase();
+  const variant =
+    s === "BUY" ? "success" : s === "SELL" ? "danger" : "secondary";
+  return <Badge bg={variant}>{s || "-"}</Badge>;
+}
+
+export default function SignalsTable({ items = [], visibleCols }: Props) {
+  const v = {
+    date: true,
+    time: true,
+    side: true,
+    type: true,
+    price: true,
+    score: true,
+    reason: true,
+    ...(visibleCols || {}),
+  };
+
+  const rows = useMemo(() => {
+    const safe = Array.isArray(items) ? items : [];
+    return safe
+      .map((s) => ({
+        time: s?.time ?? null,
+        date: s?.date ?? null,
+        signalType: s?.signalType ?? "-",
+        side: s?.side ?? "-",
+        price:
+          typeof s?.price === "number" && isFinite(s.price as number)
+            ? (s.price as number)
+            : null,
+        reason: s?.reason ?? null,
+        score:
+          typeof s?.score === "number" && isFinite(s.score as number)
+            ? (s.score as number)
+            : null,
+      }))
+      .sort((a, b) => {
+        const ta = a.time ? new Date(a.time).getTime() : 0;
+        const tb = b.time ? new Date(b.time).getTime() : 0;
+        return ta - tb;
+      });
+  }, [items]);
+
+  if (!rows.length) {
+    return (
+      <div className="text-muted" style={{ fontSize: 14 }}>
+        Nenhum sinal no período.
+      </div>
+    );
   }
-  // fallback: aproxima pelo mais próximo <= target
-  let idx = -1;
-  for (let i = 0; i < candles.length; i++) {
-    const ct = new Date(
-      candles[i].time.includes(" ")
-        ? candles[i].time.replace(" ", "T")
-        : candles[i].time
-    ).getTime();
-    if (ct <= target) idx = i;
-    else break;
-  }
-  return idx;
-}
-
-function rrTakeProfit(
-  entry: number,
-  stop: number,
-  side: "BUY" | "SELL",
-  rr = 2
-) {
-  const risk = Math.abs(entry - stop);
-  if (risk === 0 || !isFinite(risk)) return undefined;
-  return side === "BUY" ? entry + rr * risk : entry - rr * risk;
-}
-
-/**
- * Calcula sugestões:
- *  - Entrada sugerida: o preço do próprio sinal ENTRY (s.price)
- *  - Stop (desistência) para ENTRY:
- *      BUY  -> menor mínima dos últimos N candles (default 10) antes do sinal
- *      SELL -> maior máxima dos últimos N candles (default 10) antes do sinal
- *  - Saída sugerida (alvo): RR 2:1 em relação ao stop
- *  - Para EXIT: exibe somente "Saída no sinal"
- */
-function useSuggestions(signals: Signal[], candles: Candle[], lookback = 10) {
-  return useMemo(() => {
-    return signals.map((s) => {
-      if (s.signalType === "ENTRY" && (s.side === "BUY" || s.side === "SELL")) {
-        const idx = findCandleIndex(candles, s.time);
-        const start = Math.max(0, idx - lookback);
-        const window = candles.slice(start, idx + 1);
-
-        let stop: number | undefined;
-        if (s.side === "BUY") {
-          stop = Math.min(...window.map((c) => c.low));
-        } else {
-          stop = Math.max(...window.map((c) => c.high));
-        }
-        if (!isFinite(stop)) stop = undefined;
-
-        const tp =
-          stop !== undefined
-            ? rrTakeProfit(s.price, stop, s.side, 2)
-            : undefined;
-
-        return {
-          ...s,
-          suggestedEntry: s.price,
-          suggestedExit: tp, // alvo RR 2:1
-          suggestedStop: stop, // desistência
-        };
-      }
-
-      // Para EXIT: mostramos a saída conforme o preço do sinal
-      return {
-        ...s,
-        suggestedEntry: undefined,
-        suggestedExit: s.price,
-        suggestedStop: undefined,
-      };
-    });
-  }, [signals, candles, lookback]);
-}
-
-export default function SignalsTable({ signals, candles }: Props) {
-  const enriched = useSuggestions(signals, candles);
 
   return (
-    <Table striped bordered hover size="sm" responsive>
-      <thead>
-        <tr>
-          <th>Hora</th>
-          <th>Tipo</th>
-          <th>Lado</th>
-          <th>Preço Sinal</th>
-          <th>Entrada Sugerida</th>
-          <th>Saída Sugerida</th>
-          <th>Desistência (Stop)</th>
-          <th>Motivo</th>
-        </tr>
-      </thead>
-      <tbody>
-        {enriched.map((s, i) => {
-          const dt = new Date(
-            s.time.includes(" ") ? s.time.replace(" ", "T") : s.time
-          );
-          const hh = String(dt.getHours()).padStart(2, "0");
-          const mm = String(dt.getMinutes()).padStart(2, "0");
-          const labelTime = `${hh}:${mm}`;
-
-          const tipo =
-            s.signalType === "ENTRY" ? (
-              <Badge bg={s.side === "BUY" ? "success" : "danger"}>ENTRY</Badge>
-            ) : (
-              <Badge bg="secondary">EXIT</Badge>
-            );
-
-          const lado =
-            s.side === "BUY" ? (
-              <Badge bg="success">BUY</Badge>
-            ) : s.side === "SELL" ? (
-              <Badge bg="danger">SELL</Badge>
-            ) : (
-              <Badge bg="secondary">FLAT</Badge>
-            );
-
-          const fmt = (v?: number) =>
-            v !== undefined && isFinite(v) ? Math.round(v).toString() : "—";
-
-          return (
-            <tr key={i}>
-              <td>{labelTime}</td>
-              <td>{tipo}</td>
-              <td>{lado}</td>
-              <td>{fmt(s.price)}</td>
-              <td>{fmt((s as any).suggestedEntry)}</td>
-              <td>{fmt((s as any).suggestedExit)}</td>
-              <td>{fmt((s as any).suggestedStop)}</td>
-              <td style={{ maxWidth: 240 }}>{s.reason || "—"}</td>
+    <div style={{ overflowX: "auto" }}>
+      <Table striped bordered hover size="sm">
+        <thead>
+          <tr>
+            {v.date && <th style={{ whiteSpace: "nowrap" }}>Data</th>}
+            {v.time && <th>Hora</th>}
+            {v.side && <th>Side</th>}
+            {v.type && <th>Tipo</th>}
+            {v.price && <th>Preço</th>}
+            {v.score && <th>Score</th>}
+            {v.reason && <th>Motivo</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, idx) => (
+            <tr key={idx}>
+              {v.date && (
+                <td>
+                  {r.date ??
+                    (r.time ? new Date(r.time).toLocaleDateString() : "-")}
+                </td>
+              )}
+              {v.time && <td>{formatTime(r.time)}</td>}
+              {v.side && (
+                <td>
+                  <SideBadge side={r.side} />
+                </td>
+              )}
+              {v.type && <td>{r.signalType}</td>}
+              {v.price && <td>{r.price ?? "-"}</td>}
+              {v.score && (
+                <td>
+                  {typeof r.score === "number" ? r.score.toFixed(6) : "-"}
+                </td>
+              )}
+              {v.reason && (
+                <td
+                  style={{
+                    maxWidth: 360,
+                    whiteSpace: "nowrap",
+                    textOverflow: "ellipsis",
+                    overflow: "hidden",
+                  }}
+                  title={r.reason ?? ""}
+                >
+                  {r.reason ?? "-"}
+                </td>
+              )}
             </tr>
-          );
-        })}
-      </tbody>
-    </Table>
+          ))}
+        </tbody>
+      </Table>
+    </div>
   );
 }
