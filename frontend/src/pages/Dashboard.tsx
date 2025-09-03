@@ -11,19 +11,16 @@ import {
   Card,
   Badge,
   Alert,
-  InputGroup,
-  OverlayTrigger,
-  Tooltip,
   Tabs,
   Tab,
-  Dropdown,
-  ButtonGroup,
 } from "react-bootstrap";
 import CandleChart from "../components/CandleChart";
 import SignalsTable from "../components/SignalsTable";
 import ProjectedSignalsTable from "../components/ProjectedSignalsTable";
 import PnLSummary from "../components/PnLSummary";
 import EquityBars from "../components/EquityBars";
+import EquityCurve from "../components/EquityCurve";
+import WinrateHeatmap from "../components/WinrateHeatmap";
 import { api } from "../services/api";
 import { toCSV, downloadCSV } from "../utils/csv";
 import "../styles/dashboard.css";
@@ -37,6 +34,7 @@ type Candle = {
   close: number;
   volume: number;
 };
+
 type Projected = {
   time?: string | null;
   date?: string | null;
@@ -51,9 +49,11 @@ type Projected = {
   expectedValuePoints?: number | null;
 };
 
+const LS_KEY = "dtia.settings.v3"; // bump para incluir filtros de horário
+
 function weekBusinessRange() {
   const d = new Date();
-  const day = d.getDay(); // 0=Sun ... 6=Sat
+  const day = d.getDay(); // 0..6
   const diffToMon = (day + 6) % 7;
   const monday = new Date(d);
   monday.setDate(d.getDate() - diffToMon);
@@ -84,8 +84,13 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [darkMode, setDarkMode] = useState<boolean>(false);
 
-  // Controle de colunas
-  const [showColsConfirmed, setShowColsConfirmed] = useState({
+  // Filtro por horário
+  const [applyHourFilter, setApplyHourFilter] = useState<boolean>(false);
+  const [hourStart, setHourStart] = useState<number>(9);
+  const [hourEnd, setHourEnd] = useState<number>(17);
+
+  // Tabelas
+  const [showColsConfirmed] = useState({
     date: true,
     time: true,
     side: true,
@@ -94,7 +99,7 @@ export default function Dashboard() {
     score: true,
     reason: true,
   });
-  const [showColsProjected, setShowColsProjected] = useState({
+  const [showColsProjected] = useState({
     date: true,
     time: true,
     side: true,
@@ -107,15 +112,6 @@ export default function Dashboard() {
     score: true,
   });
 
-  useEffect(() => {
-    if (!dateFrom || !dateTo) {
-      const r = weekBusinessRange();
-      setDateFrom(r.from);
-      setDateTo(r.to);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // Parâmetros preditivos
   const [horizon, setHorizon] = useState<number>(8);
   const [rr, setRR] = useState<number>(2);
@@ -127,6 +123,102 @@ export default function Dashboard() {
   const [minProb, setMinProb] = useState<number>(0);
   const [minEV, setMinEV] = useState<number>(0);
   const [dailyLossCap, setDailyLossCap] = useState<number>(0);
+
+  // Carrega valores do localStorage ao montar
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (s.symbol) setSymbol(s.symbol);
+        if (s.timeframe) setTimeframe(s.timeframe);
+        if (s.dateFrom) setDateFrom(s.dateFrom);
+        if (s.dateTo) setDateTo(s.dateTo);
+        if (typeof s.showFibo === "boolean") setShowFibo(s.showFibo);
+        if (typeof s.darkMode === "boolean") setDarkMode(s.darkMode);
+
+        if (typeof s.horizon === "number") setHorizon(s.horizon);
+        if (typeof s.rr === "number") setRR(s.rr);
+        if (typeof s.evalWindow === "number") setEvalWindow(s.evalWindow);
+        if (typeof s.gateRegime === "boolean") setGateRegime(s.gateRegime);
+        if (typeof s.gateToD === "boolean") setGateToD(s.gateToD);
+        if (typeof s.calibrate === "boolean") setCalibrate(s.calibrate);
+        if (typeof s.useMicroModel === "boolean")
+          setUseMicroModel(s.useMicroModel);
+        if (typeof s.minProb === "number") setMinProb(s.minProb);
+        if (typeof s.minEV === "number") setMinEV(s.minEV);
+        if (typeof s.dailyLossCap === "number") setDailyLossCap(s.dailyLossCap);
+
+        if (typeof s.applyHourFilter === "boolean")
+          setApplyHourFilter(s.applyHourFilter);
+        if (typeof s.hourStart === "number") setHourStart(s.hourStart);
+        if (typeof s.hourEnd === "number") setHourEnd(s.hourEnd);
+      } else {
+        // valores padrão de data: semana útil
+        const r = weekBusinessRange();
+        setDateFrom(r.from);
+        setDateTo(r.to);
+      }
+    } catch {
+      const r = weekBusinessRange();
+      setDateFrom(r.from);
+      setDateTo(r.to);
+    }
+  }, []);
+
+  // Salva no localStorage quando qualquer parâmetro/filtro muda
+  useEffect(() => {
+    const payload = {
+      symbol,
+      timeframe,
+      dateFrom,
+      dateTo,
+      showFibo,
+      darkMode,
+      horizon,
+      rr,
+      evalWindow,
+      gateRegime,
+      gateToD,
+      calibrate,
+      useMicroModel,
+      minProb,
+      minEV,
+      dailyLossCap,
+      applyHourFilter,
+      hourStart,
+      hourEnd,
+    };
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(payload));
+    } catch {}
+  }, [
+    symbol,
+    timeframe,
+    dateFrom,
+    dateTo,
+    showFibo,
+    darkMode,
+    horizon,
+    rr,
+    evalWindow,
+    gateRegime,
+    gateToD,
+    calibrate,
+    useMicroModel,
+    minProb,
+    minEV,
+    dailyLossCap,
+    applyHourFilter,
+    hourStart,
+    hourEnd,
+  ]);
+
+  // Tema
+  useEffect(() => {
+    document.body.classList.toggle("theme-dark", darkMode);
+    return () => document.body.classList.remove("theme-dark");
+  }, [darkMode]);
 
   const params = useMemo(
     () => ({
@@ -173,6 +265,7 @@ export default function Dashboard() {
         timeframe,
         from: dateFrom || undefined,
         to: dateTo || undefined,
+        lossCap: Number(dailyLossCap) || 0,
       });
       setPnL(bt.data ?? { pnlPoints: 0, pnlMoney: 0 });
     } catch (e: any) {
@@ -203,9 +296,41 @@ export default function Dashboard() {
   ]);
 
   useEffect(() => {
-    loadAll();
-  }, [loadAll]);
+    if (dateFrom && dateTo) loadAll();
+  }, [loadAll, dateFrom, dateTo]);
 
+  // ---- util de PnL/trades
+  const allTrades = useMemo(
+    () => (pnl?.trades || pnl?.tradeList || []) as any[],
+    [pnl]
+  );
+
+  const filterByHour = useCallback(
+    (trades: any[]) => {
+      if (!applyHourFilter) return trades;
+      const start = Math.max(0, Math.min(23, Number(hourStart) || 0));
+      const end = Math.max(0, Math.min(23, Number(hourEnd) || 0));
+      const inRange = (h: number) => {
+        if (start <= end) return h >= start && h <= end;
+        // faixa cruzando meia-noite (ex.: 22->2)
+        return h >= start || h <= end;
+      };
+      return trades.filter((t) => {
+        const d = t?.entryTime ? new Date(t.entryTime) : null;
+        const hr = d ? d.getHours() : null;
+        if (hr === null) return false; // sem hora, não entra no filtro
+        return inRange(hr);
+      });
+    },
+    [applyHourFilter, hourStart, hourEnd]
+  );
+
+  const tradesFiltered = useMemo(
+    () => filterByHour(allTrades),
+    [allTrades, filterByHour]
+  );
+
+  // ---- exportações CSV
   const exportSignals = () => {
     const csv = toCSV(
       (signals || []).map((s: any) => ({
@@ -224,6 +349,7 @@ export default function Dashboard() {
       csv
     );
   };
+
   const exportProjected = () => {
     const csv = toCSV(
       (projected || []).map((p: any) => ({
@@ -256,21 +382,209 @@ export default function Dashboard() {
       csv
     );
   };
+
   const exportTrades = () => {
     const csv = toCSV(
-      ((pnl?.trades || pnl?.tradeList || []) as any[]).map((t: any) => ({
+      (allTrades as any[]).map((t: any) => ({
         side: t.side,
         entryTime: t.entryTime,
         entryPrice: t.entryPrice,
         exitTime: t.exitTime,
         exitPrice: t.exitPrice,
-        pnlPoints: t.pnlPoints,
+        pnlPoints: t.pnlPoints ?? t.pnl,
       })),
       ["side", "entryTime", "entryPrice", "exitTime", "exitPrice", "pnlPoints"]
     );
     downloadCSV(`trades_${symbol}_${timeframe}_${dateFrom}_${dateTo}.csv`, csv);
   };
 
+  // ---- CSV Resumo (inclui ties e profitFactor)
+  function computeSummaryFromTrades(tradesArr: any[]) {
+    const toPts = (t: any) =>
+      typeof t.pnlPoints === "number"
+        ? t.pnlPoints
+        : typeof t.pnl === "number"
+        ? t.pnl
+        : 0;
+    const total = tradesArr.length;
+    const pnlPoints = tradesArr.reduce((acc, t) => acc + toPts(t), 0);
+    const wins = tradesArr.filter((t) => toPts(t) > 0).length;
+    const losses = tradesArr.filter((t) => toPts(t) < 0).length;
+    const ties = tradesArr.filter((t) => toPts(t) === 0).length;
+    const avgPnL = total ? pnlPoints / total : 0;
+    const grossProfit = tradesArr
+      .filter((t) => toPts(t) > 0)
+      .reduce((a, t) => a + toPts(t), 0);
+    const grossLoss = tradesArr
+      .filter((t) => toPts(t) < 0)
+      .reduce((a, t) => a + toPts(t), 0);
+    const profitFactor =
+      grossLoss !== 0
+        ? grossProfit / Math.abs(grossLoss)
+        : grossProfit > 0
+        ? Infinity
+        : 0;
+
+    return {
+      trades: total,
+      wins,
+      losses,
+      ties,
+      winRate: total ? (wins / total) * 100 : 0,
+      pnlPoints,
+      avgPnL,
+      profitFactor,
+    };
+  }
+
+  const exportSummary = () => {
+    const tradesArr = allTrades as any[];
+    const summary =
+      (pnl?.summary &&
+      typeof pnl.summary === "object" &&
+      !Array.isArray(pnl.summary)
+        ? pnl.summary
+        : computeSummaryFromTrades(tradesArr)) || {};
+    const row = {
+      symbol,
+      timeframe,
+      from: dateFrom,
+      to: dateTo,
+      trades: summary.trades ?? tradesArr.length,
+      wins: summary.wins ?? 0,
+      losses: summary.losses ?? 0,
+      ties: summary.ties ?? 0,
+      winRate: summary.winRate ?? 0,
+      pnlPoints:
+        summary.pnlPoints ??
+        tradesArr.reduce(
+          (a: number, t: any) => a + (t.pnlPoints ?? t.pnl ?? 0),
+          0
+        ),
+      avgPnL: summary.avgPnL ?? 0,
+      profitFactor:
+        summary.profitFactor === Infinity
+          ? "Infinity"
+          : summary.profitFactor ?? 0,
+    };
+    const csv = toCSV(
+      [row],
+      [
+        "symbol",
+        "timeframe",
+        "from",
+        "to",
+        "trades",
+        "wins",
+        "losses",
+        "ties",
+        "winRate",
+        "pnlPoints",
+        "avgPnL",
+        "profitFactor",
+      ]
+    );
+    downloadCSV(
+      `summary_${symbol}_${timeframe}_${dateFrom}_${dateTo}.csv`,
+      csv
+    );
+  };
+
+  // ---- CSV PF/WR por hora (0..23)
+  const exportHourlyStats = () => {
+    const rows: Array<{
+      hour: number;
+      total: number;
+      wins: number;
+      losses: number;
+      ties: number;
+      winRate: number;
+      grossProfitPts: number;
+      grossLossPts: number;
+      profitFactor: number | string;
+      avgPnL: number;
+    }> = [];
+
+    const buckets: Record<
+      number,
+      {
+        total: number;
+        wins: number;
+        losses: number;
+        ties: number;
+        gp: number;
+        gl: number;
+      }
+    > = {};
+
+    const toPts = (t: any) =>
+      typeof t.pnlPoints === "number"
+        ? t.pnlPoints
+        : typeof t.pnl === "number"
+        ? t.pnl
+        : 0;
+
+    for (let h = 0; h < 24; h++) {
+      buckets[h] = { total: 0, wins: 0, losses: 0, ties: 0, gp: 0, gl: 0 };
+    }
+
+    (allTrades as any[]).forEach((t) => {
+      const d = t?.entryTime ? new Date(t.entryTime) : null;
+      const hr = d ? d.getHours() : null;
+      if (hr === null) return;
+      const pts = toPts(t);
+      const b = buckets[hr];
+      b.total += 1;
+      if (pts > 0) {
+        b.wins += 1;
+        b.gp += pts;
+      } else if (pts < 0) {
+        b.losses += 1;
+        b.gl += pts;
+      } else {
+        b.ties += 1;
+      }
+    });
+
+    for (let h = 0; h < 24; h++) {
+      const b = buckets[h];
+      const wr = b.total ? (b.wins / b.total) * 100 : 0;
+      const pf = b.gl !== 0 ? b.gp / Math.abs(b.gl) : b.gp > 0 ? "Infinity" : 0;
+      const avg = b.total ? (b.gp + b.gl) / b.total : 0;
+      rows.push({
+        hour: h,
+        total: b.total,
+        wins: b.wins,
+        losses: b.losses,
+        ties: b.ties,
+        winRate: Number(wr.toFixed(2)),
+        grossProfitPts: Number(b.gp.toFixed(2)),
+        grossLossPts: Number(b.gl.toFixed(2)),
+        profitFactor:
+          typeof pf === "number" ? Number((pf as number).toFixed(3)) : pf,
+        avgPnL: Number(avg.toFixed(3)),
+      });
+    }
+
+    const csv = toCSV(rows, [
+      "hour",
+      "total",
+      "wins",
+      "losses",
+      "ties",
+      "winRate",
+      "grossProfitPts",
+      "grossLossPts",
+      "profitFactor",
+      "avgPnL",
+    ]);
+    downloadCSV(
+      `hourly_stats_${symbol}_${timeframe}_${dateFrom}_${dateTo}.csv`,
+      csv
+    );
+  };
+
+  // ---- UI
   return (
     <div className="dash-wrapper">
       <Navbar className="mb-3 dash-navbar">
@@ -358,6 +672,51 @@ export default function Dashboard() {
                 </Button>
               </Col>
             </Row>
+
+            {/* Filtro por horário */}
+            <Row className="gy-2 align-items-end mt-2">
+              <Col sm={3}>
+                <Form.Check
+                  type="switch"
+                  label="Aplicar filtro por horário (entrada)"
+                  checked={applyHourFilter}
+                  onChange={(e) => setApplyHourFilter(e.currentTarget.checked)}
+                />
+              </Col>
+              <Col sm={2}>
+                <Form.Label>Hora início</Form.Label>
+                <Form.Control
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={hourStart}
+                  onChange={(e) =>
+                    setHourStart(
+                      Math.max(0, Math.min(23, Number(e.target.value) || 0))
+                    )
+                  }
+                />
+              </Col>
+              <Col sm={2}>
+                <Form.Label>Hora fim</Form.Label>
+                <Form.Control
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={hourEnd}
+                  onChange={(e) =>
+                    setHourEnd(
+                      Math.max(0, Math.min(23, Number(e.target.value) || 0))
+                    )
+                  }
+                />
+              </Col>
+              <Col sm={5} className="text-end">
+                <div className="text-muted small">
+                  Dica: use o heatmap abaixo para escolher as horas mais fortes.
+                </div>
+              </Col>
+            </Row>
           </Card.Body>
         </Card>
 
@@ -390,6 +749,7 @@ export default function Dashboard() {
                   ema21={ema21}
                   showFibo={showFibo}
                   darkMode={darkMode}
+                  trades={tradesFiltered as any[]}
                 />
               </Card.Body>
             </Card>
@@ -425,18 +785,7 @@ export default function Dashboard() {
                   <Tab eventKey="projected" title="Projetados">
                     <ProjectedSignalsTable
                       items={projected}
-                      visibleCols={{
-                        date: true,
-                        time: true,
-                        side: true,
-                        entry: true,
-                        stop: true,
-                        take: true,
-                        prob: true,
-                        ev: true,
-                        condition: true,
-                        score: true,
-                      }}
+                      visibleCols={showColsProjected}
                     />
                   </Tab>
                 </Tabs>
@@ -452,6 +801,13 @@ export default function Dashboard() {
                   <Button
                     size="sm"
                     variant="outline-secondary"
+                    onClick={exportSummary}
+                  >
+                    CSV Resumo
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline-secondary"
                     onClick={exportTrades}
                   >
                     CSV Trades
@@ -464,12 +820,37 @@ export default function Dashboard() {
                   pnlMoney={pnl?.pnlMoney}
                   result={pnl}
                 />
-                <EquityBars
-                  trades={(pnl?.trades || pnl?.tradeList || []) as any[]}
-                  bucket="day"
-                />
+                <EquityBars trades={tradesFiltered as any[]} bucket="day" />
               </Card.Body>
             </Card>
+
+            <div className="mt-3">
+              <EquityCurve
+                trades={tradesFiltered as any[]}
+                darkMode={darkMode}
+              />
+            </div>
+
+            <div className="mt-3">
+              <Card className="shadow-sm">
+                <Card.Header className="d-flex align-items-center justify-content-between">
+                  <span className="fw-semibold">Heatmap por Hora</span>
+                  <Button
+                    size="sm"
+                    variant="outline-secondary"
+                    onClick={exportHourlyStats}
+                  >
+                    CSV PF/WR por hora
+                  </Button>
+                </Card.Header>
+                <Card.Body>
+                  <WinrateHeatmap
+                    trades={allTrades as any[]}
+                    darkMode={darkMode}
+                  />
+                </Card.Body>
+              </Card>
+            </div>
 
             {/* Parâmetros de projeção */}
             <Card className="shadow-sm elevated-card mt-3">

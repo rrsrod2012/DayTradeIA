@@ -1,173 +1,190 @@
 import React from "react";
 import { Card, Row, Col, Badge } from "react-bootstrap";
 
-type PnLSummaryProps = {
-  pnlPoints?: number | null;
-  pnlMoney?: number | null;
-  /** Objeto completo retornado pelo /backtest */
-  result?: any;
-};
-
 type Trade = {
-  side: "BUY" | "SELL" | string;
   pnl?: number;
   pnlPoints?: number;
-  entryTime?: string;
-  exitTime?: string;
-  [k: string]: any;
 };
 
-function Metric({
-  label,
-  value,
-  subtitle,
-  variant = "light",
-}: {
-  label: string;
-  value: string | number;
-  subtitle?: string;
-  variant?: string;
-}) {
-  return (
-    <Card className="border-0 shadow-sm">
-      <Card.Body className="py-3">
-        <div className="d-flex justify-content-between align-items-center">
-          <div>
-            <div className="text-muted" style={{ fontSize: 12 }}>
-              {label}
-            </div>
-            <div style={{ fontSize: 22, fontWeight: 700 }}>{value}</div>
-            {subtitle && (
-              <div className="text-muted" style={{ fontSize: 12 }}>
-                {subtitle}
-              </div>
-            )}
-          </div>
-          <Badge bg={variant as any} pill>
-            {label}
-          </Badge>
-        </div>
-      </Card.Body>
-    </Card>
-  );
+type Summary = {
+  trades?: number;
+  wins?: number;
+  losses?: number;
+  ties?: number;
+  winRate?: number;
+  pnlPoints?: number;
+  avgPnL?: number;
+  profitFactor?: number;
+};
+
+type ResultPayload = {
+  summary?: Summary;
+  trades?: Trade[];
+  tradeList?: Trade[];
+  pnlPoints?: number;
+  pnlMoney?: number;
+};
+
+type Props = {
+  pnlPoints?: number;
+  pnlMoney?: number;
+  /** Resultado bruto do backtest (usado para extrair summary/trades) */
+  result?: ResultPayload | null;
+};
+
+function formatNumber(n: number | undefined | null, decimals = 2) {
+  if (n === undefined || n === null || Number.isNaN(n)) return "-";
+  return n.toLocaleString(undefined, {
+    maximumFractionDigits: decimals,
+    minimumFractionDigits: decimals,
+  });
 }
 
-export default function PnLSummary({
-  pnlPoints,
-  pnlMoney,
-  result,
-}: PnLSummaryProps) {
-  // Normaliza estrutura
-  const trades: Trade[] = Array.isArray(result?.trades)
-    ? result.trades
-    : Array.isArray(result?.tradeList)
-    ? result.tradeList
-    : [];
+function computeSummaryFromTrades(trades: Trade[]): Summary {
+  const toPts = (t: Trade) =>
+    typeof t.pnlPoints === "number"
+      ? t.pnlPoints
+      : typeof t.pnl === "number"
+      ? t.pnl
+      : 0;
 
-  // Se o backend já mandou summary, usa; senão, calcula
-  const s = result?.summary || {};
+  const total = trades.length;
+  const pnlPoints = trades.reduce((acc, t) => acc + toPts(t), 0);
+  const wins = trades.filter((t) => toPts(t) > 0).length;
+  const losses = trades.filter((t) => toPts(t) < 0).length;
+  const ties = trades.filter((t) => toPts(t) === 0).length;
+  const avgPnL = total ? pnlPoints / total : 0;
 
-  const totalTrades: number =
-    typeof s.trades === "number" ? s.trades : trades.length;
+  const grossProfit = trades
+    .filter((t) => toPts(t) > 0)
+    .reduce((a, t) => a + toPts(t), 0);
+  const grossLoss = trades
+    .filter((t) => toPts(t) < 0)
+    .reduce((a, t) => a + toPts(t), 0);
+  const profitFactor =
+    grossLoss !== 0
+      ? grossProfit / Math.abs(grossLoss)
+      : grossProfit > 0
+      ? Infinity
+      : 0;
 
-  const winsCount: number =
-    typeof s.wins === "number"
-      ? s.wins
-      : trades.filter((t) => {
-          const v = Number.isFinite(t.pnlPoints)
-            ? (t.pnlPoints as number)
-            : Number(t.pnl ?? 0);
-          return v > 0;
-        }).length;
+  return {
+    trades: total,
+    wins,
+    losses,
+    ties,
+    winRate: total ? (wins / total) * 100 : 0,
+    pnlPoints,
+    avgPnL,
+    profitFactor,
+  };
+}
 
-  const lossesCount: number =
-    typeof s.losses === "number"
-      ? s.losses
-      : trades.filter((t) => {
-          const v = Number.isFinite(t.pnlPoints)
-            ? (t.pnlPoints as number)
-            : Number(t.pnl ?? 0);
-          return v <= 0;
-        }).length;
+export default function PnLSummary({ pnlPoints, pnlMoney, result }: Props) {
+  // Prioriza summary do backend; caso não exista, computa a partir dos trades
+  const tradesArr = (result?.trades || result?.tradeList || []) as Trade[];
+  const summary =
+    result?.summary && typeof result.summary === "object"
+      ? result.summary
+      : computeSummaryFromTrades(tradesArr);
 
-  const totalPnLPoints: number =
-    typeof s.pnlPoints === "number"
-      ? s.pnlPoints
+  const totalTrades = summary?.trades ?? tradesArr.length;
+  const wins = summary?.wins ?? 0;
+  const losses = summary?.losses ?? 0;
+  const ties = summary?.ties ?? 0;
+  const winRate =
+    summary?.winRate ?? (totalTrades ? (wins / totalTrades) * 100 : 0);
+  const pf = summary?.profitFactor;
+
+  // Fallbacks para PnL total
+  const totalPoints =
+    typeof summary?.pnlPoints === "number"
+      ? summary?.pnlPoints
       : typeof pnlPoints === "number"
       ? pnlPoints
-      : trades.reduce((acc, t) => {
-          const v = Number.isFinite(t.pnlPoints)
-            ? (t.pnlPoints as number)
-            : Number(t.pnl ?? 0);
-          return acc + (Number.isFinite(v) ? v : 0);
-        }, 0);
-
-  const money: number =
-    typeof s.pnlMoney === "number"
-      ? s.pnlMoney
-      : typeof pnlMoney === "number"
-      ? pnlMoney
-      : 0;
-
-  const winRate: number =
-    typeof s.winRate === "number"
-      ? s.winRate
-      : totalTrades
-      ? (winsCount / totalTrades) * 100
-      : 0;
-
-  const avgPnL: number =
-    typeof s.avgPnL === "number"
-      ? s.avgPnL
-      : totalTrades
-      ? totalPnLPoints / totalTrades
-      : 0;
-
-  const maxDD: number = Number.isFinite(s.maxDrawdown) ? s.maxDrawdown : 0;
-
-  // Formatadores seguros
-  const fmtPts = (n: number) =>
-    Number.isFinite(n) ? `${n.toFixed(2)} pts` : "0.00 pts";
-  const fmtMoney = (n: number) =>
-    Number.isFinite(n) ? `R$ ${n.toFixed(2)}` : "R$ 0,00";
-  const fmtPct = (n: number) =>
-    Number.isFinite(n) ? `${n.toFixed(2)}%` : "0.00%";
+      : tradesArr.reduce((acc, t) => acc + (t.pnlPoints ?? t.pnl ?? 0), 0);
 
   return (
-    <div className="d-flex flex-column gap-2">
-      <Row xs={1} md={2} className="g-2">
-        <Col>
-          <Metric
-            label="PnL (pts)"
-            value={fmtPts(totalPnLPoints)}
-            variant="success"
-          />
-        </Col>
-        <Col>
-          <Metric
-            label="PnL (R$)"
-            value={fmtMoney(money)}
-            variant="secondary"
-          />
-        </Col>
-        <Col>
-          <Metric
-            label="Trades"
-            value={Number.isFinite(totalTrades) ? totalTrades : 0}
-            variant="light"
-            subtitle={`Wins: ${winsCount} • Losses: ${lossesCount}`}
-          />
-        </Col>
-        <Col>
-          <Metric label="Win Rate" value={fmtPct(winRate)} variant="info" />
-        </Col>
-        <Col>
-          <Metric label="Avg PnL" value={fmtPts(avgPnL)} variant="warning" />
-        </Col>
-        <Col>
-          <Metric label="Max DD" value={fmtPts(maxDD)} variant="danger" />
-        </Col>
-      </Row>
-    </div>
+    <Card className="shadow-sm">
+      <Card.Body>
+        <Row className="gy-3">
+          <Col xs={6} md={4}>
+            <div className="text-muted small">PnL (pts)</div>
+            <div
+              className={`fs-5 fw-semibold ${
+                totalPoints >= 0 ? "text-success" : "text-danger"
+              }`}
+            >
+              {formatNumber(totalPoints, 2)}
+            </div>
+          </Col>
+          <Col xs={6} md={4}>
+            <div className="text-muted small">PnL (R$)</div>
+            <div
+              className={`fs-5 fw-semibold ${
+                Number(pnlMoney) >= 0 ? "text-success" : "text-danger"
+              }`}
+            >
+              {formatNumber(pnlMoney, 2)}
+            </div>
+          </Col>
+          <Col xs={6} md={4}>
+            <div className="text-muted small">Trades</div>
+            <div className="fs-5 fw-semibold">{totalTrades || 0}</div>
+          </Col>
+
+          <Col xs={6} md={3}>
+            <div className="text-muted small">Vitórias</div>
+            <div className="fs-6 fw-semibold">
+              <Badge bg="success" pill>
+                {wins}
+              </Badge>
+            </div>
+          </Col>
+          <Col xs={6} md={3}>
+            <div className="text-muted small">Derrotas</div>
+            <div className="fs-6 fw-semibold">
+              <Badge bg="danger" pill>
+                {losses}
+              </Badge>
+            </div>
+          </Col>
+          <Col xs={6} md={3}>
+            <div className="text-muted small">Empates</div>
+            <div className="fs-6 fw-semibold">
+              <Badge bg="secondary" pill>
+                {ties}
+              </Badge>
+            </div>
+          </Col>
+          <Col xs={6} md={3}>
+            <div className="text-muted small">Win Rate</div>
+            <div className="fs-6 fw-semibold">{formatNumber(winRate, 2)}%</div>
+          </Col>
+
+          <Col xs={6} md={4}>
+            <div className="text-muted small">Profit Factor</div>
+            <div className="fs-6 fw-semibold">
+              {pf === Infinity ? "∞" : formatNumber(pf ?? 0, 2)}
+            </div>
+          </Col>
+          <Col xs={6} md={4}>
+            <div className="text-muted small">Médio por trade (pts)</div>
+            <div className="fs-6 fw-semibold">
+              {formatNumber(summary?.avgPnL ?? 0, 2)}
+            </div>
+          </Col>
+          <Col xs={12} md={4}>
+            <div className="text-muted small">Observação</div>
+            <div className="small">
+              <span className="text-muted">
+                PF &gt; 1 indica estratégia positiva; empates não entram no
+                cálculo.
+              </span>
+            </div>
+          </Col>
+        </Row>
+      </Card.Body>
+    </Card>
   );
 }
