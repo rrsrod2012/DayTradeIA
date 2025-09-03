@@ -1,583 +1,489 @@
+/* eslint-disable no-console */
 import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import routes from "./routes";
 import adminRoutes from "./routesAdmin";
 import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
-import {
-  bootConfirmedSignalsWorker,
-  backfillSignals,
-} from "./workers/confirmedSignalsWorker";
+import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
 import logger from "./logger";
 
-// ==== deps extras para o /api/backtest ====
-import { prisma } from "./prisma";
-import { DateTime } from "luxon";
+// Roteador novo do backtest (mantemos)
+import { router as backtestRouter } from "./services/backtest";
 
+// ====== IMPORTS PARA ROTA EMBUTIDA DE PROJECTED ======
+import { DateTime, Duration } from "luxon";
+import { loadCandlesAnyTF } from "./lib/aggregation";
+
+// ====== APP BASE ======
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
-// =================== Middleware de LOG de requests ===================
-app.use((req, _res, next) => {
-  logger.info(`[REQ] ${req.method} ${req.originalUrl}`);
-  next();
-});
+/**
+ * Ordem importa:
+ * - Montamos backtestRouter antes do legado
+ * - E registramos a rota de projected inline aqui
+ */
+app.use(backtestRouter);
 
-// =================== Utils locais (para /api/backtest) ===================
-const ZONE = "America/Sao_Paulo";
-const SERVER_VERSION = "server:v4-backtest-m1-signals-bucket+backfill";
+// ====== ROTA EMBUTIDA: /api/signals/projected ======
+(() => {
+  const ZONE = "America/Sao_Paulo";
+  const VERSION = "signals-projected:inline-v1";
 
-function toUtcRange(from?: string, to?: string): { gte?: Date; lte?: Date } {
-  const out: { gte?: Date; lte?: Date } = {};
-  const parse = (s: string, endOfDay = false) => {
-    const hasTime = /T|\d{2}:\d{2}/.test(String(s));
-    const dt = hasTime
-      ? DateTime.fromISO(String(s), { zone: ZONE })
-      : DateTime.fromISO(String(s), { zone: ZONE })[
-          endOfDay ? "endOf" : "startOf"
-        ]("day");
-    if (!dt.isValid) return undefined as any;
-    return dt.toUTC().toJSDate();
-  };
-  if (from) out.gte = parse(from, false)!;
-  if (to) out.lte = parse(to, true)!;
-  return out;
-}
-const toLocalDateStr = (d: Date) =>
-  DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd");
-
-function tfToMinutes(tf: string): number {
-  const s = String(tf || "").toUpperCase();
-  if (s.startsWith("M")) return parseInt(s.slice(1), 10) || 1;
-  if (s.startsWith("H")) return (parseInt(s.slice(1), 10) || 1) * 60;
-  if (s === "D1" || s === "D") return 24 * 60;
-  return 1;
-}
-function bucketStartUTC(d: Date, tfMin: number): number {
-  const y = d.getUTCFullYear(),
-    m = d.getUTCMonth(),
-    day = d.getUTCDate(),
-    H = d.getUTCHours(),
-    M = d.getUTCMinutes();
-  const bucketMin = Math.floor(M / tfMin) * tfMin;
-  return Date.UTC(y, m, day, H, bucketMin, 0, 0);
-}
-type RawCandle = {
-  id?: number;
-  time: Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number | null;
-};
-function aggregateFromM1(base: RawCandle[], tf: string): RawCandle[] {
-  const tfMin = tfToMinutes(tf);
-  if (tfMin <= 1) return base.slice();
-  const map = new Map<number, RawCandle>();
-  for (const c of base) {
-    const b = bucketStartUTC(c.time, tfMin);
-    const prev = map.get(b);
-    if (!prev) {
-      map.set(b, {
-        time: new Date(b),
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume ?? null,
-      });
-    } else {
-      prev.high = Math.max(prev.high, c.high);
-      prev.low = Math.min(prev.low, c.low);
-      prev.close = c.close;
-      if (prev.volume != null || c.volume != null)
-        prev.volume = (prev.volume ?? 0) + (c.volume ?? 0);
+  function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
+    const s = String(tfRaw || "")
+      .trim()
+      .toUpperCase();
+    if (!s) return { tfU: "M5", tfMin: 5 };
+    if (s.startsWith("M") || s.startsWith("H")) {
+      const unit = s[0];
+      const num = parseInt(s.slice(1), 10) || (unit === "H" ? 1 : 5);
+      const tfU = `${unit}${num}`;
+      const tfMin = unit === "H" ? num * 60 : num;
+      return { tfU, tfMin };
     }
+    const m = /(\d+)\s*(M|MIN|MINUTES|m)?/.exec(s);
+    if (m) {
+      const num = parseInt(m[1], 10) || 5;
+      return { tfU: `M${num}`, tfMin: num };
+    }
+    return { tfU: "M5", tfMin: 5 };
   }
-  const out = Array.from(map.values());
-  out.sort((a, b) => a.time.getTime() - b.time.getTime());
-  return out;
-}
-function lowerBound(arr: number[], x: number) {
-  let lo = 0,
-    hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (arr[mid] < x) lo = mid + 1;
-    else hi = mid;
+  function floorTo(d: Date, tfMin: number): Date {
+    const dt = DateTime.fromJSDate(d).toUTC();
+    const bucketMin = Math.floor(dt.minute / tfMin) * tfMin;
+    return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
   }
-  return lo;
-}
-
-type Side = "BUY" | "SELL";
-interface Trade {
-  entryIdx: number;
-  exitIdx: number;
-  entryTime: string;
-  exitTime: string;
-  side: Side;
-  entryPrice: number;
-  exitPrice: number;
-  pnl: number;
-}
-
-async function handleBacktest(params: any) {
-  const {
-    symbol = "WIN",
-    timeframe = "M5",
-    from: _from,
-    to: _to,
-    dateFrom,
-    dateTo,
-    exitMode = "opposite",
-    barsHold = 3,
-    initialCapital = 0,
-    limit = 0,
-  } = params || {};
-
-  const from = _from ?? dateFrom;
-  const to = _to ?? dateTo;
-  const barsHoldNum = Number(barsHold) || 3;
-  const initialCap = Number(initialCapital) || 0;
-  const pointValue = Number(process.env.CONTRACT_POINT_VALUE || 1);
-  const tf = String(timeframe).toUpperCase();
-  const tfMin = tfToMinutes(tf);
-
-  const range = toUtcRange(
-    from as string | undefined,
-    to as string | undefined
-  );
-
-  const candleWhere: any = {
-    instrument: { is: { symbol: String(symbol).toUpperCase() } },
-    timeframe: tf,
-    ...(range.gte || range.lte ? { time: range } : {}),
-  };
-
-  let candles: RawCandle[] = await prisma.candle.findMany({
-    where: candleWhere,
-    orderBy: { time: "asc" },
-    take:
-      Number(limit) > 0 && !(range.gte || range.lte)
-        ? Number(limit)
-        : undefined,
-    select: {
-      id: true,
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-    },
-  });
-
-  if (candles.length === 0 && tf !== "M1") {
-    const baseM1 = await prisma.candle.findMany({
-      where: {
-        instrument: { is: { symbol: String(symbol).toUpperCase() } },
-        timeframe: "M1",
-        ...(range.gte || range.lte ? { time: range } : {}),
-      },
-      orderBy: { time: "asc" },
-      select: { time: true, open: true, high: true, low: true, close: true },
-    });
-
-    logger.info("[BACKTEST] Fallback M1→TF", {
-      symbol,
-      timeframe: tf,
-      baseM1: baseM1.length,
-      version: SERVER_VERSION,
-    });
-
-    if (baseM1.length) {
-      candles = aggregateFromM1(
-        baseM1.map((c) => ({
-          time: c.time,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-        })),
-        tf
-      );
+  function ceilToExclusive(d: Date, tfMin: number): Date {
+    const dt = DateTime.fromJSDate(d).toUTC();
+    const bucketMin = Math.floor(dt.minute / tfMin) * tfMin + tfMin;
+    return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
+  }
+  function EMA(values: number[], period: number): (number | null)[] {
+    const out: (number | null)[] = [];
+    const k = 2 / (period + 1);
+    let ema: number | null = null;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (!isFinite(v)) {
+        out.push(ema);
+        continue;
+      }
+      ema = ema == null ? v : v * k + ema * (1 - k);
+      out.push(ema);
+    }
+    return out;
+  }
+  function ATR(
+    candles: { high: number; low: number; close: number }[],
+    period = 14
+  ): (number | null)[] {
+    const tr: number[] = [];
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+      const prevClose = i > 0 ? candles[i - 1].close : c.close;
+      const a = c.high - c.low;
+      const b = Math.abs(c.high - prevClose);
+      const d = Math.abs(c.low - prevClose);
+      tr.push(Math.max(a, b, d));
+    }
+    const out: (number | null)[] = [];
+    let ema: number | null = null;
+    const k = 2 / (period + 1);
+    for (let i = 0; i < tr.length; i++) {
+      const v = tr[i];
+      if (ema == null) ema = v;
+      else ema = v * k + ema * (1 - k);
+      out.push(ema);
+    }
+    return out;
+  }
+  async function httpPostJSON<T = any>(
+    url: string,
+    body: any,
+    timeoutMs = 2500
+  ): Promise<T> {
+    let f: typeof fetch = (global as any).fetch;
+    if (!f) {
+      const mod = await import("node-fetch");
+      // @ts-ignore
+      f = mod.default as any;
+    }
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await f(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        // @ts-ignore
+        signal: ctrl.signal,
+      } as any);
+      const txt = await resp.text();
+      const data = txt ? JSON.parse(txt) : null;
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      return data as T;
+    } finally {
+      clearTimeout(to);
     }
   }
 
-  logger.info(`[BACKTEST] Candles carregados: ${candles.length}`, {
-    version: SERVER_VERSION,
-    symbol,
-    timeframe: tf,
-    first: candles[0]?.time?.toISOString?.() ?? null,
-    last: candles[candles.length - 1]?.time?.toISOString?.() ?? null,
-  });
-
-  if (candles.length === 0) {
-    return {
-      pnlPoints: 0,
-      pnlMoney: 0,
-      params: {
+  app.post("/api/signals/projected", express.json(), async (req, res) => {
+    try {
+      const {
         symbol,
-        timeframe: tf,
+        timeframe,
         from,
         to,
-        exitMode,
-        barsHold: barsHoldNum,
-        initialCapital: initialCap,
-      },
-      summary: {
-        trades: 0,
-        wins: 0,
-        losses: 0,
-        winRate: 0,
-        pnl: 0,
-        avgPnL: 0,
-        maxDrawdown: 0,
-      },
-      equityCurve: [],
-      trades: [],
-      note: "Sem candles no período informado.",
-      version: SERVER_VERSION,
-    };
-  }
+        rr = 2,
+        minProb = 0,
+        minEV = -Infinity,
+        useMicroModel = true,
+        vwapFilter = false,
+        requireMtf = false,
+        confirmTf = "M15",
+        costPts = 0,
+        slippagePts = 0,
+        atrPeriod = 14,
+        k_sl = 1.0,
+        k_tp = rr,
+      } = req.body || {};
 
-  const times = candles.map((c) => c.time.getTime());
-  const closes = candles.map((c) => c.close);
-  const candleIndexById = new Map<string | number, number>();
-  candles.forEach((c, i) => {
-    if (c.id != null) candleIndexById.set(c.id as any, i);
-  });
+      const sym = String(symbol || "")
+        .trim()
+        .toUpperCase();
+      if (!sym)
+        return res
+          .status(200)
+          .json({ ok: false, version: VERSION, error: "Faltou 'symbol'" });
 
-  const signalsTF = await prisma.signal.findMany({
-    where: {
-      candle: {
-        is: {
-          instrument: { is: { symbol: String(symbol).toUpperCase() } },
-          timeframe: tf,
-          ...(range.gte || range.lte ? { time: range } : {}),
-        },
-      },
-    },
-    include: { candle: true },
-    orderBy: { candle: { time: "asc" } },
-  });
+      const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-  logger.info(`[BACKTEST] Sinais carregados: ${signalsTF.length}`, {
-    version: SERVER_VERSION,
-  });
-
-  type Sig = { idx: number; side: Side };
-  let sList: Sig[] = [];
-
-  if (signalsTF.length > 0) {
-    sList = signalsTF.map((s) => {
-      let idx = candleIndexById.get(s.candleId as any);
-      if (idx === undefined) {
-        const t = s.candle!.time.getTime();
-        idx = Math.min(lowerBound(times, t), times.length - 1);
+      // Range
+      const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 5);
+      let fromD: Date, toD: Date;
+      if (from && to) {
+        const f = new Date(String(from));
+        const t = new Date(String(to));
+        if (!isFinite(f.getTime()) || !isFinite(t.getTime())) {
+          return res
+            .status(200)
+            .json({
+              ok: false,
+              version: VERSION,
+              error: "Parâmetros 'from'/'to' inválidos",
+            });
+        }
+        fromD = floorTo(f, tfMin);
+        toD = ceilToExclusive(t, tfMin);
+      } else {
+        const now = DateTime.now().toUTC();
+        const f = now.minus(Duration.fromObject({ days: fallbackDays }));
+        fromD = floorTo(f.toJSDate(), tfMin);
+        toD = ceilToExclusive(now.toJSDate(), tfMin);
       }
-      return { idx, side: (s.side as Side) || "BUY" };
-    });
-  } else if (tf !== "M1") {
-    const signalsM1 = await prisma.signal.findMany({
-      where: {
-        candle: {
-          is: {
-            instrument: { is: { symbol: String(symbol).toUpperCase() } },
-            timeframe: "M1",
-            ...(range.gte || range.lte ? { time: range } : {}),
-          },
-        },
-      },
-      include: { candle: true },
-      orderBy: { candle: { time: "asc" } },
-    });
+      if (fromD >= toD) {
+        return res
+          .status(200)
+          .json({
+            ok: false,
+            version: VERSION,
+            error: "'from' deve ser anterior a 'to'",
+          });
+      }
 
-    if (signalsM1.length > 0) {
-      const tfMin = tfToMinutes(tf);
-      const bucketLast = new Map<number, { side: Side; when: number }>();
-      for (const s of signalsM1) {
-        const t = s.candle!.time;
-        const b = bucketStartUTC(t, tfMin);
-        const prev = bucketLast.get(b);
-        const tMs = t.getTime();
-        const side = (s.side as Side) || "BUY";
-        if (!prev || tMs >= prev.when) bucketLast.set(b, { side, when: tMs });
-      }
-      const buckets = Array.from(bucketLast.entries()).sort(
-        (a, b) => a[0] - b[0]
-      );
-      for (const [b, info] of buckets) {
-        const idx = Math.min(lowerBound(times, b), times.length - 1);
-        sList.push({ idx, side: info.side });
-      }
-      const compact: Sig[] = [];
-      for (const s of sList.sort((a, b) => a.idx - b.idx)) {
-        const last = compact[compact.length - 1];
-        if (!last || last.idx !== s.idx || last.side !== s.side)
-          compact.push(s);
-      }
-      sList = compact;
-      logger.info("[BACKTEST] Usando sinais confirmados M1 agregados", {
-        count: sList.length,
-        timeframe: tf,
-        version: SERVER_VERSION,
+      // Candles
+      const candles = await loadCandlesAnyTF(sym, tfU, {
+        gte: fromD,
+        lte: toD,
       });
-    }
-  }
+      if (!candles?.length)
+        return res.status(200).json({ ok: true, version: VERSION, data: [] });
 
-  if (sList.length === 0) {
-    const ema = (arr: number[], p: number) => {
-      if (p <= 1) return arr.slice();
-      const k = 2 / (p + 1);
-      const out: number[] = [];
-      let prev = arr[0] ?? 0;
-      out.push(prev);
-      for (let i = 1; i < arr.length; i++) {
-        const cur = arr[i] * k + prev * (1 - k);
-        out.push(cur);
-        prev = cur;
-      }
-      return out;
-    };
-    const f = ema(closes, 9);
-    const g = ema(closes, 21);
-    for (let i = 1; i < Math.min(f.length, g.length); i++) {
-      const prev = (f[i - 1] ?? 0) - (g[i - 1] ?? 0);
-      const cur = (f[i] ?? 0) - (g[i] ?? 0);
-      const side =
-        prev <= 0 && cur > 0 ? "BUY" : prev >= 0 && cur < 0 ? "SELL" : null;
-      if (!side) continue;
-      sList.push({ idx: i, side });
-    }
-    logger.info(
-      "[BACKTEST] Usando baseline EMA 9/21 (sem sinais confirmados)",
-      {
-        count: sList.length,
-        version: SERVER_VERSION,
-      }
-    );
-  }
+      const closes = candles.map((c) => Number(c.close));
+      const highs = candles.map((c) => Number(c.high));
+      const lows = candles.map((c) => Number(c.low));
+      const times = candles.map((c) => c.time);
 
-  if (sList.length === 0) {
-    return {
-      pnlPoints: 0,
-      pnlMoney: 0,
-      params: {
-        symbol,
-        timeframe: tf,
-        from,
-        to,
-        exitMode,
-        barsHold: barsHoldNum,
-        initialCapital: initialCap,
-      },
-      summary: {
-        trades: 0,
-        wins: 0,
-        losses: 0,
-        winRate: 0,
-        pnl: 0,
-        avgPnL: 0,
-        maxDrawdown: 0,
-      },
-      equityCurve: candles.map((c, i) => ({
-        time: c.time.toISOString(),
-        date: toLocalDateStr(c.time),
-        equity: initialCap,
-        idx: i,
-      })),
-      trades: [],
-      note: "Sem sinais para backtest no período informado.",
-      version: SERVER_VERSION,
-    };
-  }
-
-  const trades: Trade[] = [];
-  for (let i = 0; i < sList.length; i++) {
-    const s = sList[i];
-    const entryIdx = Math.max(0, Math.min(s.idx, candles.length - 1));
-    const entryPrice = candles[entryIdx].close;
-    const side = s.side;
-
-    let exitIdx = -1;
-    if (String(exitMode).toLowerCase() === "bars") {
-      exitIdx = Math.min(candles.length - 1, entryIdx + barsHoldNum);
-    } else {
-      let j = i + 1;
-      for (; j < sList.length; j++) {
-        if (sList[j].side !== side) break;
-      }
-      exitIdx = Math.min(
-        candles.length - 1,
-        j < sList.length ? sList[j].idx : candles.length - 1
+      const e9 = EMA(closes, 9);
+      const e21 = EMA(closes, 21);
+      const atr = ATR(
+        candles.map((c) => ({ high: c.high, low: c.low, close: c.close })),
+        Number(atrPeriod) || 14
       );
+
+      // VWAP por sessão
+      const vwap: (number | null)[] = [];
+      let accPV = 0,
+        accVol = 0;
+      let dLocal = DateTime.fromJSDate(times[0])
+        .setZone(ZONE)
+        .toFormat("yyyy-LL-dd");
+      for (let i = 0; i < candles.length; i++) {
+        const dl = DateTime.fromJSDate(times[i])
+          .setZone(ZONE)
+          .toFormat("yyyy-LL-dd");
+        if (dl !== dLocal) {
+          accPV = 0;
+          accVol = 0;
+          dLocal = dl;
+        }
+        const typical = (highs[i] + lows[i] + closes[i]) / 3;
+        const vol = Number((candles[i] as any).volume ?? 1);
+        accPV += typical * vol;
+        accVol += vol;
+        vwap.push(accVol > 0 ? accPV / accVol : null);
+      }
+
+      // MTF (opcional)
+      let mtfUp: boolean[] | null = null,
+        mtfDown: boolean[] | null = null;
+      if (requireMtf && confirmTf && confirmTf !== tfU) {
+        const { tfU: confU } = normalizeTf(confirmTf);
+        const c2 = await loadCandlesAnyTF(sym, confU, { gte: fromD, lte: toD });
+        if (c2?.length) {
+          const e9b = EMA(
+            c2.map((c) => Number(c.close)),
+            9
+          );
+          const e21b = EMA(
+            c2.map((c) => Number(c.close)),
+            21
+          );
+          mtfUp = [];
+          mtfDown = [];
+          let j = 0;
+          for (let i = 0; i < candles.length; i++) {
+            const t = times[i].getTime();
+            while (j + 1 < c2.length && c2[j + 1].time.getTime() <= t) j++;
+            const u = e9b[j] != null && e21b[j] != null && e9b[j]! > e21b[j]!;
+            const d = e9b[j] != null && e21b[j] != null && e9b[j]! < e21b[j]!;
+            mtfUp.push(!!u);
+            mtfDown.push(!!d);
+          }
+        }
+      }
+
+      type Row = {
+        side: "BUY" | "SELL" | "FLAT";
+        suggestedEntry: number | null;
+        stopSuggestion: number | null;
+        takeProfitSuggestion: number | null;
+        conditionText: string;
+        probHit?: number | null;
+        probCalibrated?: number | null;
+        expectedValuePoints?: number | null;
+        time: string;
+        date: string;
+      };
+      const out: Row[] = [];
+
+      function featuresAt(i: number) {
+        const c = closes[i];
+        const e9v = e9[i] ?? c;
+        const e21v = e21[i] ?? c;
+        const atrv = atr[i] ?? 0;
+        const vw = vwap[i] ?? c;
+        const slope9 =
+          i > 0 && e9[i - 1] != null ? e9v - (e9[i - 1] as number) : 0;
+        const slope21 =
+          i > 0 && e21[i - 1] != null ? e21v - (e21[i - 1] as number) : 0;
+        const ret1 = i > 0 ? closes[i] - closes[i - 1] : 0;
+        const range = highs[i] - lows[i];
+        const rangeRatio = atrv > 0 ? range / atrv : 0;
+        const distEma21 = e21v ? c - e21v : 0;
+        const distVwap = c - vw;
+        const hour = DateTime.fromJSDate(times[i]).setZone(ZONE).hour;
+        return {
+          dist_ema21: distEma21,
+          dist_vwap: distVwap,
+          slope_e9: slope9,
+          slope_e21: slope21,
+          range_ratio: rangeRatio,
+          ret1,
+          hour,
+        };
+      }
+
+      async function getProb(features: any): Promise<number | null> {
+        const url = String(process.env.MICRO_MODEL_URL || "").trim();
+        if (!(useMicroModel && url)) return null;
+        try {
+          const resp = await httpPostJSON<{ probHit?: number }>(
+            `${url}/predict`,
+            { features }
+          );
+          if (typeof resp?.probHit === "number" && isFinite(resp.probHit))
+            return resp.probHit;
+          return null;
+        } catch (e) {
+          console.warn(
+            "[projected] micro-model erro:",
+            (e as any)?.message || e
+          );
+          return null;
+        }
+      }
+
+      for (let i = 1; i < candles.length - 1; i++) {
+        const prevUp =
+          e9[i - 1] != null &&
+          e21[i - 1] != null &&
+          (e9[i - 1] as number) <= (e21[i - 1] as number);
+        const nowUp =
+          e9[i] != null &&
+          e21[i] != null &&
+          (e9[i] as number) > (e21[i] as number);
+        const prevDn =
+          e9[i - 1] != null &&
+          e21[i - 1] != null &&
+          (e9[i - 1] as number) >= (e21[i - 1] as number);
+        const nowDn =
+          e9[i] != null &&
+          e21[i] != null &&
+          (e9[i] as number) < (e21[i] as number);
+
+        const crossUp = prevUp && nowUp;
+        const crossDn = prevDn && nowDn;
+        if (!crossUp && !crossDn) continue;
+
+        if (vwapFilter) {
+          const vw = vwap[i];
+          if (vw != null) {
+            if (crossUp && closes[i] < vw) continue;
+            if (crossDn && closes[i] > vw) continue;
+          }
+        }
+        // MTF
+        // (calculado acima quando requireMtf)
+        // Se existir, valide direção:
+        // @ts-ignore
+        if (requireMtf && Array.isArray((global as any).__mtfUp)) {
+          /* no-op */
+        }
+
+        // Entrada na próxima barra
+        const j = Math.min(i + 1, candles.length - 1);
+        const entry = Number.isFinite((candles[j] as any).open)
+          ? Number((candles[j] as any).open)
+          : Number((candles[j] as any).close) || closes[i];
+
+        const atrv = atr[i] ?? 0;
+        const slPts = Math.max(atrv * Number(k_sl), 0);
+        const tpPts = Math.max(atrv * Number(k_tp), 0);
+
+        const isBuy = !!crossUp;
+        const sl = slPts > 0 ? (isBuy ? entry - slPts : entry + slPts) : null;
+        const tp = tpPts > 0 ? (isBuy ? entry + tpPts : entry - tpPts) : null;
+
+        const feats = featuresAt(i);
+        let prob = await getProb(feats);
+        if (prob == null) {
+          const raw =
+            0.5 +
+            Math.max(
+              -0.08,
+              Math.min(0.08, (feats.slope_e9 - feats.slope_e21) * 2)
+            ) +
+            Math.max(
+              -0.05,
+              Math.min(0.05, (feats.dist_ema21 / Math.max(atrv, 1e-6)) * 0.1)
+            );
+          prob = Math.max(0.35, Math.min(0.65, raw));
+        }
+
+        const costs = Number(costPts) + Number(slippagePts);
+        const evPts = prob * (tpPts || 0) - (1 - prob) * (slPts || 0) - costs;
+
+        if (prob < Number(minProb)) continue;
+        if (evPts < Number(minEV)) continue;
+
+        const row = {
+          side: isBuy ? "BUY" : ("SELL" as const),
+          suggestedEntry: entry,
+          stopSuggestion: sl,
+          takeProfitSuggestion: tp,
+          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${
+            vwapFilter ? " + VWAP" : ""
+          }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
+          probHit: Number(prob.toFixed(4)),
+          probCalibrated: Number(prob.toFixed(4)),
+          expectedValuePoints: Number(evPts.toFixed(2)),
+          time: candles[i].time.toISOString(),
+          date: DateTime.fromJSDate(candles[i].time).setZone(ZONE).toISODate()!,
+        };
+        (out as any[]).push(row);
+      }
+
+      return res.status(200).json(out);
+    } catch (e: any) {
+      console.error(
+        "[/api/signals/projected] erro:",
+        e?.stack || e?.message || e
+      );
+      return res
+        .status(200)
+        .json({
+          ok: false,
+          version: VERSION,
+          error: "unexpected",
+          diag: String(e?.stack || e?.message || e),
+        });
     }
-
-    if (exitIdx <= entryIdx)
-      exitIdx = Math.min(entryIdx + 1, candles.length - 1);
-    const exitPrice = candles[exitIdx].close;
-    const pnl =
-      side === "BUY" ? exitPrice - entryPrice : entryPrice - exitPrice;
-
-    trades.push({
-      entryIdx,
-      exitIdx,
-      entryTime: candles[entryIdx].time.toISOString(),
-      exitTime: candles[exitIdx].time.toISOString(),
-      side,
-      entryPrice,
-      exitPrice,
-      pnl: Number(pnl.toFixed(2)),
-    });
-  }
-
-  const equityCurve = trades.map((t, k) => {
-    const equity =
-      trades.slice(0, k + 1).reduce((a, b) => a + b.pnl, 0) + initialCap;
-    const c = candles[Math.min(candles.length - 1, Math.max(0, t.exitIdx))];
-    return {
-      time: c.time.toISOString(),
-      date: toLocalDateStr(c.time),
-      equity: Number(equity.toFixed(2)),
-      idx: t.exitIdx,
-    };
   });
+})();
 
-  const totalTrades = trades.length;
-  const wins = trades.filter((t) => t.pnl > 0).length;
-  const losses = trades.filter((t) => t.pnl <= 0).length;
-  const totalPnl = trades.reduce((a, b) => a + b.pnl, 0);
-  const avgPnl = totalTrades > 0 ? totalPnl / totalTrades : 0;
-
-  let peak = initialCap;
-  let maxDD = 0;
-  for (const pt of equityCurve) {
-    if (pt.equity > peak) peak = pt.equity;
-    const dd = peak - pt.equity;
-    if (dd > maxDD) maxDD = dd;
-  }
-
-  const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0;
-
-  return {
-    pnlPoints: Number(totalPnl.toFixed(2)),
-    pnlMoney: Number(
-      (totalPnl * Number(process.env.CONTRACT_POINT_VALUE || 1)).toFixed(2)
-    ),
-    params: {
-      symbol,
-      timeframe: tf,
-      from,
-      to,
-      exitMode,
-      barsHold: barsHoldNum,
-      initialCapital: initialCap,
-    },
-    summary: {
-      trades: totalTrades,
-      wins,
-      losses,
-      winRate: Number(winRate.toFixed(2)),
-      pnl: Number(totalPnl.toFixed(2)),
-      avgPnL: Number(avgPnl.toFixed(2)),
-      maxDrawdown: Number(maxDD.toFixed(2)),
-    },
-    equityCurve,
-    trades,
-    version: SERVER_VERSION,
-  };
-}
-
-// =================== ENDPOINTS INLINE PARA EVITAR 404 ===================
-app.get("/api/backtest", async (req, res) => {
-  logger.info("[BACKTEST] GET /api/backtest acionado", {
-    query: req.query,
-    version: SERVER_VERSION,
-  });
-  try {
-    const data = await handleBacktest(req.query || {});
-    return res.json(data);
-  } catch (err: any) {
-    logger.error("[BACKTEST][GET] Erro", { error: err?.message || err });
-    return res
-      .status(500)
-      .json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-app.post("/api/backtest", async (req, res) => {
-  logger.info("[BACKTEST] POST /api/backtest acionado", {
-    body: req.body,
-    version: SERVER_VERSION,
-  });
-  try {
-    const payload = { ...(req.query || {}), ...(req.body || {}) };
-    const data = await handleBacktest(payload);
-    return res.json(data);
-  } catch (err: any) {
-    logger.error("[BACKTEST][POST] Erro", { error: err?.message || err });
-    return res
-      .status(500)
-      .json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =================== ADMIN: Backfill de sinais confirmados ===================
-app.post("/admin/signals/backfill", async (req, res) => {
-  const { symbol, timeframe, from, to, emaFast, emaSlow } = req.body || {};
-  logger.info("[ADMIN] POST /admin/signals/backfill", {
-    symbol,
-    timeframe,
-    from,
-    to,
-    emaFast,
-    emaSlow,
-  });
-
-  if (!symbol || !timeframe) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "symbol e timeframe são obrigatórios" });
-  }
-  try {
-    const result = await backfillSignals({
-      symbol,
-      timeframe,
-      from,
-      to,
-      emaFast,
-      emaSlow,
-    });
-    return res.json({ ok: true, ...result });
-  } catch (err: any) {
-    logger.error("[ADMIN][backfill] Erro", { error: err?.message || err });
-    return res
-      .status(500)
-      .json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =================== Montagem dos routers existentes ===================
+// ====== ROTAS LEGADAS ======
 app.use("/api", routes);
 app.use("/admin", adminRoutes);
 
-// =================== Bootstraps/infra ===================
+// Health
+app.get("/healthz", (_req, res) =>
+  res.json({
+    ok: true,
+    service: "server",
+    version: "server:v4-inline-projected",
+  })
+);
+
+// Error handler final
+app.use(
+  (
+    err: any,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    const code = err?.status || 500;
+    const payload: any = {
+      ok: false,
+      error: err?.message || "internal",
+      where: "global",
+    };
+    if (err?.stack)
+      payload.diag = String(err.stack).split("\n").slice(0, 6).join("\n");
+    logger?.error?.("[global-error]", {
+      code,
+      msg: err?.message,
+      stack: err?.stack,
+    });
+    res.status(code).json(payload);
+  }
+);
+
 const server = createServer(app);
 const PORT = Number(process.env.PORT || 4000);
 
 server.listen(PORT, () => {
-  logger.info(`[SERVER] ouvindo em http://localhost:${PORT}`, {
-    version: SERVER_VERSION,
-  });
+  logger.info(`[SERVER] ouvindo em http://localhost:${PORT}`);
   try {
     bootCsvWatchersIfConfigured?.();
   } catch (e: any) {
     logger.warn("[CSVWatcher] módulo não carregado", { err: e?.message || e });
   }
-
   try {
     bootConfirmedSignalsWorker?.();
   } catch (e: any) {
@@ -585,10 +491,11 @@ server.listen(PORT, () => {
       err: e?.message || e,
     });
   }
-
   try {
     setupWS?.(server);
   } catch (e: any) {
     logger.warn("[WS] módulo não iniciado", { err: e?.message || e });
   }
 });
+
+export default server;

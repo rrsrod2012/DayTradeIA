@@ -1,524 +1,219 @@
-// backend/src/services/csvWatcher.ts (v7 — watcher resiliente + fix ENOENT + anti-duplicatas sem skipDuplicates)
-// Novidades desta versão:
-// - Continua observando o **diretório** (evita ENOENT) e faz heartbeat periódico.
-// - Logs enxutos (sem payload enorme).
-// - Lê tudo do .env.
-// - **Anti-duplicatas robusto** para Prisma antigo:
-//   1) Tenta createMany com skipDuplicates (quando suportado).
-//   2) Se não suportar, tenta createMany **sem** skipDuplicates.
-//   3) Se der **Unique constraint failed**, cai em fallback por registro
-//      (create individual com **ignore de P2002**), com **concorrência limitada**.
-//      Assim não estoura e não imprime o array de dados inteiro.
-
-import chokidar from "chokidar";
-import { promises as fs } from "fs";
+/* eslint-disable no-console */
+import fs from "fs";
 import path from "path";
-import { DateTime } from "luxon";
-import { prisma } from "../prisma";
+import chokidar from "chokidar";
 import logger from "../logger";
-import dotenv from "dotenv";
 
-dotenv.config();
+/**
+ * Observa arquivos CSV e, quando modificados, tenta reimportá-los.
+ *
+ * Como diferentes projetos usam nomes/caminhos distintos para o importador de CSV,
+ * aqui fazemos uma RESOLUÇÃO DINÂMICA em tempo de execução:
+ *
+ * - Tenta carregar, nesta ordem (primeira função encontrada vence):
+ *   1) process.env.CSV_IMPORTER (ex.: "../lib/csvImporter#importCsvFile")
+ *   2) ../lib/csvImporter (export default ou named importCsvFile / importCandlesFromCsv / importCsv)
+ *   3) ../lib/csvLoader   (mesma heurística de nomes)
+ *   4) ../services/csvImport (mesma heurística de nomes)
+ *
+ * Se nada for encontrado, apenas LOGA um aviso e NÃO interrompe o servidor.
+ *
+ * Variáveis de ambiente:
+ * - DADOS_DIR: diretório onde ficam os CSVs (ex.: C:\tmp\daytrade-ia\dados)
+ * - CSV_FILES: lista separada por vírgula dos arquivos a observar (default: WINM1.csv,WINM5.csv,WDOM1.csv,WDOM5.csv)
+ * - CSV_WATCH_POLLING=true/false (default: true no Windows)
+ * - CSV_IMPORTER="caminho#exportName" (opcional, para apontar explicitamente quem importa)
+ */
 
-type WatchCfg = {
-  filePath: string; // caminho completo do arquivo alvo
-  symbol: string; // ex.: WIN, WDO
-  timeframe?: string; // ex.: M1, M5
-  delimiter?: string; // força "," ou ";"; se omitido, autodetecta
-  header?: string; // ex.: time,o,h,l,c,v (opcional)
-  tzOffset?: string; // "-03:00" ou "America/Sao_Paulo"
-};
-
-// ==================== Carrega configuração de watchers ====================
-const ENV_JSON = (() => {
-  try {
-    const raw = process.env.MT_CSV_WATCHERS?.trim();
-    return raw ? (JSON.parse(raw) as WatchCfg[]) : [];
-  } catch {
-    return [];
-  }
-})();
-
-const FALLBACK_SINGLE: WatchCfg[] = process.env.MT_CSV_PATH
-  ? [
-      {
-        filePath: process.env.MT_CSV_PATH!,
-        symbol: (process.env.MT_SYMBOL || "WIN").toUpperCase(),
-        timeframe: (process.env.MT_TIMEFRAME || "M5").toUpperCase(),
-        delimiter: process.env.MT_DELIMITER || undefined,
-        header: process.env.MT_HEADER || undefined,
-        tzOffset: process.env.MT_TZ_OFFSET || "-03:00",
-      },
-    ]
-  : [];
-
-const WATCHERS: WatchCfg[] = (ENV_JSON.length ? ENV_JSON : FALLBACK_SINGLE).map(
-  (w) => ({
-    ...w,
-    symbol: (w.symbol || "WIN").toUpperCase(),
-    timeframe: (w.timeframe || "M5").toUpperCase(),
-    delimiter: w.delimiter || undefined,
-    header: w.header || undefined,
-    tzOffset: w.tzOffset || "-03:00",
-  })
-);
-
-// ==================== .env (com defaults seguros) ====================
-const LOG_SAMPLES = process.env.MT_CSV_LOG_SAMPLES === "1";
-const MAX_SAMPLES = Math.max(1, Number(process.env.MT_CSV_MAX_SAMPLES || 5));
-const USE_POLLING = process.env.CHOKIDAR_USEPOLLING === "1";
-const POLL_INTERVAL = Math.max(
-  250,
-  Number(process.env.CHOKIDAR_INTERVAL || 1000)
-);
-const HEARTBEAT_SECONDS = Math.max(
-  10,
-  Number(process.env.MT_HEARTBEAT_SEC || 45)
-);
-const MIN_INTERVAL_MS = Math.max(
-  500,
-  Number(process.env.MT_MIN_INTERVAL_MS || 4000)
-); // debounce entre imports
-const BATCH_SIZE = Math.max(200, Number(process.env.MT_CSV_BATCH_SIZE || 1000));
-const PRISMA_UPSERT_CONCURRENCY = Math.max(
-  1,
-  Number(process.env.PRISMA_UPSERT_CONCURRENCY || 16)
-);
-const PRISMA_DEDUPE = process.env.PRISMA_SKIP_DUPLICATES !== "0"; // tenta usar skipDuplicates se possível
-
-// ==================== Utilitários CSV ====================
-function guessDelimiterFromHeader(headerLine: string): "," | ";" {
-  const commas = (headerLine.match(/,/g) || []).length;
-  const semis = (headerLine.match(/;/g) || []).length;
-  return semis > commas ? ";" : ",";
+function pick<T>(x: T | undefined | null, def: T): T {
+  return x === undefined || x === null ? def : x;
 }
 
-function normalizeHeaderTokens(tokens: string[]) {
-  const map: Record<string, string> = {
-    time: "time",
-    datetime: "time",
-    date: "time",
-    timestamp: "time",
-    open: "o",
-    o: "o",
-    high: "h",
-    h: "h",
-    low: "l",
-    l: "l",
-    close: "c",
-    c: "c",
-    volume: "v",
-    vol: "v",
-    v: "v",
-    qty: "v",
-    quantidade: "v",
-  };
-  return tokens.map(
-    (x) => map[x.trim().toLowerCase()] ?? x.trim().toLowerCase()
-  );
+type ImportFn = (fullPath: string) => Promise<number | void> | number | void;
+
+function tryPickExport(mod: any): ImportFn | null {
+  if (!mod) return null;
+  // named
+  if (typeof mod.importCsvFile === "function")
+    return mod.importCsvFile as ImportFn;
+  if (typeof mod.importCandlesFromCsv === "function")
+    return mod.importCandlesFromCsv as ImportFn;
+  if (typeof mod.importCsv === "function") return mod.importCsv as ImportFn;
+  if (typeof mod.loadCsv === "function") return mod.loadCsv as ImportFn;
+  // default
+  if (typeof mod.default === "function") return mod.default as ImportFn;
+  return null;
 }
 
-function normalizeHeader(line: string, delim: "," | ";") {
-  const toks = line.split(delim).map((s) => s.trim());
-  return normalizeHeaderTokens(toks).join(",");
+function parseImporterEnv(
+  s: string
+): { modulePath: string; exportName?: string } | null {
+  if (!s) return null;
+  const [m, e] = s.split("#");
+  return { modulePath: m, exportName: e || undefined };
 }
 
-const DATE_FORMATS = [
-  "yyyy-LL-dd HH:mm:ss",
-  "yyyy-LL-dd HH:mm",
-  "yyyy-LL-dd'T'HH:mm:ss",
-  "yyyy-LL-dd'T'HH:mm",
-  "dd/LL/yyyy HH:mm:ss",
-  "dd/LL/yyyy HH:mm",
-  "dd/LL/yyyy",
-  "yyyy-LL-dd",
-  "yyyy.MM.dd HH:mm:ss",
-  "yyyy.MM.dd HH:mm",
-  "dd.MM.yyyy HH:mm:ss",
-  "dd.MM.yyyy HH:mm",
-];
-
-function parseTimeToISO(s: string, tzOffset?: string) {
-  let dt: DateTime | null = null;
-  for (const f of DATE_FORMATS) {
-    const candidate = DateTime.fromFormat(s, f);
-    if (candidate.isValid) {
-      dt = candidate;
-      break;
-    }
-  }
-  if (!dt) {
-    const iso = DateTime.fromISO(s);
-    if (iso.isValid) dt = iso;
-  }
-  if (!dt || !dt.isValid) return null;
-
-  const off = (tzOffset || "-03:00").trim();
-  const tz = /^([+-]\d{2}):?(\d{2})$/.test(off)
-    ? `UTC${off}`
-    : off.startsWith("UTC")
-    ? off
-    : off === "America/Sao_Paulo"
-    ? "America/Sao_Paulo"
-    : `UTC${off}`;
-
-  const withZone = dt.setZone(tz as any, { keepLocalTime: true });
-  if (!withZone.isValid) return null;
-  return withZone.toUTC().toISO();
-}
-
-function parseNum(s: string) {
-  const t = s.replace(/\./g, "").replace(",", ".");
-  const n = Number(t);
-  return Number.isFinite(n) ? n : NaN;
-}
-
-async function ensureInstrumentId(symbol: string) {
-  const up = await prisma.instrument.upsert({
-    where: { symbol },
-    update: {},
-    create: { symbol, name: symbol },
-  });
-  return up.id;
-}
-
-// ==================== Importação ====================
-
-type CsvRow = {
-  time: string;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
-};
-
-async function parseCsvFile(cfg: WatchCfg): Promise<CsvRow[]> {
-  const raw = await fs.readFile(cfg.filePath, "utf8");
-  const lines = raw.split(/\r?\n/).filter((ln) => ln.trim().length > 0);
-  if (lines.length < 2) return [];
-
-  const detected: "," | ";" =
-    cfg.delimiter === ";" || cfg.delimiter === ","
-      ? (cfg.delimiter as any)
-      : guessDelimiterFromHeader(lines[0]);
-
-  const headerLine = cfg.header ? cfg.header : lines[0];
-  const headerNorm = normalizeHeader(headerLine, detected);
-  const cols = headerNorm.split(",");
-  const idx = {
-    time: cols.indexOf("time"),
-    o: cols.indexOf("o"),
-    h: cols.indexOf("h"),
-    l: cols.indexOf("l"),
-    c: cols.indexOf("c"),
-    v: cols.indexOf("v"),
-  };
-  if (Object.values(idx).some((i) => i < 0)) {
-    logger.warn(
-      `[CSVWatcher] Cabeçalho inesperado: "${headerLine}" (detected ${detected})`
-    );
-    return [];
-  }
-
-  const out: CsvRow[] = [];
-  let badTime = 0,
-    badNum = 0;
-  const badSamples: string[] = [];
-  const dataStart = cfg.header ? 0 : 1;
-
-  for (let li = dataStart; li < lines.length; li++) {
-    const parts = lines[li].split(detected).map((s) => s.trim());
-    if (!parts.length || parts.length < cols.length) continue;
-
-    const iso = parseTimeToISO(parts[idx.time], cfg.tzOffset || "-03:00");
-    if (!iso) {
-      badTime++;
-      if (LOG_SAMPLES && badSamples.length < MAX_SAMPLES)
-        badSamples.push(`L${li + 1}:${parts[idx.time]}`);
-      continue;
-    }
-
-    const o = parseNum(parts[idx.o]);
-    const h = parseNum(parts[idx.h]);
-    const l = parseNum(parts[idx.l]);
-    const c = parseNum(parts[idx.c]);
-    const v = parseNum(parts[idx.v]);
-    if ([o, h, l, c, v].some((n) => Number.isNaN(n))) {
-      badNum++;
-      continue;
-    }
-
-    out.push({ time: iso, o, h, l, c, v });
-  }
-
-  if (badTime || badNum) {
-    logger.warn(
-      `[CSVWatcher] ${path.basename(
-        cfg.filePath
-      )}: descartadas ${badTime} datas inválidas e ${badNum} valores numéricos inválidos.`
-    );
-    if (LOG_SAMPLES && badSamples.length)
-      logger.warn(
-        `[CSVWatcher] amostras (limit ${MAX_SAMPLES}): ${badSamples.join("; ")}`
+async function resolveImporter(): Promise<ImportFn | null> {
+  // 1) CSV_IMPORTER explícito
+  const fromEnv = parseImporterEnv(process.env.CSV_IMPORTER || "");
+  if (fromEnv?.modulePath) {
+    try {
+      // caminho relativo a este arquivo
+      const baseDir = path.resolve(__dirname, "..");
+      const resolved = require.resolve(
+        path.resolve(baseDir, fromEnv.modulePath)
       );
-  }
-
-  out.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
-  return out;
-}
-
-// ============== Inserção com dedupe (fallback por registro) ==============
-
-async function createManyWithFallback(
-  rows: CsvRow[],
-  instrumentId: number,
-  timeframe: string
-) {
-  // Primeiro tenta createMany com/sem skipDuplicates
-  try {
-    await prisma.candle.createMany({
-      data: rows.map((r) => ({
-        instrumentId,
-        timeframe,
-        time: new Date(r.time),
-        open: r.o,
-        high: r.h,
-        low: r.l,
-        close: r.c,
-        volume: r.v,
-      })),
-      ...(PRISMA_DEDUPE ? { skipDuplicates: true as any } : {}),
-    } as any);
-    return { inserted: rows.length, dedupFallback: false };
-  } catch (e: any) {
-    const msg = String(e?.message || e);
-    if (/Unknown argument `skipDuplicates`/i.test(msg)) {
-      // Tenta novamente sem skipDuplicates (algumas versões antigas aceitam createMany puro)
-      try {
-        await prisma.candle.createMany({
-          data: rows.map((r) => ({
-            instrumentId,
-            timeframe,
-            time: new Date(r.time),
-            open: r.o,
-            high: r.h,
-            low: r.l,
-            close: r.c,
-            volume: r.v,
-          })),
-        });
-        return { inserted: rows.length, dedupFallback: false };
-      } catch (e2: any) {
-        // Se mesmo assim houver violação de única, cai no fallback individual
-        if (/Unique constraint failed/i.test(String(e2?.message || e2))) {
-          const res = await createIndividuallyIgnoringDuplicates(
-            rows,
-            instrumentId,
-            timeframe
-          );
-          return { ...res, dedupFallback: true };
-        }
-        logger.error(
-          `[CSVWatcher] createMany falhou sem skipDuplicates: ${String(
-            e2?.message || e2
-          )}`
-        );
-        throw e2;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const mod = require(resolved);
+      if (fromEnv.exportName) {
+        const fn = mod?.[fromEnv.exportName];
+        if (typeof fn === "function") return fn as ImportFn;
+      } else {
+        const fn = tryPickExport(mod);
+        if (fn) return fn;
       }
-    }
-    if (/Unique constraint failed/i.test(msg)) {
-      const res = await createIndividuallyIgnoringDuplicates(
-        rows,
-        instrumentId,
-        timeframe
+      logger?.warn?.(
+        "[CSVWatcher] CSV_IMPORTER encontrado mas não expõe função válida: %s",
+        process.env.CSV_IMPORTER
       );
-      return { ...res, dedupFallback: true };
-    }
-    logger.error(`[CSVWatcher] createMany falhou: ${msg}`);
-    throw e;
-  }
-}
-
-async function createIndividuallyIgnoringDuplicates(
-  rows: CsvRow[],
-  instrumentId: number,
-  timeframe: string
-) {
-  // Insere um a um, ignorando P2002 (duplicado) — com concorrência limitada
-  let ok = 0,
-    dup = 0,
-    fail = 0;
-  const limit = PRISMA_UPSERT_CONCURRENCY;
-  let i = 0;
-  async function worker() {
-    while (i < rows.length) {
-      const idx = i++;
-      const r = rows[idx];
-      try {
-        await prisma.candle.create({
-          data: {
-            instrumentId,
-            timeframe,
-            time: new Date(r.time),
-            open: r.o,
-            high: r.h,
-            low: r.l,
-            close: r.c,
-            volume: r.v,
-          },
-        });
-        ok++;
-      } catch (e: any) {
-        // P2002 = Unique constraint failed
-        if (
-          String(e?.code) === "P2002" ||
-          /Unique constraint failed/i.test(String(e?.message || e))
-        ) {
-          dup++;
-        } else {
-          fail++;
-          logger.error(
-            `[CSVWatcher] create(individual) falhou: ${String(e?.message || e)}`
-          );
-        }
-      }
-    }
-  }
-  const workers = Array.from({ length: limit }, () => worker());
-  await Promise.all(workers);
-  if (dup)
-    logger.warn(`[CSVWatcher] ${dup} registros já existiam (ignorados).`);
-  return { inserted: ok, duplicates: dup, failed: fail };
-}
-
-async function insertCandles(
-  rows: CsvRow[],
-  instrumentId: number,
-  timeframe: string
-) {
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const slice = rows.slice(i, i + BATCH_SIZE);
-    const { inserted, duplicates } = await createManyWithFallback(
-      slice,
-      instrumentId,
-      timeframe
-    );
-    logger.info(
-      `[CSVWatcher] lote processado: ${inserted} inseridos${
-        duplicates ? `, ${duplicates} duplicados` : ""
-      }`
-    );
-  }
-}
-
-// ==================== Ciclo de importação ====================
-
-type FileState = { mtimeMs: number; size: number; lastRun: number };
-const fileStates = new Map<string, FileState>();
-const missingWarned = new Set<string>(); // evita flood de ENOENT
-
-async function importIfChanged(cfg: WatchCfg) {
-  try {
-    const st = await fs.stat(cfg.filePath);
-    const prev = fileStates.get(cfg.filePath);
-    const now = Date.now();
-    if (prev && now - prev.lastRun < MIN_INTERVAL_MS) return; // debounce
-    if (!prev || prev.mtimeMs !== st.mtimeMs || prev.size !== st.size) {
-      const rows = await parseCsvFile(cfg);
-      if (rows.length) {
-        const instrumentId = await ensureInstrumentId(cfg.symbol);
-        const timeframe = cfg.timeframe || "M5";
-        await insertCandles(rows, instrumentId, timeframe);
-        logger.info(
-          `[CSVWatcher] importados ${rows.length} candles de ${path.basename(
-            cfg.filePath
-          )} (${cfg.symbol}/${timeframe})`
-        );
-      }
-      fileStates.set(cfg.filePath, {
-        mtimeMs: st.mtimeMs,
-        size: st.size,
-        lastRun: now,
-      });
-    }
-    // se conseguiu stat, zera o aviso de ausente
-    missingWarned.delete(cfg.filePath);
-  } catch (e: any) {
-    if ((e as any)?.code === "ENOENT") {
-      if (!missingWarned.has(cfg.filePath)) {
-        missingWarned.add(cfg.filePath);
-        logger.warn(`[CSVWatcher] aguardando arquivo: ${cfg.filePath}`);
-      }
-      return;
-    }
-    logger.warn(
-      `[CSVWatcher] importIfChanged falhou para ${cfg.filePath}: ${String(
+    } catch (e: any) {
+      logger?.warn?.(
+        "[CSVWatcher] Falha ao carregar CSV_IMPORTER %s: %s",
+        process.env.CSV_IMPORTER,
         e?.message || e
-      )}`
-    );
+      );
+    }
   }
-}
 
-function watchOne(cfg: WatchCfg) {
-  const abs = path.resolve(cfg.filePath);
-  const dir = path.dirname(abs);
-  const base = path.basename(abs);
+  // 2..4) Heurística por caminhos comuns
+  const candidates = [
+    "../lib/csvImporter",
+    "../lib/csvLoader",
+    "../services/csvImport",
+  ];
+  for (const c of candidates) {
+    try {
+      const resolved = require.resolve(path.resolve(__dirname, c));
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const mod = require(resolved);
+      const fn = tryPickExport(mod);
+      if (fn) {
+        logger?.info?.("[CSVWatcher] Importador CSV detectado em %s", c);
+        return fn;
+      }
+    } catch {
+      // segue tentando
+    }
+  }
 
-  // Observa o DIRETÓRIO; filtra pelo nome do arquivo.
-  const watcher = chokidar.watch(dir, {
-    persistent: true,
-    ignoreInitial: false,
-    awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 200 },
-    usePolling: USE_POLLING,
-    interval: POLL_INTERVAL,
-    binaryInterval: POLL_INTERVAL,
-    ignorePermissionErrors: true,
-    depth: 0,
-  });
-
-  const onChange = async (changedPath: string) => {
-    if (path.basename(changedPath) !== base) return;
-    await importIfChanged({ ...cfg, filePath: path.join(dir, base) });
-  };
-
-  watcher
-    .on("add", onChange)
-    .on("change", onChange)
-    .on("unlink", (p) => {
-      if (path.basename(p) === base) missingWarned.add(abs);
-    })
-    .on("error", (e) => logger.error(`[CSVWatcher] erro no watcher: ${e}`))
-    .on("ready", () =>
-      logger.info(
-        `[CSVWatcher] pronto para ${base} em ${dir} (polling=${
-          USE_POLLING ? "on" : "off"
-        })`
-      )
-    );
-
-  // Heartbeat (fallback): rescan periódico do arquivo alvo
-  const interval = setInterval(
-    () => importIfChanged({ ...cfg, filePath: path.join(dir, base) }),
-    HEARTBEAT_SECONDS * 1000
+  logger?.warn?.(
+    "[CSVWatcher] Nenhum importador CSV encontrado. Defina CSV_IMPORTER ou adicione um dos módulos esperados."
   );
-
-  // Primeira passada (se já existir)
-  importIfChanged({ ...cfg, filePath: path.join(dir, base) });
-
-  return () => {
-    clearInterval(interval);
-    watcher.close();
-  };
+  return null;
 }
 
-export function bootCsvWatchersIfConfigured() {
-  if (!WATCHERS.length) {
-    logger.info(`[CSVWatcher] módulo não configurado.`);
+export async function bootCsvWatchersIfConfigured() {
+  const dir = process.env.DADOS_DIR || process.env.CSV_DIR || "";
+  if (!dir) {
+    logger?.warn?.("[CSVWatcher] DADOS_DIR não definido — watcher desativado");
     return;
   }
-  logger.info(`[CSVWatcher] Inicializando ${WATCHERS.length} watcher(s)...`);
-  const stops: Array<() => void> = [];
-  for (const cfg of WATCHERS) stops.push(watchOne(cfg));
-  return () => stops.forEach((s) => s());
+  const polling = pick(
+    process.env.CSV_WATCH_POLLING === "false" ? false : true,
+    true
+  );
+  const filesEnv = (
+    process.env.CSV_FILES || "WINM1.csv,WINM5.csv,WDOM1.csv,WDOM5.csv"
+  )
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const importer = await resolveImporter();
+
+  logger?.info?.("[CSVWatcher] Inicializando watcher(s)...", {
+    dir,
+    files: filesEnv,
+    polling,
+    hasImporter: !!importer,
+  });
+
+  for (const fname of filesEnv) {
+    const full = path.resolve(dir, fname);
+    const exists = fs.existsSync(full);
+    logger?.info?.(
+      "[CSVWatcher] pronto para %s em %s (polling=%s, exists=%s)",
+      fname,
+      dir,
+      polling ? "on" : "off",
+      exists ? "yes" : "no"
+    );
+
+    const watcher = chokidar.watch(full, {
+      persistent: true,
+      ignoreInitial: false,
+      usePolling: polling,
+      interval: 1000,
+      binaryInterval: 1500,
+      awaitWriteFinish: {
+        stabilityThreshold: 1500,
+        pollInterval: 250,
+      },
+    });
+
+    const processFile = async (event: string) => {
+      try {
+        if (!fs.existsSync(full)) {
+          logger?.warn?.("[CSVWatcher] arquivo ausente %s (%s)", full, event);
+          return;
+        }
+        const stats = fs.statSync(full);
+        if (stats.size === 0) {
+          logger?.warn?.("[CSVWatcher] arquivo vazio %s", full);
+          return;
+        }
+        if (importer) {
+          const ret = await importer(full);
+          if (typeof ret === "number") {
+            logger?.info?.(
+              "[CSVWatcher] %s processado (%s): %d registros afetados",
+              path.basename(full),
+              event,
+              ret
+            );
+          } else {
+            logger?.info?.(
+              "[CSVWatcher] %s processado (%s)",
+              path.basename(full),
+              event
+            );
+          }
+        } else {
+          // Sem importador: apenas log para não travar o servidor
+          logger?.warn?.(
+            "[CSVWatcher] Mudança detectada em %s, mas nenhum importador está configurado.",
+            path.basename(full)
+          );
+        }
+      } catch (e: any) {
+        logger?.error?.(
+          "[CSVWatcher] erro ao processar %s: %s",
+          full,
+          e?.message || e
+        );
+      }
+    };
+
+    watcher
+      .on("add", () => processFile("add"))
+      .on("change", () => processFile("change"))
+      .on("rename", () => processFile("rename"))
+      .on("error", (err) =>
+        logger?.error?.(
+          "[CSVWatcher] erro watcher %s: %s",
+          full,
+          err?.message || err
+        )
+      );
+  }
 }

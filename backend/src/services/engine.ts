@@ -2,12 +2,12 @@
 import { DateTime } from "luxon";
 import { Config } from "../config";
 import { loadCandlesAnyTF } from "../lib/aggregation";
+import { EMA, ATR } from "./indicators";
 
-// Tipos básicos
+/** Tipos básicos */
 export type Side = "BUY" | "SELL" | "FLAT";
 type TrendBias = "UP" | "DOWN" | "SIDEWAYS";
 
-// Estrutura de candle mínima esperada de loadCandlesAnyTF
 type Candle = {
   time: Date;
   open: number;
@@ -17,35 +17,32 @@ type Candle = {
   volume?: number | null;
 };
 
-// Saída de sinal projetado
+/** Saída para a UI */
 export type ProjectedSignal = {
   side: Side;
-  suggestedEntry: number;
-  stopSuggestion?: number;
-  takeProfitSuggestion?: number;
-  conditionText: string;
-  validCandles: number;
-  expiresAt?: string;
+  suggestedEntry?: number | null;
+  stopSuggestion?: number | null;
+  takeProfitSuggestion?: number | null;
 
-  // Metricas de qualidade
-  score?: number;
-  probHit?: number;
-  probCalibrated?: number;
-  expectedValuePoints?: number;
+  conditionText?: string | null;
+  score?: number | null;
 
-  // Campos informativos adicionais
+  probHit?: number | null;
+  probCalibrated?: number | null;
+  expectedValuePoints?: number | null;
+
   time?: string; // ISO
   date?: string; // YYYY-MM-DD
 };
 
-// Opções de geração (batem com o que o frontend envia)
+/** Opções (compatível com o frontend atual) */
 export type GenerateOpts = {
   symbol: string;
   timeframe: string;
   from?: string | Date | null;
   to?: string | Date | null;
 
-  limit?: number; // quando from/to não são dados
+  limit?: number;
   horizon?: number;
   rr?: number;
   evalWindow?: number;
@@ -55,93 +52,167 @@ export type GenerateOpts = {
   tod?: boolean;
   conformal?: boolean;
 
-  // Risco/execução
+  /** Custos */
   costPts?: number;
   slippagePts?: number;
 
-  // Filtros/gates
+  /** Confirmação MTF */
   requireMtf?: boolean;
   confirmTf?: string;
+
+  /** Cooldown inteligente (não usado aqui) */
   cooldownSmart?: boolean;
+
+  /** Filtros de decisão */
   minProb?: number;
   minEV?: number;
 
-  // IA
+  /** IA micro-modelo (gateway p/ futura integração) */
   useMicroModel?: boolean;
+
+  /** Confluências adicionais */
+  vwapFilter?: boolean;
 };
 
-// Utils de data
+const MICRO_URL = process.env.MICRO_MODEL_URL || ""; // ex.: http://localhost:8000
+
+/* --------- Utils --------- */
 function toUtcRange(
   from?: string | Date | null,
   to?: string | Date | null
 ): { time?: { gte?: Date; lte?: Date } } {
-  const gte = from ? new Date(from) : undefined;
-  const lte = to ? new Date(to) : undefined;
+  const gte = from ? new Date(from as any) : undefined;
+  const lte = to ? new Date(to as any) : undefined;
   if (gte || lte)
     return { time: { ...(gte ? { gte } : {}), ...(lte ? { lte } : {}) } };
   return {};
 }
 
-function timeOfDayBucket(
-  ts: string | Date
-): "PRE" | "MORNING" | "MID" | "CLOSE" {
-  const d =
-    ts instanceof Date
-      ? DateTime.fromJSDate(ts, { zone: "America/Sao_Paulo" })
-      : DateTime.fromISO(ts, { zone: "America/Sao_Paulo" });
-  const hh = d.hour;
-  if (hh < 10) return "PRE";
-  if (hh < 12) return "MORNING";
-  if (hh < 15) return "MID";
-  return "CLOSE";
+function logisticCalibrate(p: number): number {
+  // placeholder simples e monotônico (a ser substituído por calibração real)
+  const z = Math.max(1e-6, Math.min(1 - 1e-6, p));
+  const shifted = 1 / (1 + Math.exp(-((z - 0.5) * 3)));
+  return Math.max(0.0, Math.min(1.0, shifted));
 }
 
-// Indicadores simples
-function ema(vals: number[], p: number): number[] {
-  if (!vals.length || p <= 1) return vals.slice();
-  const k = 2 / (p + 1);
-  let e: number | null = null;
-  return vals.map((v) => {
-    e = e === null ? v : v * k + e * (1 - k);
-    return e!;
-  });
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
 }
 
-function inferTrend(closes: number[]): TrendBias {
-  if (closes.length < 5) return "SIDEWAYS";
-  const a = closes[0];
-  const b = closes[closes.length - 1];
-  const chg = (b - a) / Math.max(1, Math.abs(a));
-  if (chg > 0.002) return "UP";
-  if (chg < -0.002) return "DOWN";
-  return "SIDEWAYS";
+function trendFrom(
+  ema9: (number | null)[],
+  ema21: (number | null)[],
+  i: number
+): TrendBias {
+  if (ema9[i] == null || ema21[i] == null) return "SIDEWAYS";
+  const e9 = ema9[i] as number,
+    e21 = ema21[i] as number;
+  const prev9 = i > 0 && ema9[i - 1] != null ? (ema9[i - 1] as number) : e9;
+  const prev21 = i > 0 && ema21[i - 1] != null ? (ema21[i - 1] as number) : e21;
+  if (e9 > e21 && prev9 >= prev21) return "UP";
+  if (e9 < e21 && prev9 <= prev21) return "DOWN";
+  return e9 > e21 ? "UP" : e9 < e21 ? "DOWN" : "SIDEWAYS";
 }
 
-// Probabilidade base simples em função do regime e horário
-function baseProbFromContext(
-  bias: TrendBias,
-  tod: "PRE" | "MORNING" | "MID" | "CLOSE",
-  side: Side
-): number {
-  let p = 0.5;
-  if (bias === "UP" && side === "BUY") p += 0.06;
-  if (bias === "DOWN" && side === "SELL") p += 0.06;
-  if (tod === "MORNING" || tod === "MID") p += 0.02; // mais liquidez
-  if (tod === "PRE" || tod === "CLOSE") p -= 0.01;
-  return Math.max(0.05, Math.min(0.95, p));
+/** Arredondamento a tick (pontos); default 1 ponto */
+function roundToTick(price: number, tick = 1): number {
+  if (!isFinite(price) || tick <= 0) return price;
+  return Math.round(price / tick) * tick;
 }
 
-// Recalibração logística (stub)
-function logisticCalibrate(pRaw: number): number {
-  // z = a + b * (pRaw - 0.5)
-  const a = 0.2;
-  const b = 2.0;
-  const z = a + b * (pRaw - 0.5);
-  const p = 1 / (1 + Math.exp(-z));
-  return Math.max(0.01, Math.min(0.99, p));
+/** VWAP intradiário (ancorado no início do dia, reinicia a cada data local BRT) */
+function vwapAnchoredDaily(
+  candles: Candle[],
+  zone = "America/Sao_Paulo"
+): (number | null)[] {
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  let curDay = "";
+  let cumPV = 0;
+  let cumV = 0;
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const d = DateTime.fromJSDate(c.time).setZone(zone).toFormat("yyyy-LL-dd");
+    if (d !== curDay) {
+      curDay = d;
+      cumPV = 0;
+      cumV = 0;
+    }
+    const tp = (c.high + c.low + c.close) / 3;
+    const v = (c.volume ?? 1) || 1;
+    cumPV += tp * v;
+    cumV += v;
+    out[i] = cumV > 0 ? cumPV / cumV : tp;
+  }
+  return out;
 }
 
-// ---------- Função principal ----------
+/** Busca índice do TF de confirmação com tempo <= t, avançando ponteiro */
+function advanceIdxUntil(times: Date[], startIdx: number, t: Date): number {
+  let j = Math.max(0, startIdx);
+  while (j + 1 < times.length && times[j + 1] <= t) j++;
+  return j;
+}
+
+/** Monta features compatíveis com o micro-modelo */
+function buildFeatures(
+  i: number,
+  candles: Candle[],
+  e9: (number | null)[],
+  e21: (number | null)[],
+  atr: (number | null)[],
+  vwap: (number | null)[]
+) {
+  const c = candles[i];
+  const prev = candles[i - 1] ?? c;
+  const _atr = (atr[i] ?? atr[i - 1] ?? 1) as number;
+  const _e9 = (e9[i] ?? e9[i - 1] ?? c.close) as number;
+  const _e21 = (e21[i] ?? e21[i - 1] ?? c.close) as number;
+  const _vwap = (vwap[i] ?? vwap[i - 1] ?? c.close) as number;
+
+  const ret1 = (c.close - prev.close) / Math.max(1e-6, _atr);
+  const slope9 = ((e9[i] ?? _e9) as number) - ((e9[i - 1] ?? _e9) as number);
+  const slope21 =
+    ((e21[i] ?? _e21) as number) - ((e21[i - 1] ?? _e21) as number);
+
+  const feat = {
+    dist_ema21: (c.close - _e21) / Math.max(1e-6, _atr),
+    dist_vwap: (c.close - _vwap) / Math.max(1e-6, _atr),
+    slope_e9: slope9 / Math.max(1e-6, _atr),
+    slope_e21: slope21 / Math.max(1e-6, _atr),
+    range_ratio: (c.high - c.low) / Math.max(1e-6, _atr),
+    ret1,
+    hour: DateTime.fromJSDate(c.time).setZone("America/Sao_Paulo").hour,
+  };
+  return feat;
+}
+
+/** Chama microserviço de IA (FastAPI) para obter probabilidade calibrada */
+async function microPredict(
+  features: Record<string, number>
+): Promise<number | null> {
+  if (!MICRO_URL) return null;
+  try {
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 1200);
+    // @ts-ignore - Node 18+ possui fetch global
+    const resp = await fetch(`${MICRO_URL.replace(/\/+$/, "")}/predict`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ features }),
+      signal: controller.signal,
+    });
+    clearTimeout(to);
+    if (!resp.ok) return null;
+    const j = await resp.json();
+    if (typeof j?.p === "number" && isFinite(j.p)) return clamp(j.p, 0, 1);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/* --------- Função principal --------- */
 export async function generateProjectedSignals(
   opts: GenerateOpts
 ): Promise<ProjectedSignal[]> {
@@ -154,9 +225,9 @@ export async function generateProjectedSignals(
     limit = 500,
     horizon = 8,
     rr = 2,
-    evalWindow = 200,
+    evalWindow = 200, // usado p/ suavização
     adaptive = true,
-    cooldown = true,
+    cooldown = true, // mantido por compat — não aplicado aqui
     regime = true,
     tod = true,
     conformal = false,
@@ -164,7 +235,6 @@ export async function generateProjectedSignals(
     costPts = Config.COST_PER_TRADE_POINTS,
     slippagePts = Config.SLIPPAGE_POINTS,
 
-    // não usados diretamente aqui, mas mantidos por compatibilidade
     requireMtf = Config.REQUIRE_MTF_CONFIRM,
     confirmTf = Config.MTF_CONFIRM_TF,
     cooldownSmart = Config.COOLDOWN_SMART,
@@ -173,140 +243,162 @@ export async function generateProjectedSignals(
     minEV = 0,
 
     useMicroModel = false,
+    vwapFilter = true,
   } = opts;
 
   const range = toUtcRange(from || undefined, to || undefined).time;
 
-  // Carrega candles do TF solicitado
-  let candles: Candle[] = await loadCandlesAnyTF(
-    symbol,
-    timeframe,
-    range as any
-  );
+  // Carrega candles do TF solicitado (usa fallback de agregação do módulo)
+  const symbolU = String(symbol).toUpperCase();
+  const tfU = String(timeframe).toUpperCase();
+  const candles = await loadCandlesAnyTF(symbolU, tfU, range as any);
+  if (!candles?.length) return [];
 
-  if (!candles || candles.length === 0) return [];
-
-  // Se não há range explícito, aplica limite no final (mais recentes)
-  if ((!range || (!range.gte && !range.lte)) && limit && limit > 0) {
-    candles = candles.slice(-limit);
-  }
-
+  const highs = candles.map((c) => c.high);
+  const lows = candles.map((c) => c.low);
   const closes = candles.map((c) => c.close);
-  const bias = inferTrend(closes);
-  const last = candles[candles.length - 1];
 
-  // EMA 21 como referência de entrada
-  const e21 = ema(closes, 21);
-  const lastE = e21[e21.length - 1];
+  // Indicadores principais MTF=base
+  const e9 = EMA(closes, 9);
+  const e21 = EMA(closes, 21);
+  const atrArr = ATR(highs, lows, closes, 14);
+  const vwap = vwapAnchoredDaily(candles, "America/Sao_Paulo");
 
-  // Bucket horário
-  const todBucket = tod ? timeOfDayBucket(last.time) : "MID";
-
-  // Calcula um tamanho de alvo/stop simples (ATR não disponível aqui; usa desvio aproximado)
-  const recent = closes.slice(-Math.max(10, Math.min(closes.length, 50)));
-  const mean = recent.reduce((a, b) => a + b, 0) / Math.max(1, recent.length);
-  const dev =
-    recent.length > 1
-      ? Math.sqrt(
-          recent.reduce((a, b) => a + Math.pow(b - mean, 2), 0) /
-            (recent.length - 1)
-        )
-      : Math.max(1, Math.abs(last.close) * 0.001);
-  const basePoints = Math.max(1, dev); // "pontos" aproximados
-
-  // Duas candidatas: BUY na EMA e SELL na EMA (exemplo simples)
-  const candidates: ProjectedSignal[] = [];
-
-  // BUY
-  {
-    const entry = Math.round(lastE);
-    const sl = Math.round(entry - basePoints);
-    const tp = Math.round(entry + rr * basePoints);
-    const side: Side = "BUY";
-    let prob = baseProbFromContext(bias, todBucket, side);
-    // conformal "dummy": p -= 0.01
-    if (conformal) prob = Math.max(0.01, prob - 0.01);
-    const evPts =
-      prob * Math.abs(tp - entry) -
-      (1 - prob) * Math.abs(entry - sl) -
-      (costPts + slippagePts);
-
-    candidates.push({
-      side,
-      suggestedEntry: entry,
-      stopSuggestion: sl,
-      takeProfitSuggestion: tp,
-      conditionText: `EMA21 touch/bounce (${bias})`,
-      validCandles: Math.max(2, horizon),
-      time: last.time.toISOString(),
-      date: DateTime.fromJSDate(last.time).toISODate() || undefined,
-      score: 1,
-      probHit: prob,
-      expectedValuePoints: evPts,
-    });
-  }
-
-  // SELL
-  {
-    const entry = Math.round(lastE);
-    const sl = Math.round(entry + basePoints);
-    const tp = Math.round(entry - rr * basePoints);
-    const side: Side = "SELL";
-    let prob = baseProbFromContext(bias, todBucket, side);
-    if (conformal) prob = Math.max(0.01, prob - 0.01);
-    const evPts =
-      prob * Math.abs(entry - tp) -
-      (1 - prob) * Math.abs(sl - entry) -
-      (costPts + slippagePts);
-
-    candidates.push({
-      side,
-      suggestedEntry: entry,
-      stopSuggestion: sl,
-      takeProfitSuggestion: tp,
-      conditionText: `EMA21 rejection (${bias})`,
-      validCandles: Math.max(2, horizon),
-      time: last.time.toISOString(),
-      date: DateTime.fromJSDate(last.time).toISODate() || undefined,
-      score: 1,
-      probHit: prob,
-      expectedValuePoints: evPts,
-    });
-  }
-
-  // Micro-modelo (stub) — recalibra probabilidade e atualiza EV
-  if (useMicroModel) {
-    for (const c of candidates) {
-      const base = typeof c.probHit === "number" ? c.probHit : 0.5;
-      const pCal = logisticCalibrate(base);
-      c.probCalibrated = pCal;
-
-      if (
-        typeof c.suggestedEntry === "number" &&
-        typeof c.stopSuggestion === "number" &&
-        typeof c.takeProfitSuggestion === "number"
-      ) {
-        const tpPts = Math.abs(c.takeProfitSuggestion - c.suggestedEntry);
-        const slPts = Math.abs(c.suggestedEntry - c.stopSuggestion);
-        c.expectedValuePoints =
-          pCal * tpPts - (1 - pCal) * slPts - (costPts + slippagePts);
-      }
+  // MTF de confirmação (opcional)
+  let confirmTimes: Date[] = [];
+  let confirmE9: (number | null)[] = [];
+  let confirmE21: (number | null)[] = [];
+  if (requireMtf && confirmTf) {
+    const conf = await loadCandlesAnyTF(
+      symbolU,
+      String(confirmTf).toUpperCase(),
+      range as any
+    );
+    if (conf?.length) {
+      const cCloses = conf.map((c) => c.close);
+      confirmTimes = conf.map((c) => c.time);
+      confirmE9 = EMA(cCloses, 9);
+      confirmE21 = EMA(cCloses, 21);
     }
   }
 
-  // Gates finais por minProb/minEV
+  // Heurística de sessão/Time-Of-Day (opcional)
+  const allowedHour = (d: Date) => {
+    if (!tod) return true;
+    const dt = DateTime.fromJSDate(d).setZone("America/Sao_Paulo");
+    const h = dt.hour;
+    if (h < 9 || h > 18) return false;
+    if (h === 9 && dt.minute < 15) return false;
+    if (h === 18 && dt.minute > 0) return false;
+    return true;
+  };
+
+  const tick = Number(process.env.TICK_SIZE_POINTS || 1);
+
   const out: ProjectedSignal[] = [];
-  for (const s of candidates) {
-    const p = s.probCalibrated ?? s.probHit ?? 0;
-    const ev = s.expectedValuePoints ?? 0;
-    if (minProb > 0 && p < minProb) continue;
-    if (minEV > 0 && ev < minEV) continue;
-    out.push(s);
+  let j = 0; // ponteiro no TF de confirmação
+  for (let i = 30; i < candles.length; i++) {
+    const cndl = candles[i];
+    if (!allowedHour(cndl.time)) continue;
+    if (e21[i] == null || e9[i] == null || atrArr[i] == null || vwap[i] == null)
+      continue;
+
+    const atr = atrArr[i] as number;
+    const ema21 = e21[i] as number;
+    const bias = trendFrom(e9, e21, i);
+
+    // Confluência VWAP (opcional): BUY não muito abaixo do VWAP; SELL não muito acima
+    const _vwap = vwap[i] as number;
+    if (vwapFilter) {
+      if (bias === "UP" && cndl.close < _vwap) continue;
+      if (bias === "DOWN" && cndl.close > _vwap) continue;
+    }
+
+    // Sinal do tipo "EMA21 bounce" com ajuste por ATR
+    let side: Side | null = null;
+    const touched = cndl.low <= ema21 && cndl.high >= ema21;
+
+    if (bias === "UP" && touched && cndl.close >= ema21) {
+      side = "BUY";
+    } else if (bias === "DOWN" && touched && cndl.close <= ema21) {
+      side = "SELL";
+    }
+    if (!side) continue;
+
+    // Confirmação MTF: exige viés no TF maior na mesma direção
+    if (requireMtf && confirmTimes.length) {
+      j = advanceIdxUntil(confirmTimes, j, cndl.time);
+      const e9c = confirmE9[j],
+        e21c = confirmE21[j];
+      if (e9c != null && e21c != null) {
+        const confBias: TrendBias =
+          (e9c as number) > (e21c as number)
+            ? "UP"
+            : (e9c as number) < (e21c as number)
+            ? "DOWN"
+            : "SIDEWAYS";
+        if (side === "BUY" && confBias !== "UP") continue;
+        if (side === "SELL" && confBias !== "DOWN") continue;
+      }
+    }
+
+    const entry = roundToTick(ema21, tick);
+    const sl =
+      side === "BUY"
+        ? roundToTick(entry - 1 * atr, tick)
+        : roundToTick(entry + 1 * atr, tick);
+    const tp =
+      side === "BUY"
+        ? roundToTick(entry + rr * atr, tick)
+        : roundToTick(entry - rr * atr, tick);
+
+    // Probabilidade heurística + micro-modelo opcional
+    const sep = Math.abs((e9[i]! - e21[i]!) / Math.max(1e-6, atr));
+    let p = clamp(
+      0.5 + (side === "BUY" ? 1 : -1) * Math.min(0.15, sep * 0.03),
+      0.35,
+      0.65
+    );
+
+    if (useMicroModel && MICRO_URL) {
+      const feats = buildFeatures(i, candles, e9, e21, atrArr, vwap);
+      const pModel = await microPredict(feats);
+      if (pModel != null) {
+        p = pModel; // já calibrado pelo serviço
+      } else {
+        p = logisticCalibrate(p); // fallback suave
+      }
+    }
+
+    const tpPts = Math.abs(tp - entry);
+    const slPts = Math.abs(entry - sl);
+    const evPts = p * tpPts - (1 - p) * slPts - (costPts + slippagePts);
+
+    if (p < (minProb || 0)) continue;
+    if (evPts < (minEV || 0)) continue;
+
+    out.push({
+      side,
+      suggestedEntry: entry,
+      stopSuggestion: sl,
+      takeProfitSuggestion: tp,
+      conditionText: `EMA21 bounce (${bias}) • ATR14=${atr.toFixed(
+        2
+      )} • RR=${rr} • ${vwapFilter ? "VWAP✓" : "VWAP–"}${
+        requireMtf && confirmTimes.length ? " • MTF✓" : ""
+      }`,
+      score: sep,
+      probHit: p,
+      probCalibrated: useMicroModel ? p : undefined,
+      expectedValuePoints: Number(evPts.toFixed(2)),
+      time: cndl.time.toISOString(),
+      date: DateTime.fromJSDate(cndl.time).toFormat("yyyy-LL-dd"),
+    });
+
+    if (!range && out.length >= limit) break;
   }
 
-  return out;
+  return range ? out : out.slice(-limit);
 }
 
-export default {
-  generateProjectedSignals,
-};
+export default { generateProjectedSignals };
