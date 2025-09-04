@@ -1,5 +1,8 @@
-# exemplos
+# Gera candles M5 a partir de M1 + grava sinais em cima de M5
 npx ts-node scripts/rebuild-confirmed-signals.ts --symbol WIN --timeframe M5
+
+# Janela específica (recomendado p/ testar)
 npx ts-node scripts/rebuild-confirmed-signals.ts --symbol WIN --timeframe M5 --from 2025-08-01 --to 2025-09-04
-# dry-run (não grava no banco)
-npx ts-node scripts/rebuild-confirmed-signals.ts --symbol WDO --timeframe M1 --from 2025-01-01 --to 2025-01-31 --dry
+
+# Se sua base for grande e você quiser limitar a leitura de M1 (por performance):
+npx ts-node scripts/rebuild-confirmed-signals.ts --symbol WIN --timeframe M5 --limit 200000

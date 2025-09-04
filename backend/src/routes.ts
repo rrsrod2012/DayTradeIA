@@ -37,13 +37,6 @@ const toLocalDateStr = (d: Date) =>
   DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd");
 
 /* ---------------- utils do TF ---------------- */
-const TF_MINUTES: Record<string, number> = {
-  M1: 1,
-  M5: 5,
-  M15: 15,
-  M30: 30,
-  H1: 60,
-};
 function tfToMinutes(tfRaw: string) {
   const s = String(tfRaw || "")
     .trim()
@@ -81,7 +74,7 @@ router.get("/candles", async (req, res) => {
       rows = await prisma.candle.findMany({
         where: {
           ...(baseRange ? { time: baseRange } : {}),
-          OR: variants.map((v) => ({ instrument: { is: { symbol: v } } })),
+          instrument: { is: { symbol: { in: variants } } },
           timeframe: { in: [String(timeframe).toUpperCase(), String(tfMin)] },
         },
         orderBy: { time: "asc" },
@@ -96,14 +89,14 @@ router.get("/candles", async (req, res) => {
       });
     }
 
-    // fallback M1->TF (em memória) se necessário
+    // fallback M1->TF (agregação em memória)
     const haveExactTF = rows.length > 0 && tfMin <= 1;
     if (!haveExactTF && tfMin > 1) {
       const m1 = await prisma.candle.findMany({
         where: {
           ...(baseRange ? { time: baseRange } : {}),
-          OR: variants.map((v) => ({ instrument: { is: { symbol: v } } })),
-          timeframe: { in: ["M1", "1", "M-1"] },
+          instrument: { is: { symbol: { in: variants } } },
+          timeframe: { in: ["M1", "1"] },
         },
         orderBy: { time: "asc" },
         select: {
@@ -171,10 +164,12 @@ router.get("/candles", async (req, res) => {
   }
 });
 
-/* ------------------------ SINAIS CONFIRMADOS (robusto por candleId) ------------------------ */
+/* ------------------------ /signals (CONFIRMADOS) ------------------------ */
 router.get("/signals", async (req, res) => {
   try {
     const {
+      symbol: symbolQ,
+      timeframe: timeframeQ,
       from: _from,
       to: _to,
       dateFrom,
@@ -182,84 +177,53 @@ router.get("/signals", async (req, res) => {
       limit = "200",
     } = req.query as any;
 
+    const symbol = (symbolQ ? String(symbolQ).trim() : "").toUpperCase();
+    const tfUpper =
+      (timeframeQ ? String(timeframeQ).trim().toUpperCase() : "") || undefined;
+    const tfNum = tfUpper ? String(tfToMinutes(tfUpper)) : undefined;
+
     const from = (_from as string) || (dateFrom as string) || undefined;
     const to = (_to as string) || (dateTo as string) || undefined;
     const range = toUtcRange(from, to);
     const effLimit = Number(limit) || 200;
 
-    let signalRows: {
-      id: number;
-      side: "BUY" | "SELL";
-      signalType: string | null;
-      score: number | null;
-      reason: string | null;
-      candleId: number | null;
-    }[] = [];
+    const whereBase: any = {};
+    if (range) whereBase.candle = { is: { time: range } } as any;
 
-    if (range) {
-      const candleIds = await prisma.candle.findMany({
-        where: { time: range },
-        select: { id: true },
-        orderBy: { time: "asc" },
-      });
-      const ids = candleIds.map((c) => c.id);
-      signalRows = ids.length
-        ? await prisma.signal.findMany({
-            where: { candleId: { in: ids } },
-            orderBy: [{ candleId: "asc" }, { id: "asc" }],
-            select: {
-              id: true,
-              side: true,
-              signalType: true,
-              score: true,
-              reason: true,
-              candleId: true,
-            },
-          })
-        : [];
-    } else {
-      signalRows = await prisma.signal.findMany({
-        orderBy: { id: "desc" },
-        take: effLimit,
-        select: {
-          id: true,
-          side: true,
-          signalType: true,
-          score: true,
-          reason: true,
-          candleId: true,
+    const signals = await prisma.signal.findMany({
+      where: whereBase,
+      orderBy: [{ id: "desc" }],
+      take: effLimit,
+      include: {
+        candle: {
+          select: {
+            id: true,
+            time: true,
+            open: true,
+            high: true,
+            low: true,
+            close: true,
+            volume: true,
+            timeframe: true,
+            instrument: { select: { symbol: true } },
+          },
         },
-      });
-      signalRows = signalRows.sort((a, b) => a.id - b.id);
-    }
-
-    if (!signalRows.length) return res.json([]);
-
-    const uniqCandleIds = Array.from(
-      new Set(signalRows.map((s) => s.candleId).filter(Boolean))
-    ) as number[];
-    const candles = await prisma.candle.findMany({
-      where: { id: { in: uniqCandleIds } },
-      select: {
-        id: true,
-        time: true,
-        open: true,
-        high: true,
-        low: true,
-        close: true,
-        volume: true,
       },
     });
-    const byId = new Map(candles.map((c) => [c.id, c]));
 
-    const out = signalRows
+    if (!signals.length) return res.json([]);
+
+    const rows = signals
       .map((s) => {
-        const c = s.candleId ? byId.get(s.candleId) : undefined;
+        const c = s.candle;
         if (!c) return null;
+        const sym = c.instrument?.symbol ?? null;
+        const tf = c.timeframe ?? null;
+
         return {
           id: s.id,
           side: s.side,
-          type: s.signalType,
+          signalType: s.signalType,
           score: s.score ?? null,
           reason: s.reason ?? null,
           time: c.time.toISOString(),
@@ -269,20 +233,47 @@ router.get("/signals", async (req, res) => {
           low: c.low,
           close: c.close,
           volume: c.volume ?? null,
+          symbol: sym,
+          timeframe: tf,
+          price: c.close, // necessário para o grid
         };
       })
-      .filter(Boolean);
+      .filter(Boolean) as any[];
 
-    return res.json(out);
+    const filtered = rows.filter((r) => {
+      const okSym = symbol
+        ? String(r.symbol || "").toUpperCase() === symbol
+        : true;
+      const okTf = tfUpper
+        ? String(r.timeframe || "").toUpperCase() === tfUpper ||
+          String(r.timeframe || "") === tfNum ||
+          r.timeframe == null
+        : true;
+      if (range) {
+        const t = new Date(r.time).getTime();
+        const gte = (range as any).gte
+          ? new Date((range as any).gte).getTime()
+          : -Infinity;
+        const lte = (range as any).lte
+          ? new Date((range as any).lte).getTime()
+          : Infinity;
+        if (t < gte || t > lte) return false;
+      }
+      return okSym && okTf;
+    });
+
+    filtered.sort((a, b) => a.time.localeCompare(b.time));
+    return res.json(filtered);
   } catch (err: any) {
     logger.error("[/signals] erro", { message: err?.message });
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
-/* ----------------------- SINAIS PROJETADOS ----------------------- */
-router.post("/signals/projected", async (req, res) => {
+/* ----------------------- /signals/projected ----------------------- */
+router.all("/signals/projected", async (req, res) => {
   try {
+    const q = (req.method === "GET" ? req.query : req.query) as any;
     const {
       symbol = "WIN",
       timeframe = "M5",
@@ -292,7 +283,7 @@ router.post("/signals/projected", async (req, res) => {
       dateTo,
       limit = "500",
       ...rest
-    } = req.query as any;
+    } = q;
 
     const from = (_from as string) || (dateFrom as string);
     const to = (_to as string) || (dateTo as string);
@@ -300,21 +291,29 @@ router.post("/signals/projected", async (req, res) => {
     const effLimit = userHasRange ? undefined : Number(limit) || 500;
 
     const extra = Object.fromEntries(
-      Object.entries(rest).map(([k, v]) => [
+      Object.entries(rest || {}).map(([k, v]) => [
         k,
-        isNaN(Number(v)) ? v : Number(v),
+        isNaN(Number(v as any)) ? v : Number(v),
       ])
     ) as Record<string, any>;
 
-    const items =
-      ((await generateProjectedSignals?.({
-        symbol: String(symbol).toUpperCase(),
-        timeframe: String(timeframe).toUpperCase(),
-        from: (from as string) || undefined,
-        to: (to as string) || undefined,
-        limit: effLimit,
-        ...extra,
-      })) as any[]) ?? [];
+    let items: any[] = [];
+    try {
+      items =
+        ((await generateProjectedSignals?.({
+          symbol: String(symbol).toUpperCase(),
+          timeframe: String(timeframe).toUpperCase(),
+          from: (from as string) || undefined,
+          to: (to as string) || undefined,
+          limit: effLimit,
+          ...extra,
+        })) as any[]) ?? [];
+    } catch (inner: any) {
+      logger.warn("[/signals/projected] engine falhou, usando vazio", {
+        message: inner?.message,
+      });
+      items = [];
+    }
 
     const out: any[] = [];
     let prevKey = "";
@@ -327,8 +326,11 @@ router.post("/signals/projected", async (req, res) => {
 
     res.json(out);
   } catch (e: any) {
-    logger.error("[/signals/projected] erro", { message: e?.message });
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    logger.error("[/signals/projected] erro inesperado", {
+      message: e?.message,
+      stack: e?.stack,
+    });
+    res.json([]);
   }
 });
 
@@ -337,10 +339,12 @@ router.post("/ml/feedback", express.json(), async (req, res) => {
   try {
     const base = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
     if (!base)
-      return res.status(400).json({
-        ok: false,
-        error: "MICRO_MODEL_URL não configurada no backend",
-      });
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "MICRO_MODEL_URL não configurada no backend",
+        });
 
     const body = req.body || {};
     let rows = Array.isArray(body?.rows) ? body.rows : null;
@@ -409,6 +413,169 @@ router.post("/ml/auto/stop", (_req, res) => {
 });
 router.get("/ml/auto/status", (_req, res) => {
   return res.status(200).json(statusAutoTrainer());
+});
+
+/* ------------------------ DEBUG: signals ------------------------ */
+router.get("/debug/signals", async (_req, res) => {
+  try {
+    const candles = await prisma.candle.count();
+    const signals = await prisma.signal.count();
+    const withCandle = await prisma.signal.count({
+      where: { candleId: { gt: 0 } },
+    });
+
+    const lastSignals = await prisma.signal.findMany({
+      orderBy: { id: "desc" },
+      take: 5,
+      include: {
+        candle: {
+          select: {
+            id: true,
+            time: true,
+            open: true,
+            high: true,
+            low: true,
+            close: true,
+            volume: true,
+            timeframe: true,
+            instrument: { select: { symbol: true } },
+          },
+        },
+      },
+    });
+
+    res.json({
+      ok: true,
+      totals: { candles, signals, signalsWithCandleId: withCandle },
+      sample: lastSignals.map((s) => ({
+        id: s.id,
+        side: s.side,
+        signalType: s.signalType,
+        candleId: s.candleId,
+        candle: s.candle
+          ? {
+              id: s.candle.id,
+              time: s.candle.time,
+              timeframe: s.candle.timeframe,
+              symbol: s.candle.instrument?.symbol ?? null,
+              close: s.candle.close,
+            }
+          : null,
+      })),
+    });
+  } catch (e: any) {
+    res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* ------------------------ DEBUG: candles (com filtros) ------------------------ */
+router.get("/debug/candles", async (req, res) => {
+  try {
+    const {
+      symbol = "",
+      timeframe = "",
+      from,
+      to,
+      limit = "5000",
+    } = req.query as any;
+    const variants = symbol
+      ? Array.from(
+          new Set([
+            String(symbol),
+            String(symbol).toUpperCase(),
+            String(symbol).toLowerCase(),
+          ])
+        )
+      : [];
+    const range = toUtcRange(from, to);
+
+    const rows = await prisma.candle.findMany({
+      where: {
+        ...(range ? { time: range } : {}),
+        ...(variants.length
+          ? { instrument: { is: { symbol: { in: variants } } } }
+          : {}),
+        ...(timeframe
+          ? {
+              timeframe: {
+                in: [
+                  String(timeframe).toUpperCase(),
+                  String(tfToMinutes(String(timeframe)).toString()),
+                ],
+              },
+            }
+          : {}),
+      },
+      orderBy: { time: "desc" },
+      take: Number(limit) || 5000,
+      select: {
+        id: true,
+        time: true,
+        close: true,
+        timeframe: true,
+        instrument: { select: { symbol: true } },
+      },
+    });
+
+    const bySymbol = new Map<string, number>();
+    const byTF = new Map<string, number>();
+    for (const r of rows) {
+      const s = r.instrument?.symbol ?? "(sem instrument)";
+      const tf = String(r.timeframe ?? "(sem tf)");
+      bySymbol.set(s, (bySymbol.get(s) || 0) + 1);
+      byTF.set(tf, (byTF.get(tf) || 0) + 1);
+    }
+
+    res.json({
+      ok: true,
+      count: rows.length,
+      bySymbol: Array.from(bySymbol.entries()).map(([k, v]) => ({
+        symbol: k,
+        count: v,
+      })),
+      byTimeframe: Array.from(byTF.entries()).map(([k, v]) => ({
+        timeframe: k,
+        count: v,
+      })),
+      sample: rows.slice(0, 10),
+    });
+  } catch (e: any) {
+    res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* ------------------------ DEBUG: candles summary (NOVO) ------------------------ */
+router.get("/debug/candles/summary", async (_req, res) => {
+  try {
+    // Pega uma amostra grande e sumariza por símbolo/timeframe, sem filtros.
+    const rows = await prisma.candle.findMany({
+      orderBy: { time: "desc" },
+      take: 100000, // ajusta se quiser menor
+      select: { timeframe: true, instrument: { select: { symbol: true } } },
+    });
+
+    const bySymbol = new Map<string, number>();
+    const byTF = new Map<string, number>();
+    for (const r of rows) {
+      const s = r.instrument?.symbol ?? "(sem instrument)";
+      const tf = String(r.timeframe ?? "(sem tf)");
+      bySymbol.set(s, (bySymbol.get(s) || 0) + 1);
+      byTF.set(tf, (byTF.get(tf) || 0) + 1);
+    }
+
+    res.json({
+      ok: true,
+      totalSampled: rows.length,
+      symbols: Array.from(bySymbol.entries())
+        .map(([k, v]) => ({ symbol: k, count: v }))
+        .sort((a, b) => b.count - a.count),
+      timeframes: Array.from(byTF.entries())
+        .map(([k, v]) => ({ timeframe: k, count: v }))
+        .sort((a, b) => b.count - a.count),
+    });
+  } catch (e: any) {
+    res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 export default router;
