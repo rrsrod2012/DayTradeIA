@@ -3,6 +3,11 @@ import { prisma } from "./prisma";
 import { DateTime } from "luxon";
 import { generateProjectedSignals } from "./services/engine";
 import logger from "./logger";
+import {
+  startAutoTrainer,
+  stopAutoTrainer,
+  statusAutoTrainer,
+} from "./workers/autoTrainer";
 
 const router = express.Router();
 const ZONE = "America/Sao_Paulo";
@@ -54,7 +59,7 @@ function tfToMinutes(tfRaw: string) {
   return 5;
 }
 
-/* ----------------- ROTA CANDLES (sem alterações de lógica) ----------------- */
+/* ----------------- ROTA CANDLES ----------------- */
 router.get("/candles", async (req, res) => {
   try {
     const {
@@ -91,7 +96,7 @@ router.get("/candles", async (req, res) => {
       });
     }
 
-    // fallback: agregação M1->TF em memória, caso aplicável
+    // fallback M1->TF (em memória) se necessário
     const haveExactTF = rows.length > 0 && tfMin <= 1;
     if (!haveExactTF && tfMin > 1) {
       const m1 = await prisma.candle.findMany({
@@ -170,7 +175,6 @@ router.get("/candles", async (req, res) => {
 router.get("/signals", async (req, res) => {
   try {
     const {
-      // symbol ignorado por enquanto para evitar dependência de relação
       from: _from,
       to: _to,
       dateFrom,
@@ -193,32 +197,27 @@ router.get("/signals", async (req, res) => {
     }[] = [];
 
     if (range) {
-      // 1) Busca IDs de candles no período (sem depender de relações)
       const candleIds = await prisma.candle.findMany({
         where: { time: range },
         select: { id: true },
         orderBy: { time: "asc" },
       });
       const ids = candleIds.map((c) => c.id);
-      if (ids.length) {
-        // 2) Busca signals por candleId IN ids
-        signalRows = await prisma.signal.findMany({
-          where: { candleId: { in: ids } },
-          orderBy: [{ candleId: "asc" }, { id: "asc" }],
-          select: {
-            id: true,
-            side: true,
-            signalType: true,
-            score: true,
-            reason: true,
-            candleId: true,
-          },
-        });
-      } else {
-        signalRows = [];
-      }
+      signalRows = ids.length
+        ? await prisma.signal.findMany({
+            where: { candleId: { in: ids } },
+            orderBy: [{ candleId: "asc" }, { id: "asc" }],
+            select: {
+              id: true,
+              side: true,
+              signalType: true,
+              score: true,
+              reason: true,
+              candleId: true,
+            },
+          })
+        : [];
     } else {
-      // Sem range: pega últimos N signals
       signalRows = await prisma.signal.findMany({
         orderBy: { id: "desc" },
         take: effLimit,
@@ -231,15 +230,11 @@ router.get("/signals", async (req, res) => {
           candleId: true,
         },
       });
-      // ordena crescente por id para UX consistente
       signalRows = signalRows.sort((a, b) => a.id - b.id);
     }
 
-    if (!signalRows.length) {
-      return res.json([]); // nada no banco (ou nenhum no range)
-    }
+    if (!signalRows.length) return res.json([]);
 
-    // 3) Junta candles por ID (sem depender de relação Prisma)
     const uniqCandleIds = Array.from(
       new Set(signalRows.map((s) => s.candleId).filter(Boolean))
     ) as number[];
@@ -257,11 +252,10 @@ router.get("/signals", async (req, res) => {
     });
     const byId = new Map(candles.map((c) => [c.id, c]));
 
-    // 4) Projeta resposta
     const out = signalRows
       .map((s) => {
         const c = s.candleId ? byId.get(s.candleId) : undefined;
-        if (!c) return null; // ignora signals sem candle correspondente
+        if (!c) return null;
         return {
           id: s.id,
           side: s.side,
@@ -286,7 +280,7 @@ router.get("/signals", async (req, res) => {
   }
 });
 
-/* ----------------------- SINAIS PROJETADOS (sem mudanças) ----------------------- */
+/* ----------------------- SINAIS PROJETADOS ----------------------- */
 router.post("/signals/projected", async (req, res) => {
   try {
     const {
@@ -338,17 +332,15 @@ router.post("/signals/projected", async (req, res) => {
   }
 });
 
-/* ------------------------ IA ONLINE: FEEDBACK (mesmo) ------------------------ */
+/* ------------------------ IA ONLINE: FEEDBACK / META ------------------------ */
 router.post("/ml/feedback", express.json(), async (req, res) => {
   try {
     const base = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
     if (!base)
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "MICRO_MODEL_URL não configurada no backend",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "MICRO_MODEL_URL não configurada no backend",
+      });
 
     const body = req.body || {};
     let rows = Array.isArray(body?.rows) ? body.rows : null;
@@ -404,6 +396,19 @@ router.get("/ml/meta", async (_req, res) => {
       .status(200)
       .json({ ok: false, error: String(err?.message || err) });
   }
+});
+
+/* ------------------------ CONTROLE DO AUTO-TRAINER ------------------------ */
+router.post("/ml/auto/start", (_req, res) => {
+  const r = startAutoTrainer();
+  return res.status(r.ok ? 200 : 400).json(r);
+});
+router.post("/ml/auto/stop", (_req, res) => {
+  const r = stopAutoTrainer();
+  return res.status(200).json(r);
+});
+router.get("/ml/auto/status", (_req, res) => {
+  return res.status(200).json(statusAutoTrainer());
 });
 
 export default router;
