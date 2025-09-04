@@ -1,19 +1,28 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// https://vitejs.dev/config/
+// Ajusta o proxy para usar IPv4 explicitamente (evita ::1 no Windows)
+// e garante headers corretos para CORS no desenvolvimento.
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
-    strictPort: true,
+    host: true, // permite acesso via LAN se precisar
+    port: 5173, // ajuste se usar outra porta no seu setup
     proxy: {
-      // Encaminha chamadas de API para o backend em dev
       "/api": {
-        target: "http://localhost:4000",
+        target: "http://127.0.0.1:4000", // BACKEND em IPv4
         changeOrigin: true,
-        // mantém o prefixo /api do lado do backend
-        rewrite: (path) => path,
+        secure: false,
+        ws: false,
+        // se a sua API no backend já vem com /api prefixado, não reescreva
+        // rewrite: (path) => path.replace(/^\/api/, "/api"),
+      },
+      // se você estiver chamando o microserviço IA direto do FE (geralmente não precisa)
+      "/ml": {
+        target: "http://127.0.0.1:4000",
+        changeOrigin: true,
+        secure: false,
+        ws: false,
       },
     },
   },

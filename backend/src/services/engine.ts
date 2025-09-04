@@ -2,7 +2,7 @@
 import { DateTime } from "luxon";
 import { Config } from "../config";
 import { loadCandlesAnyTF } from "../lib/aggregation";
-import { EMA, ATR } from "./indicators";
+import { EMA, ATR, ADX } from "./indicators";
 
 /** Tipos básicos */
 export type Side = "BUY" | "SELL" | "FLAT";
@@ -17,12 +17,22 @@ type Candle = {
   volume?: number | null;
 };
 
-/** Saída para a UI */
-export type ProjectedSignal = {
+type ProjectedSignal = {
   side: Side;
   suggestedEntry?: number | null;
   stopSuggestion?: number | null;
   takeProfitSuggestion?: number | null;
+
+  // plano de risco sugerido (dinâmico)
+  riskPlan?: {
+    kSL: number; // multiplicador de ATR para SL
+    rr: number; // take-profit em ATRs
+    breakEvenTriggerATR: number; // quando mover para BE
+    trail?: { type: "EMA" | "ATR"; params: Record<string, number> };
+  };
+
+  // features (úteis p/ feedback/treino online)
+  features?: Record<string, number>;
 
   conditionText?: string | null;
   score?: number | null;
@@ -45,36 +55,25 @@ export type GenerateOpts = {
   limit?: number;
   horizon?: number;
   rr?: number;
-  evalWindow?: number;
-  adaptive?: boolean;
-  cooldown?: boolean;
-  regime?: boolean;
+  eligible?: "ALL" | "SESSION";
   tod?: boolean;
-  conformal?: boolean;
-
-  /** Custos */
-  costPts?: number;
-  slippagePts?: number;
-
-  /** Confirmação MTF */
   requireMtf?: boolean;
   confirmTf?: string;
 
-  /** Cooldown inteligente (não usado aqui) */
-  cooldownSmart?: boolean;
-
-  /** Filtros de decisão */
+  /** EV & filtros */
+  costPts?: number;
+  slippagePts?: number;
   minProb?: number;
   minEV?: number;
 
-  /** IA micro-modelo (gateway p/ futura integração) */
+  /** Micro-modelo (IA) */
   useMicroModel?: boolean;
 
   /** Confluências adicionais */
   vwapFilter?: boolean;
 };
 
-const MICRO_URL = process.env.MICRO_MODEL_URL || ""; // ex.: http://localhost:8000
+const MICRO_URL = process.env.MICRO_MODEL_URL || ""; // ex.: http://localhost:5050
 
 /* --------- Utils --------- */
 function toUtcRange(
@@ -107,20 +106,17 @@ function trendFrom(
   if (ema9[i] == null || ema21[i] == null) return "SIDEWAYS";
   const e9 = ema9[i] as number,
     e21 = ema21[i] as number;
-  const prev9 = i > 0 && ema9[i - 1] != null ? (ema9[i - 1] as number) : e9;
-  const prev21 = i > 0 && ema21[i - 1] != null ? (ema21[i - 1] as number) : e21;
-  if (e9 > e21 && prev9 >= prev21) return "UP";
-  if (e9 < e21 && prev9 <= prev21) return "DOWN";
-  return e9 > e21 ? "UP" : e9 < e21 ? "DOWN" : "SIDEWAYS";
+  if (e9 > e21) return "UP";
+  if (e9 < e21) return "DOWN";
+  return "SIDEWAYS";
 }
 
-/** Arredondamento a tick (pontos); default 1 ponto */
-function roundToTick(price: number, tick = 1): number {
-  if (!isFinite(price) || tick <= 0) return price;
-  return Math.round(price / tick) * tick;
+function roundToTick(x: number, tick = 1) {
+  const k = Math.round(x / tick);
+  return k * tick;
 }
 
-/** VWAP intradiário (ancorado no início do dia, reinicia a cada data local BRT) */
+/** VWAP ancorado por dia (zona local) */
 function vwapAnchoredDaily(
   candles: Candle[],
   zone = "America/Sao_Paulo"
@@ -161,7 +157,8 @@ function buildFeatures(
   e9: (number | null)[],
   e21: (number | null)[],
   atr: (number | null)[],
-  vwap: (number | null)[]
+  vwap: (number | null)[],
+  adx: (number | null)[]
 ) {
   const c = candles[i];
   const prev = candles[i - 1] ?? c;
@@ -175,6 +172,11 @@ function buildFeatures(
   const slope21 =
     ((e21[i] ?? _e21) as number) - ((e21[i - 1] ?? _e21) as number);
 
+  const dt = DateTime.fromJSDate(c.time).setZone("America/Sao_Paulo");
+  const hourLocal = dt.hour + dt.minute / 60;
+  const angle = (hourLocal / 24) * 2 * Math.PI;
+  const adxNorm = ((adx[i] ?? adx[i - 1] ?? 0) as number) / 100;
+
   const feat = {
     dist_ema21: (c.close - _e21) / Math.max(1e-6, _atr),
     dist_vwap: (c.close - _vwap) / Math.max(1e-6, _atr),
@@ -182,12 +184,15 @@ function buildFeatures(
     slope_e21: slope21 / Math.max(1e-6, _atr),
     range_ratio: (c.high - c.low) / Math.max(1e-6, _atr),
     ret1,
-    hour: DateTime.fromJSDate(c.time).setZone("America/Sao_Paulo").hour,
+    hour: dt.hour,
+    hour_sin: Math.sin(angle),
+    hour_cos: Math.cos(angle),
+    adx14: adxNorm,
   };
   return feat;
 }
 
-/** Chama microserviço de IA (FastAPI) para obter probabilidade calibrada */
+/** Chama microserviço de IA (FastAPI/Node) para obter probabilidade calibrada */
 async function microPredict(
   features: Record<string, number>
 ): Promise<number | null> {
@@ -222,21 +227,19 @@ export async function generateProjectedSignals(
     from,
     to,
 
-    limit = 500,
-    horizon = 8,
-    rr = 2,
-    evalWindow = 200, // usado p/ suavização
-    adaptive = true,
-    cooldown = true, // mantido por compat — não aplicado aqui
-    regime = true,
+    limit = 200,
+    horizon = 12,
+    rr = 2.0,
+
+    eligible = "ALL",
     tod = true,
-    conformal = false,
 
-    costPts = Config.COST_PER_TRADE_POINTS,
-    slippagePts = Config.SLIPPAGE_POINTS,
+    requireMtf = false,
+    confirmTf,
 
-    requireMtf = Config.REQUIRE_MTF_CONFIRM,
-    confirmTf = Config.MTF_CONFIRM_TF,
+    costPts = 2,
+    slippagePts = 0,
+
     cooldownSmart = Config.COOLDOWN_SMART,
 
     minProb = 0,
@@ -262,6 +265,7 @@ export async function generateProjectedSignals(
   const e9 = EMA(closes, 9);
   const e21 = EMA(closes, 21);
   const atrArr = ATR(highs, lows, closes, 14);
+  const adxArr = ADX(highs, lows, closes, 14);
   const vwap = vwapAnchoredDaily(candles, "America/Sao_Paulo");
 
   // MTF de confirmação (opcional)
@@ -293,6 +297,13 @@ export async function generateProjectedSignals(
     return true;
   };
 
+  // Elegibilidade extra
+  const allowByEligible = (i: number): boolean => {
+    if (eligible === "ALL") return true;
+    if (eligible === "SESSION") return allowedHour(candles[i].time);
+    return true;
+  };
+
   const tick = Number(process.env.TICK_SIZE_POINTS || 1);
 
   const out: ProjectedSignal[] = [];
@@ -302,6 +313,7 @@ export async function generateProjectedSignals(
     if (!allowedHour(cndl.time)) continue;
     if (e21[i] == null || e9[i] == null || atrArr[i] == null || vwap[i] == null)
       continue;
+    if (!allowByEligible(i)) continue;
 
     const atr = atrArr[i] as number;
     const ema21 = e21[i] as number;
@@ -342,18 +354,52 @@ export async function generateProjectedSignals(
       }
     }
 
+    const adxVal = adxArr[i] as number | null;
+    const prevE21 = (e21[i - 1] ?? e21[i]) as number;
+    const slope21 = (e21[i] as number) - prevE21;
+    const slopeNorm = slope21 / Math.max(1e-6, atr);
+
+    // Dinâmica de SL (kSL) e RR
+    let kSL = 1.0;
+    if (adxVal != null) {
+      if (adxVal >= 28) kSL = 1.2;
+      else if (adxVal <= 18) kSL = 0.9;
+    }
+    let rrDyn = rr;
+    if (adxVal != null) {
+      if (adxVal >= 28) rrDyn = Math.min(3.0, rrDyn + 0.5);
+      else if (adxVal <= 18) rrDyn = Math.max(1.2, rrDyn - 0.5);
+    }
+    // Ajuste pequeno por inclinação de EMA21
+    rrDyn = Math.max(
+      1.0,
+      Math.min(
+        3.5,
+        rrDyn + Math.max(-0.3, Math.min(0.3, Math.abs(slopeNorm) - 0.2))
+      )
+    );
+
     const entry = roundToTick(ema21, tick);
     const sl =
       side === "BUY"
-        ? roundToTick(entry - 1 * atr, tick)
-        : roundToTick(entry + 1 * atr, tick);
+        ? roundToTick(entry - kSL * atr, tick)
+        : roundToTick(entry + kSL * atr, tick);
     const tp =
       side === "BUY"
-        ? roundToTick(entry + rr * atr, tick)
-        : roundToTick(entry - rr * atr, tick);
+        ? roundToTick(entry + rrDyn * atr, tick)
+        : roundToTick(entry - rrDyn * atr, tick);
+
+    // Sugerir break-even/trailing conforme regime
+    const breakEvenTriggerATR = adxVal != null && adxVal >= 28 ? 0.8 : 1.0;
+    const trail =
+      adxVal != null && adxVal >= 25
+        ? { type: "EMA" as const, params: { period: 9 } }
+        : { type: "ATR" as const, params: { multiple: 1.0 } };
 
     // Probabilidade heurística + micro-modelo opcional
     const sep = Math.abs((e9[i]! - e21[i]!) / Math.max(1e-6, atr));
+    const feats = buildFeatures(i, candles, e9, e21, atrArr, vwap, adxArr);
+
     let p = clamp(
       0.5 + (side === "BUY" ? 1 : -1) * Math.min(0.15, sep * 0.03),
       0.35,
@@ -361,7 +407,6 @@ export async function generateProjectedSignals(
     );
 
     if (useMicroModel && MICRO_URL) {
-      const feats = buildFeatures(i, candles, e9, e21, atrArr, vwap);
       const pModel = await microPredict(feats);
       if (pModel != null) {
         p = pModel; // já calibrado pelo serviço
@@ -384,9 +429,18 @@ export async function generateProjectedSignals(
       takeProfitSuggestion: tp,
       conditionText: `EMA21 bounce (${bias}) • ATR14=${atr.toFixed(
         2
-      )} • RR=${rr} • ${vwapFilter ? "VWAP✓" : "VWAP–"}${
+      )} • ADX14=${(adxVal ?? 0).toFixed(1)} • RR=${rrDyn.toFixed(
+        2
+      )} • kSL=${kSL.toFixed(2)} • ${vwapFilter ? "VWAP✓" : "VWAP–"}${
         requireMtf && confirmTimes.length ? " • MTF✓" : ""
       }`,
+      riskPlan: {
+        kSL: Number(kSL.toFixed(2)),
+        rr: Number(rrDyn.toFixed(2)),
+        breakEvenTriggerATR: Number(breakEvenTriggerATR.toFixed(2)),
+        trail,
+      },
+      features: feats,
       score: sep,
       probHit: p,
       probCalibrated: useMicroModel ? p : undefined,
