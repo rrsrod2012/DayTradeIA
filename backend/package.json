@@ -17,6 +17,8 @@
     "express": "^4.19.2",
     "lightweight-charts": "^5.0.8",
     "luxon": "^3.7.1",
+    "morgan": "^1.10.1",
+    "node-fetch": "^2.7.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
