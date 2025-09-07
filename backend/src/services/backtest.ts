@@ -9,8 +9,9 @@ type TF = "M1" | "M5" | "M15" | "M30" | "H1";
 const TF_MIN: Record<TF, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60 };
 const ZONE = "America/Sao_Paulo";
 
-const VERSION = "backtest:v3.4-always-200";
+const VERSION = "backtest:v3.5-date-normalized";
 
+/* ===== Helpers de timeframe/bucket ===== */
 function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
   const s = String(tfRaw || "")
     .trim()
@@ -43,6 +44,8 @@ function ceilToExclusive(d: Date, tfMin: number): Date {
 function toLocalDateStr(d: Date) {
   return DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd");
 }
+
+/* ===== EMA ===== */
 function EMA(values: number[], period: number): (number | null)[] {
   const out: (number | null)[] = [];
   const k = 2 / (period + 1);
@@ -59,6 +62,7 @@ function EMA(values: number[], period: number): (number | null)[] {
   return out;
 }
 
+/* ===== Respostas padrão ===== */
 function ok<T>(data: T, extra: Record<string, any> = {}) {
   return { ok: true, version: VERSION, ...extra, ...data };
 }
@@ -69,6 +73,95 @@ function diagify(e: any) {
   const s = String(e?.stack || e?.message || e);
   const lines = s.split("\n").slice(0, 10).join("\n");
   return { diag: lines };
+}
+
+/* ===== NOVO: parsing/normalização de datas no fuso de SP ===== */
+function parseUserDate(raw: any): {
+  ok: boolean;
+  dt: DateTime;
+  isDateOnly: boolean;
+} {
+  if (raw == null)
+    return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+  let s = String(raw).trim();
+  if (!s)
+    return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+
+  // BR: dd/MM/yyyy [HH:mm[:ss]]
+  const reBR =
+    /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2})(?::(\d{2})(?::(\d{2}))?)?)?$/;
+  const m = reBR.exec(s);
+  if (m) {
+    const fmt = m[4]
+      ? m[6]
+        ? "dd/LL/yyyy HH:mm:ss"
+        : "dd/LL/yyyy HH:mm"
+      : "dd/LL/yyyy";
+    const dt = DateTime.fromFormat(s, fmt, { zone: ZONE });
+    return { ok: dt.isValid, dt, isDateOnly: !m[4] };
+  }
+
+  // ISO yyyy-MM-dd → só data
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const dt = DateTime.fromISO(s, { zone: ZONE });
+    return { ok: dt.isValid, dt, isDateOnly: true };
+  }
+
+  // ISO com hora — tratamos como hora local (ignorando Z/offset se houver)
+  if (/^\d{4}-\d{2}-\d{2}t/i.test(s)) {
+    s = s.replace(/([+-]\d{2}:?\d{2}|Z)$/i, ""); // remove offset/Z para tratar como local
+    const dt = DateTime.fromISO(s, { zone: ZONE });
+    return { ok: dt.isValid, dt, isDateOnly: false };
+  }
+
+  // Epoch ms
+  if (/^\d{10,13}$/.test(s)) {
+    const n = Number(s);
+    const dt = Number.isFinite(n)
+      ? DateTime.fromMillis(n, { zone: ZONE })
+      : DateTime.invalid("nan");
+    return { ok: dt.isValid, dt, isDateOnly: false };
+  }
+
+  return { ok: false, dt: DateTime.invalid("unparsed"), isDateOnly: false };
+}
+
+function normalizeDayRange(
+  fromRaw: any,
+  toRaw: any
+): { fromLocal: DateTime; toLocal: DateTime } | null {
+  const pF = parseUserDate(fromRaw);
+  const pT = parseUserDate(toRaw);
+
+  if (!pF.ok && !pT.ok) return null;
+
+  let fromLocal: DateTime;
+  let toLocal: DateTime;
+
+  if (pF.ok && pT.ok) {
+    const sameDay =
+      pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
+    if (pF.isDateOnly || pT.isDateOnly || sameDay) {
+      fromLocal = pF.dt.startOf("day");
+      toLocal = pT.dt.endOf("day");
+    } else {
+      fromLocal = pF.dt;
+      toLocal = pT.dt;
+    }
+  } else if (pF.ok) {
+    fromLocal = pF.isDateOnly ? pF.dt.startOf("day") : pF.dt;
+    toLocal = pF.isDateOnly ? pF.dt.endOf("day") : pF.dt.endOf("day");
+  } else {
+    toLocal = pT.isDateOnly ? pT.dt.endOf("day") : pT.dt;
+    fromLocal = pT.isDateOnly ? pT.dt.startOf("day") : pT.dt.startOf("day");
+  }
+
+  if (toLocal < fromLocal) {
+    const tmp = fromLocal;
+    fromLocal = toLocal.startOf("day");
+    toLocal = tmp.endOf("day");
+  }
+  return { fromLocal, toLocal };
 }
 
 /* -------- Utilitário: ecoa o payload do front -------- */
@@ -95,23 +188,23 @@ router.get("/api/backtest/health", async (req, res) => {
       .toUpperCase()
       .trim();
     if (!sym) return res.status(200).json(bad("Faltou 'symbol'"));
+
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
+    // ==== NOVO: datas como dia inteiro em SP, depois em UTC + bucket ====
     const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 5);
     let fromD: Date, toD: Date;
-    if (from && to) {
-      const f = new Date(String(from)),
-        t = new Date(String(to));
-      if (!isFinite(f.getTime()) || !isFinite(t.getTime())) {
-        return res.status(200).json(bad("Parâmetros 'from'/'to' inválidos"));
-      }
-      fromD = floorTo(f, tfMin);
-      toD = ceilToExclusive(t, tfMin);
+
+    const norm = normalizeDayRange(from, to);
+    if (norm) {
+      fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
+      toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
     } else {
-      const tnow = DateTime.now().toUTC();
-      const f = tnow.minus(Duration.fromObject({ days: fallbackDays }));
+      const tnowLocal = DateTime.now().setZone(ZONE);
+      const f = tnowLocal.minus({ days: fallbackDays }).startOf("day").toUTC();
+      const t = tnowLocal.endOf("day").toUTC();
       fromD = floorTo(f.toJSDate(), tfMin);
-      toD = ceilToExclusive(tnow.toJSDate(), tfMin);
+      toD = ceilToExclusive(t.toJSDate(), tfMin);
     }
 
     const candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD });
@@ -156,24 +249,20 @@ router.all("/api/backtest", express.json(), async (req, res) => {
 
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
+    // ==== NOVO: datas como dia inteiro em SP, depois em UTC + bucket ====
     const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 5);
     let fromD: Date, toD: Date;
 
-    if (from && to) {
-      const f = new Date(String(from));
-      const t = new Date(String(to));
-      if (!isFinite(f.getTime()) || !isFinite(t.getTime())) {
-        return res
-          .status(200)
-          .json(bad("Parâmetros 'from'/'to' inválidos", { from, to }));
-      }
-      fromD = floorTo(f, tfMin);
-      toD = ceilToExclusive(t, tfMin);
+    const norm = normalizeDayRange(from, to);
+    if (norm) {
+      fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
+      toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
     } else {
-      const tnow = DateTime.now().toUTC();
-      const f = tnow.minus(Duration.fromObject({ days: fallbackDays }));
+      const tnowLocal = DateTime.now().setZone(ZONE);
+      const f = tnowLocal.minus({ days: fallbackDays }).startOf("day").toUTC();
+      const t = tnowLocal.endOf("day").toUTC();
       fromD = floorTo(f.toJSDate(), tfMin);
-      toD = ceilToExclusive(tnow.toJSDate(), tfMin);
+      toD = ceilToExclusive(t.toJSDate(), tfMin);
     }
 
     if (fromD >= toD) {

@@ -1,42 +1,53 @@
-import { useEffect, useRef } from "react";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export type WSOptions = {
+  path?: string; // ex: "/stream"
+  onOpen?: (ev: Event) => void;
+  onMessage?: (data: any, raw: MessageEvent) => void;
+  onError?: (ev: Event) => void;
+  onClose?: (ev: CloseEvent) => void;
+};
 
-export function useWebSocketStream(
-  enabled: boolean,
-  onCandle: (c: any) => void,
-  onImport?: (p: any) => void
-) {
-  const wsRef = useRef<WebSocket | null>(null);
-  useEffect(() => {
-    if (!enabled) {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      return;
-    }
-    const ws = new WebSocket(
-      "ws://localhost:4000/stream?symbol=WIN&timeframe=M5"
-    );
-    wsRef.current = ws;
-    ws.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        if (data.type === "candle") onCandle(data.candle);
-        if (data.type === "importProgress") {
-          if (onImport) onImport(data);
-        }
-      } catch {}
-    };
-    return () => {
-      ws.close();
-      wsRef.current = null;
-    };
-  }, [enabled, onCandle as any, onImport as any]);
+export function getWebSocketUrl(path = "/stream"): string {
+  const env: any = (import.meta as any).env || {};
+  const explicit = env.VITE_WS_URL as string | undefined;
+  if (explicit && explicit.trim()) {
+    return explicit.trim();
+  }
+  const apiBase = (env.VITE_API_BASE as string | undefined)?.trim() || "";
+  const base =
+    apiBase !== ""
+      ? apiBase.replace(/^http/i, "ws")
+      : window.location.origin.replace(/^http/i, "ws");
+  const normalizedBase = base.replace(/\/?$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return normalizedBase + normalizedPath;
 }
 
-export function useImportProgress(
-  enabled: boolean,
-  onUpdate: (p: any) => void
-) {
-  useWebSocketStream(enabled, () => {}, onUpdate);
+export function openWebSocket(opts: WSOptions = {}) {
+  const url = getWebSocketUrl(opts.path ?? "/stream");
+  const ws = new WebSocket(url);
+
+  ws.onopen = (ev) => {
+    opts.onOpen?.(ev);
+  };
+
+  ws.onmessage = (ev) => {
+    let data: any = null;
+    try {
+      data = JSON.parse(ev.data as any);
+    } catch {
+      data = ev.data;
+    }
+    opts.onMessage?.(data, ev);
+  };
+
+  ws.onerror = (ev) => {
+    opts.onError?.(ev);
+  };
+
+  ws.onclose = (ev) => {
+    opts.onClose?.(ev);
+  };
+
+  return ws;
 }

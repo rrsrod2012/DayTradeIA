@@ -14,6 +14,7 @@ import {
   Tabs,
   Tab,
 } from "react-bootstrap";
+import ImportProgress from "../components/ImportProgress";
 import CandleChart from "../components/CandleChart";
 import SignalsTable from "../components/SignalsTable";
 import ProjectedSignalsTable from "../components/ProjectedSignalsTable";
@@ -589,6 +590,12 @@ export default function Dashboard() {
     <div className="dash-wrapper">
       <Navbar className="mb-3 dash-navbar">
         <Container>
+          {/* Import progress */}
+          <Row className="mb-3">
+            <Col>
+              <ImportProgress />
+            </Col>
+          </Row>
           <Navbar.Brand className="fw-bold">DayTrade IA</Navbar.Brand>
           <div className="d-flex align-items-center gap-2 ms-auto">
             <Form.Check

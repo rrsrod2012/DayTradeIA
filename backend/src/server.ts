@@ -9,29 +9,127 @@ import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
 import logger from "./logger";
 
+import { bootPipeline } from "./services/pipeline";
 // Roteador novo do backtest (mantemos)
 import { router as backtestRouter } from "./services/backtest";
 
-// ====== IMPORTS PARA ROTA EMBUTIDA DE PROJECTED ======
 import { DateTime, Duration } from "luxon";
 import { loadCandlesAnyTF } from "./lib/aggregation";
 
-// ====== APP BASE ======
 const app = express();
+
+// ====== Timezone/base para normalização de filtros de data ======
+const ZONE_BR = "America/Sao_Paulo";
+
+/** Parse flexível: ISO (com/sem hora) ou BR "dd/MM/yyyy[ HH:mm[:ss]]" — tudo no fuso de SP */
+function parseUserDate(raw: any): {
+  ok: boolean;
+  dt: DateTime;
+  isDateOnly: boolean;
+} {
+  if (raw == null)
+    return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+  const s = String(raw).trim();
+
+  // BR: dd/MM/yyyy [HH:mm[:ss]]
+  const brFull =
+    /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+  const m = brFull.exec(s);
+  if (m) {
+    const [_, dd, MM, yyyy, hh, mm, ss] = m;
+    const fmt = hh
+      ? ss
+        ? "dd/LL/yyyy HH:mm:ss"
+        : "dd/LL/yyyy HH:mm"
+      : "dd/LL/yyyy";
+    const dt = DateTime.fromFormat(s, fmt, { zone: ZONE_BR });
+    return { ok: dt.isValid, dt, isDateOnly: !hh };
+  }
+
+  // ISO (yyyy-MM-dd[THH:mm[:ss[.SSS]]][Z])
+  const dtISO = DateTime.fromISO(s, { zone: ZONE_BR });
+  if (dtISO.isValid) {
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
+    return { ok: true, dt: dtISO, isDateOnly };
+  }
+
+  // Epoch ms?
+  if (/^\d{10,13}$/.test(s)) {
+    const n = Number(s);
+    const dt = Number.isFinite(n)
+      ? DateTime.fromMillis(n, { zone: ZONE_BR })
+      : DateTime.invalid("nan");
+    return { ok: dt.isValid, dt, isDateOnly: false };
+  }
+
+  return { ok: false, dt: DateTime.invalid("unparsed"), isDateOnly: false };
+}
+
+/** Normaliza um range de usuário para [fromLocal, toLocal] cobrindo o DIA INTEIRO quando data é “só a data” */
+function normalizeDayRange(
+  fromRaw: any,
+  toRaw: any
+): { fromLocal: DateTime; toLocal: DateTime } | null {
+  const pF = parseUserDate(fromRaw);
+  const pT = parseUserDate(toRaw);
+
+  // nenhum dos dois informado
+  if (!pF.ok && !pT.ok) return null;
+
+  let fromLocal: DateTime;
+  let toLocal: DateTime;
+
+  if (pF.ok && pT.ok) {
+    // se qualquer um for "só data", tratamos ambos como dia cheio
+    const sameDay =
+      pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
+    if (pF.isDateOnly || pT.isDateOnly || sameDay) {
+      const base = pF.dt; // usa o dia de 'from'
+      fromLocal = base.startOf("day");
+      toLocal = pT.dt.endOf("day");
+    } else {
+      fromLocal = pF.dt;
+      toLocal = pT.dt;
+    }
+  } else if (pF.ok && !pT.ok) {
+    // só from: cobre o dia de from
+    fromLocal = pF.isDateOnly ? pF.dt.startOf("day") : pF.dt;
+    toLocal = pF.isDateOnly ? pF.dt.endOf("day") : pF.dt.endOf("day");
+  } else {
+    // só to: cobre o dia de to
+    toLocal = pT.isDateOnly ? pT.dt.endOf("day") : pT.dt;
+    fromLocal = pT.isDateOnly ? pT.dt.startOf("day") : pT.dt.startOf("day");
+  }
+
+  // garante ordem
+  if (toLocal < fromLocal) {
+    const tmp = fromLocal;
+    fromLocal = toLocal.startOf("day");
+    toLocal = tmp.endOf("day");
+  }
+  return { fromLocal, toLocal };
+}
+
+// CORS + preflight
 app.use(cors());
+app.options("*", cors());
+
 app.use(express.json({ limit: "5mb" }));
 
 /**
- * Ordem importa:
- * - Montamos backtestRouter antes do legado
- * - E registramos a rota de projected inline aqui
+ * Ordem:
+ * - backtestRouter antes do legado
+ * - rotas inline (projected + fallbacks + debug)
+ * - rotas legadas
  */
 app.use(backtestRouter);
 
-// ====== ROTA EMBUTIDA: /api/signals/projected ======
+/* =========================
+   /api/signals/projected (inline já existente)
+   ========================= */
 (() => {
   const ZONE = "America/Sao_Paulo";
-  const VERSION = "signals-projected:inline-v1";
+  const VERSION = "signals-projected:inline-v3"; // bump
 
   function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
     const s = String(tfRaw || "")
@@ -52,17 +150,29 @@ app.use(backtestRouter);
     }
     return { tfU: "M5", tfMin: 5 };
   }
-  function floorTo(d: Date, tfMin: number): Date {
-    const dt = DateTime.fromJSDate(d).toUTC();
-    const bucketMin = Math.floor(dt.minute / tfMin) * tfMin;
-    return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
-  }
-  function ceilToExclusive(d: Date, tfMin: number): Date {
-    const dt = DateTime.fromJSDate(d).toUTC();
-    const bucketMin = Math.floor(dt.minute / tfMin) * tfMin + tfMin;
-    return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
-  }
-  function EMA(values: number[], period: number): (number | null)[] {
+  const floorTo = (d: Date, tfMin: number) =>
+    DateTime.fromJSDate(d)
+      .toUTC()
+      .set({
+        second: 0,
+        millisecond: 0,
+        minute:
+          Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin,
+      })
+      .toJSDate();
+  const ceilToExclusive = (d: Date, tfMin: number) =>
+    DateTime.fromJSDate(d)
+      .toUTC()
+      .set({
+        second: 0,
+        millisecond: 0,
+        minute:
+          Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin +
+          tfMin,
+      })
+      .toJSDate();
+
+  const EMA = (values: number[], period: number): (number | null)[] => {
     const out: (number | null)[] = [];
     const k = 2 / (period + 1);
     let ema: number | null = null;
@@ -76,31 +186,34 @@ app.use(backtestRouter);
       out.push(ema);
     }
     return out;
-  }
-  function ATR(
+  };
+  const ATR = (
     candles: { high: number; low: number; close: number }[],
     period = 14
-  ): (number | null)[] {
+  ): (number | null)[] => {
     const tr: number[] = [];
     for (let i = 0; i < candles.length; i++) {
       const c = candles[i];
       const prevClose = i > 0 ? candles[i - 1].close : c.close;
-      const a = c.high - c.low;
-      const b = Math.abs(c.high - prevClose);
-      const d = Math.abs(c.low - prevClose);
-      tr.push(Math.max(a, b, d));
+      tr.push(
+        Math.max(
+          c.high - c.low,
+          Math.abs(c.high - prevClose),
+          Math.abs(c.low - prevClose)
+        )
+      );
     }
     const out: (number | null)[] = [];
     let ema: number | null = null;
     const k = 2 / (period + 1);
     for (let i = 0; i < tr.length; i++) {
       const v = tr[i];
-      if (ema == null) ema = v;
-      else ema = v * k + ema * (1 - k);
+      ema = ema == null ? v : v * k + ema * (1 - k);
       out.push(ema);
     }
     return out;
-  }
+  };
+
   async function httpPostJSON<T = any>(
     url: string,
     body: any,
@@ -109,8 +222,7 @@ app.use(backtestRouter);
     let f: typeof fetch = (global as any).fetch;
     if (!f) {
       const mod = await import("node-fetch");
-      // @ts-ignore
-      f = mod.default as any;
+      /* @ts-ignore */ f = mod.default as any;
     }
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -119,8 +231,7 @@ app.use(backtestRouter);
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-        // @ts-ignore
-        signal: ctrl.signal,
+        /* @ts-ignore */ signal: ctrl.signal,
       } as any);
       const txt = await resp.text();
       const data = txt ? JSON.parse(txt) : null;
@@ -162,25 +273,16 @@ app.use(backtestRouter);
 
       const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-      // Range
-      const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 5);
+      // ====== Range: agora interpreta 1 dia como dia inteiro no fuso de SP ======
       let fromD: Date, toD: Date;
-      if (from && to) {
-        const f = new Date(String(from));
-        const t = new Date(String(to));
-        if (!isFinite(f.getTime()) || !isFinite(t.getTime())) {
-          return res
-            .status(200)
-            .json({
-              ok: false,
-              version: VERSION,
-              error: "Parâmetros 'from'/'to' inválidos",
-            });
-        }
-        fromD = floorTo(f, tfMin);
-        toD = ceilToExclusive(t, tfMin);
+      const norm = normalizeDayRange(from, to);
+      if (norm) {
+        // passa pelos buckets do TF
+        fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
+        toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
       } else {
-        const now = DateTime.now().toUTC();
+        const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 5);
+        const now = DateTime.now().setZone(ZONE_BR).toUTC();
         const f = now.minus(Duration.fromObject({ days: fallbackDays }));
         fromD = floorTo(f.toJSDate(), tfMin);
         toD = ceilToExclusive(now.toJSDate(), tfMin);
@@ -215,7 +317,7 @@ app.use(backtestRouter);
         Number(atrPeriod) || 14
       );
 
-      // VWAP por sessão
+      // VWAP por sessão (dia local em SP)
       const vwap: (number | null)[] = [];
       let accPV = 0,
         accVol = 0;
@@ -238,7 +340,7 @@ app.use(backtestRouter);
         vwap.push(accVol > 0 ? accPV / accVol : null);
       }
 
-      // MTF (opcional)
+      // (MTF opcional — inalterado)
       let mtfUp: boolean[] | null = null,
         mtfDown: boolean[] | null = null;
       if (requireMtf && confirmTf && confirmTf !== tfU) {
@@ -291,39 +393,31 @@ app.use(backtestRouter);
           i > 0 && e9[i - 1] != null ? e9v - (e9[i - 1] as number) : 0;
         const slope21 =
           i > 0 && e21[i - 1] != null ? e21v - (e21[i - 1] as number) : 0;
-        const ret1 = i > 0 ? closes[i] - closes[i - 1] : 0;
         const range = highs[i] - lows[i];
         const rangeRatio = atrv > 0 ? range / atrv : 0;
         const distEma21 = e21v ? c - e21v : 0;
         const distVwap = c - vw;
-        const hour = DateTime.fromJSDate(times[i]).setZone(ZONE).hour;
         return {
           dist_ema21: distEma21,
           dist_vwap: distVwap,
           slope_e9: slope9,
           slope_e21: slope21,
           range_ratio: rangeRatio,
-          ret1,
-          hour,
         };
       }
 
-      async function getProb(features: any): Promise<number | null> {
+      async function getProb(_features: any): Promise<number | null> {
         const url = String(process.env.MICRO_MODEL_URL || "").trim();
         if (!(useMicroModel && url)) return null;
         try {
           const resp = await httpPostJSON<{ probHit?: number }>(
             `${url}/predict`,
-            { features }
+            { features: _features }
           );
           if (typeof resp?.probHit === "number" && isFinite(resp.probHit))
             return resp.probHit;
           return null;
-        } catch (e) {
-          console.warn(
-            "[projected] micro-model erro:",
-            (e as any)?.message || e
-          );
+        } catch {
           return null;
         }
       }
@@ -345,7 +439,6 @@ app.use(backtestRouter);
           e9[i] != null &&
           e21[i] != null &&
           (e9[i] as number) < (e21[i] as number);
-
         const crossUp = prevUp && nowUp;
         const crossDn = prevDn && nowDn;
         if (!crossUp && !crossDn) continue;
@@ -357,52 +450,57 @@ app.use(backtestRouter);
             if (crossDn && closes[i] > vw) continue;
           }
         }
-        // MTF
-        // (calculado acima quando requireMtf)
-        // Se existir, valide direção:
-        // @ts-ignore
-        if (requireMtf && Array.isArray((global as any).__mtfUp)) {
-          /* no-op */
+        if (requireMtf && mtfUp && mtfDown) {
+          if (crossUp && !mtfUp[i]) continue;
+          if (crossDn && !mtfDown[i]) continue;
         }
 
         // Entrada na próxima barra
         const j = Math.min(i + 1, candles.length - 1);
         const entry = Number.isFinite((candles[j] as any).open)
           ? Number((candles[j] as any).open)
-          : Number((candles[j] as any).close) || closes[i];
+          : Number((candles[j] as any).close) || Number(candles[i].close);
 
         const atrv = atr[i] ?? 0;
-        const slPts = Math.max(atrv * Number(k_sl), 0);
-        const tpPts = Math.max(atrv * Number(k_tp), 0);
-
         const isBuy = !!crossUp;
+
+        // SL/TP em pontos via ATR
+        const slPts = atrv > 0 ? Math.max(atrv * Number(k_sl), 0) : 0;
+        const tpPts = atrv > 0 ? Math.max(atrv * Number(k_tp), 0) : 0;
+
         const sl = slPts > 0 ? (isBuy ? entry - slPts : entry + slPts) : null;
         const tp = tpPts > 0 ? (isBuy ? entry + tpPts : entry - tpPts) : null;
 
-        const feats = featuresAt(i);
-        let prob = await getProb(feats);
+        let prob = await getProb(featuresAt(i));
         if (prob == null) {
+          // Heurística estável quando não há micro-model
+          const e9v0 = e9[i] ?? entry;
+          const e21v0 = e21[i] ?? entry;
           const raw =
             0.5 +
             Math.max(
               -0.08,
-              Math.min(0.08, (feats.slope_e9 - feats.slope_e21) * 2)
+              Math.min(0.08, ((e9v0 as number) - (e21v0 as number)) * 0.002)
             ) +
             Math.max(
               -0.05,
-              Math.min(0.05, (feats.dist_ema21 / Math.max(atrv, 1e-6)) * 0.1)
+              Math.min(
+                0.05,
+                ((entry - (e21v0 as number)) / Math.max(atrv || 1e-6, 1e-6)) *
+                  0.1
+              )
             );
           prob = Math.max(0.35, Math.min(0.65, raw));
         }
 
         const costs = Number(costPts) + Number(slippagePts);
-        const evPts = prob * (tpPts || 0) - (1 - prob) * (slPts || 0) - costs;
+        const evPts = (tpPts || 0) * prob - (slPts || 0) * (1 - prob) - costs;
 
         if (prob < Number(minProb)) continue;
         if (evPts < Number(minEV)) continue;
 
-        const row = {
-          side: isBuy ? "BUY" : ("SELL" as const),
+        out.push({
+          side: isBuy ? "BUY" : "SELL",
           suggestedEntry: entry,
           stopSuggestion: sl,
           takeProfitSuggestion: tp,
@@ -411,11 +509,10 @@ app.use(backtestRouter);
           }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
           probHit: Number(prob.toFixed(4)),
           probCalibrated: Number(prob.toFixed(4)),
-          expectedValuePoints: Number(evPts.toFixed(2)),
+          expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
           time: candles[i].time.toISOString(),
           date: DateTime.fromJSDate(candles[i].time).setZone(ZONE).toISODate()!,
-        };
-        (out as any[]).push(row);
+        });
       }
 
       return res.status(200).json(out);
@@ -436,6 +533,184 @@ app.use(backtestRouter);
   });
 })();
 
+/* =========================
+   Fallback /api/candles — agora com normalização de 1 dia
+   ========================= */
+app.get("/api/candles", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "")
+      .trim()
+      .toUpperCase();
+    const timeframe = String(req.query.timeframe || "M5")
+      .trim()
+      .toUpperCase();
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    if (!symbol)
+      return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
+
+    const norm = normalizeDayRange(req.query.from, req.query.to);
+    let f: Date, t: Date;
+    if (norm) {
+      f = norm.fromLocal.toUTC().toJSDate();
+      t = norm.toLocal.toUTC().toJSDate();
+    } else {
+      // range padrão: 5 dias
+      const now = DateTime.now().setZone(ZONE_BR);
+      f = now.minus({ days: 5 }).startOf("day").toUTC().toJSDate();
+      t = now.endOf("day").toUTC().toJSDate();
+    }
+
+    const rows = await loadCandlesAnyTF(symbol, timeframe, {
+      gte: f,
+      lte: t,
+      limit,
+    });
+    const out = (rows || []).map((c) => ({
+      time: c.time.toISOString(),
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close),
+      volume: Number((c as any).volume ?? 0),
+    }));
+    return res.json(out);
+  } catch (e: any) {
+    console.error("[/api/candles] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   Fallback /api/signals (confirmados EMA) — com range de 1 dia
+   ========================= */
+app.get("/api/signals", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "")
+      .trim()
+      .toUpperCase();
+    const timeframe = String(req.query.timeframe || "M5")
+      .trim()
+      .toUpperCase();
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    if (!symbol)
+      return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
+
+    const norm = normalizeDayRange(req.query.from, req.query.to);
+    let f: Date, t: Date;
+    if (norm) {
+      f = norm.fromLocal.toUTC().toJSDate();
+      t = norm.toLocal.toUTC().toJSDate();
+    } else {
+      const now = DateTime.now().setZone(ZONE_BR);
+      f = now.minus({ days: 5 }).startOf("day").toUTC().toJSDate();
+      t = now.endOf("day").toUTC().toJSDate();
+    }
+
+    const rows = await loadCandlesAnyTF(symbol, timeframe, {
+      gte: f,
+      lte: t,
+      limit,
+    });
+    if (!rows?.length) return res.json([]);
+
+    const closes = rows.map((c) => Number(c.close));
+    const EMA = (values: number[], period: number): (number | null)[] => {
+      const out: (number | null)[] = [];
+      const k = 2 / (period + 1);
+      let ema: number | null = null;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        ema = ema == null ? v : v * k + ema * (1 - k);
+        out.push(ema);
+      }
+      return out;
+    };
+    const e9 = EMA(closes, 9);
+    const e21 = EMA(closes, 21);
+
+    const out: any[] = [];
+    for (let i = 1; i < rows.length; i++) {
+      const prevUp =
+        e9[i - 1] != null &&
+        e21[i - 1] != null &&
+        (e9[i - 1] as number) <= (e21[i - 1] as number);
+      const nowUp =
+        e9[i] != null &&
+        e21[i] != null &&
+        (e9[i] as number) > (e21[i] as number);
+      const prevDn =
+        e9[i - 1] != null &&
+        e21[i - 1] != null &&
+        (e9[i - 1] as number) >= (e21[i - 1] as number);
+      const nowDn =
+        e9[i] != null &&
+        e21[i] != null &&
+        (e9[i] as number) < (e21[i] as number);
+      const crossUp = prevUp && nowUp;
+      const crossDn = prevDn && nowDn;
+      if (!crossUp && !crossDn) continue;
+
+      out.push({
+        side: crossUp ? "BUY" : "SELL",
+        time: rows[i].time.toISOString(),
+        price: Number(rows[i].close),
+        note: "EMA9xEMA21",
+      });
+    }
+    return res.json(out);
+  } catch (e: any) {
+    console.error("[/api/signals] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   Diagnóstico rápido
+   ========================= */
+app.get("/api/debug/availability", async (_req, res) => {
+  try {
+    const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO")
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1")
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    const now = DateTime.now().setZone(ZONE_BR);
+    const from = now.minus({ days: 30 }).startOf("day").toUTC().toJSDate();
+    const to = now.endOf("day").toUTC().toJSDate();
+    const out: any[] = [];
+    for (const s of syms) {
+      for (const tf of tfs) {
+        try {
+          const rows = await loadCandlesAnyTF(s, tf, {
+            gte: from,
+            lte: to,
+            limit: 5_000,
+          });
+          out.push({
+            symbol: s,
+            timeframe: tf,
+            count: rows?.length || 0,
+            first: rows?.[0]?.time?.toISOString?.() || null,
+            last: rows?.[rows.length - 1]?.time?.toISOString?.() || null,
+          });
+        } catch (e: any) {
+          out.push({
+            symbol: s,
+            timeframe: tf,
+            error: e?.message || String(e),
+          });
+        }
+      }
+    }
+    return res.json({ ok: true, data: out });
+  } catch (e: any) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 // ====== ROTAS LEGADAS ======
 app.use("/api", routes);
 app.use("/admin", adminRoutes);
@@ -445,7 +720,7 @@ app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     service: "server",
-    version: "server:v4-inline-projected",
+    version: "server:v5-date-normalized",
   })
 );
 
@@ -495,6 +770,11 @@ server.listen(PORT, () => {
     setupWS?.(server);
   } catch (e: any) {
     logger.warn("[WS] módulo não iniciado", { err: e?.message || e });
+  }
+  try {
+    bootPipeline?.();
+  } catch (e: any) {
+    logger.warn("[pipeline] módulo não iniciado", { err: e?.message || e });
   }
 });
 

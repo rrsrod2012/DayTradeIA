@@ -44,15 +44,24 @@ export type ProjectedSignalsParams = {
   confirmTf?: string;
 };
 
-const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
+const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
+const API_BASE = (RAW_API_BASE as string).replace(/\/$/, "");
 
 /** Fetch JSON com tratamento de erro padrão do backend (ok=false) */
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(API_BASE + url, {
-    headers: { "content-type": "application/json" },
-    credentials: "include",
+  const fullUrl =
+    (API_BASE || window.location.origin.replace(/\/$/, "")) +
+    (url.startsWith("/") ? url : `/${url}`);
+
+  const resp = await fetch(fullUrl, {
+    headers: { "content-type": "application/json", ...(init?.headers || {}) },
+    // ⚠️ CORS: sem cookies/credenciais (o backend usa ACAO: *)
+    credentials: "omit",
+    mode: "cors",
+    cache: "no-cache",
     ...init,
   });
+
   const txt = await resp.text();
   const data = txt ? JSON.parse(txt) : null;
   const backendErr =
@@ -72,7 +81,8 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-/** Projeções (IA/Heurística) — sempre normaliza para ProjectedSignal[] */
+export type { ProjectedSignalsParams };
+
 export async function projectedSignals(
   params: ProjectedSignalsParams
 ): Promise<ProjectedSignal[]> {
@@ -97,7 +107,6 @@ export async function projectedSignals(
       ? "SELL"
       : "FLAT";
 
-    // tempo
     const t = s.time ?? s.timestamp ?? s.date ?? s.datetime;
     let iso: string | undefined;
     if (typeof t === "string")
@@ -123,7 +132,6 @@ export async function projectedSignals(
   return out;
 }
 
-/** Sinais confirmados: sempre retorna ConfirmedSignal[] */
 export async function fetchConfirmedSignals(params: {
   symbol: string;
   timeframe: string;
@@ -179,7 +187,6 @@ export async function fetchConfirmedSignals(params: {
   return out;
 }
 
-/** Backtest (para PnL) */
 export async function runBacktest(params: {
   symbol: string;
   timeframe: string;
@@ -194,7 +201,6 @@ export async function runBacktest(params: {
   });
 }
 
-/** Candles (usa ensure/aggregate do backend) */
 export async function fetchCandles(params: {
   symbol: string;
   timeframe: string;

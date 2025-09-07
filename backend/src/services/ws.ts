@@ -5,46 +5,110 @@ import { bus } from "./events";
 type ClientInfo = { symbol: string; timeframe: string };
 
 export function setupWS(server: Server) {
-  const wss = new WebSocketServer({ server, path: "/stream" });
+  // perMessageDeflate: false evita alguns handshakes falharem em dev/proxy
+  const wss = new WebSocketServer({
+    server,
+    path: "/stream",
+    perMessageDeflate: false,
+  });
   const clients = new Map<any, ClientInfo>();
 
   function broadcast(obj: any) {
     const payload = JSON.stringify(obj);
     for (const ws of wss.clients) {
       try {
-        (ws as any).send(payload);
-      } catch {}
+        // 1: OPEN
+        // @ts-ignore
+        if (ws.readyState === 1) (ws as any).send(payload);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[ws] broadcast erro:", (e as any)?.message || e);
+      }
     }
   }
 
-  // Bridge import progress events → FE
+  // === Bridge import progress events → FE (formato novo + legado)
   try {
-    bus.on("import:begin", (p: any) =>
-      broadcast({ type: "importProgress", stage: "begin", ...p })
-    );
-    bus.on("import:progress", (p: any) =>
-      broadcast({ type: "importProgress", stage: "progress", ...p })
-    );
-    bus.on("import:done", (p: any) =>
-      broadcast({ type: "importProgress", stage: "done", ...p })
-    );
-    bus.on("import:error", (p: any) =>
-      broadcast({ type: "importProgress", stage: "error", ...p })
-    );
-  } catch {}
+    bus.on("import:begin", (p: any) => {
+      broadcast({ type: "import:begin", payload: p }); // NOVO
+      broadcast({ type: "importProgress", stage: "begin", ...p }); // LEGADO
+    });
+    bus.on("import:progress", (p: any) => {
+      broadcast({ type: "import:progress", payload: p }); // NOVO
+      broadcast({ type: "importProgress", stage: "progress", ...p }); // LEGADO
+    });
+    bus.on("import:done", (p: any) => {
+      broadcast({ type: "import:done", payload: p }); // NOVO
+      broadcast({ type: "importProgress", stage: "done", ...p }); // LEGADO
+    });
+    bus.on("import:error", (p: any) => {
+      broadcast({ type: "import:error", payload: p }); // NOVO
+      broadcast({ type: "importProgress", stage: "error", ...p }); // LEGADO
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[ws] não foi possível registrar bridge de import:*:", e);
+  }
 
+  // === Heartbeat
+  function noop() {}
+  function heartbeat(this: any) {
+    this.isAlive = true;
+  }
   wss.on("connection", (ws, req) => {
     const url = new URL(req.url ?? "", "http://localhost");
     const symbol = url.searchParams.get("symbol") ?? "WIN";
     const timeframe = url.searchParams.get("timeframe") ?? "M5";
     clients.set(ws, { symbol, timeframe });
 
-    (ws as any).send(JSON.stringify({ type: "hello", symbol, timeframe }));
+    // marca vivo e responde pong
+    // @ts-ignore
+    ws.isAlive = true;
+    // @ts-ignore
+    ws.on("pong", heartbeat);
 
-    (ws as any).on("close", () => {
+    try {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[ws] conectado ${req.socket.remoteAddress} symbol=${symbol} tf=${timeframe}`
+      );
+      (ws as any).send(JSON.stringify({ type: "hello", symbol, timeframe }));
+    } catch {}
+
+    (ws as any).on("close", (code: number, reason: any) => {
       clients.delete(ws);
+      // eslint-disable-next-line no-console
+      console.log("[ws] close", code, reason?.toString?.() || "");
+    });
+
+    (ws as any).on("error", (err: any) => {
+      // eslint-disable-next-line no-console
+      console.error("[ws] error:", err?.message || err);
     });
   });
+
+  // ping a cada 15s; encerra quem não responde
+  const interval = setInterval(() => {
+    for (const ws of wss.clients) {
+      // @ts-ignore
+      if (ws.isAlive === false) {
+        try {
+          // @ts-ignore
+          console.warn("[ws] encerrando cliente inativo");
+          // @ts-ignore
+          return ws.terminate();
+        } catch {}
+      }
+      // @ts-ignore
+      ws.isAlive = false;
+      try {
+        // @ts-ignore
+        ws.ping(noop);
+      } catch {}
+    }
+  }, 15000);
+
+  wss.on("close", () => clearInterval(interval));
 
   // (debug) – envia candle simulado a cada 3s
   if (process.env.WS_DEBUG_CANDLES !== "0") {
@@ -68,11 +132,15 @@ export function setupWS(server: Server) {
       });
       for (const ws of wss.clients) {
         try {
-          (ws as any).send(payload);
+          // 1: OPEN
+          // @ts-ignore
+          if (ws.readyState === 1) (ws as any).send(payload);
         } catch {}
       }
     }, 3000);
   }
 
+  // eslint-disable-next-line no-console
+  console.log("[ws] pronto em /stream");
   return wss;
 }
