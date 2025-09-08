@@ -3,15 +3,18 @@ import { ProgressBar, Alert, Badge, Card } from "react-bootstrap";
 
 /**
  * Este componente:
- * - Conecta ao WebSocket /stream (via hook interno que lê VITE_WS_URL/VITE_API_BASE/window.location)
+ * - Conecta ao WebSocket /stream (via URL derivada)
  * - Escuta eventos: import:begin, import:progress, import:done, import:error
  * - Agrega progresso por arquivo
- * - Exibe status da conexão WS e um mini-log dos últimos eventos (para diagnóstico)
- *
- * Espera que o backend envie mensagens JSON no formato:
- *   { type: "import:begin"|"import:progress"|"import:done"|"import:error",
- *     payload: { file: string, total?: number, processed?: number, inserted?: number, updated?: number, message?: string } }
+ * - Exibe status da conexão WS e um mini-log
+ * - Dispara "daytrade:data-invalidate" no término da importação,
+ *   e repassa qualquer "data:invalidate" que vier do backend.
+ * - HOTFIX: se ninguém tratar o evento em ~800ms, força um reload da página (uma vez).
  */
+
+// Toggle opcional para não recarregar a página automaticamente
+const DISABLE_FALLBACK_RELOAD =
+  ((import.meta as any).env?.VITE_DISABLE_RELOAD ?? "") === "1";
 
 type ImportEventPayload = {
   file: string;
@@ -20,6 +23,8 @@ type ImportEventPayload = {
   inserted?: number;
   updated?: number;
   message?: string;
+  symbol?: string;
+  timeframe?: string;
 };
 
 type ImportEvent = {
@@ -39,18 +44,25 @@ type FileProgress = {
 };
 
 function getWSUrl(): string {
-  // 1) variáveis do Vite
   const env: any = (import.meta as any).env || {};
   const explicit = env.VITE_WS_URL as string | undefined;
   if (explicit && explicit.trim()) return explicit.trim();
 
-  // 2) derivar de VITE_API_BASE se existir
   const apiBase = (env.VITE_API_BASE as string | undefined)?.trim() || "";
   const base =
     apiBase !== ""
       ? apiBase.replace(/^http/i, "ws")
       : window.location.origin.replace(/^http/i, "ws");
   return base.replace(/\/?$/, "") + "/stream";
+}
+
+// Heurística para extrair symbol/timeframe do nome do arquivo (fallback)
+function guessFromFile(file?: string): { symbol?: string; timeframe?: string } {
+  if (!file) return {};
+  const base = (file.split(/[\\/]/).pop() || "").toUpperCase();
+  const sym = base.match(/\b([A-Z]{3,5})\b/)?.[1];
+  const tf = base.match(/\b((?:M|H)\d{1,2})\b/)?.[1];
+  return { symbol: sym || undefined, timeframe: tf || undefined };
 }
 
 export default function ImportProgress() {
@@ -61,23 +73,58 @@ export default function ImportProgress() {
   const [log, setLog] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // flags do fallback
+  const handledRef = useRef(false);
+  const reloadedRef = useRef(false);
+
+  // Qualquer parte do app pode sinalizar que tratou a invalidação:
+  // window.dispatchEvent(new CustomEvent("daytrade:data-invalidate:handled"))
+  useEffect(() => {
+    const onHandled = () => {
+      handledRef.current = true;
+    };
+    window.addEventListener("daytrade:data-invalidate:handled", onHandled);
+    return () =>
+      window.removeEventListener(
+        "daytrade:data-invalidate:handled",
+        onHandled
+      );
+  }, []);
+
+  const scheduleFallbackReload = () => {
+    if (DISABLE_FALLBACK_RELOAD) return; // não força reload se desativado
+    // Aguarda um pouquinho para dar tempo de componentes reagirem ao evento
+    setTimeout(() => {
+      if (!handledRef.current && !reloadedRef.current) {
+        reloadedRef.current = true;
+        try {
+          // eslint-disable-next-line no-console
+          console.log(
+            "[ImportProgress] ninguém tratou data-invalidate → recarregando página"
+          );
+        } catch { }
+        window.location.reload();
+      }
+    }, 800);
+  };
+
   useEffect(() => {
     const url = getWSUrl();
     let closedByUs = false;
+    let alive = true;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     const addLog = (line: string) =>
       setLog((prev) =>
-        [new Date().toLocaleTimeString() + " " + line, ...prev].slice(0, 20)
+        [new Date().toLocaleTimeString() + " " + line, ...prev].slice(0, 40)
       );
 
     ws.onopen = () => {
+      if (!alive) return;
       setStatus("open");
       addLog(`WS conectado: ${url}`);
-      // Opcional: informe seu símbolo/timeframe se o backend espera querystring.
-      // Se o backend ignora, não tem problema.
       try {
         ws.send(
           JSON.stringify({
@@ -85,10 +132,11 @@ export default function ImportProgress() {
             payload: { source: "ImportProgress" },
           })
         );
-      } catch {}
+      } catch { }
     };
 
     ws.onmessage = (evt) => {
+      if (!alive) return;
       let data: any = null;
       try {
         data = JSON.parse(evt.data);
@@ -96,7 +144,6 @@ export default function ImportProgress() {
         addLog("WS msg (texto): " + String(evt.data).slice(0, 120));
         return;
       }
-
       if (!data || !data.type) {
         addLog("WS msg desconhecida");
         return;
@@ -104,13 +151,25 @@ export default function ImportProgress() {
 
       // Log leve
       addLog(
-        `evt: ${data.type}${
-          data?.payload?.file ? " [" + data.payload.file + "]" : ""
+        `evt: ${data.type}${data?.payload?.file ? " [" + data.payload.file + "]" : ""
         }`
       );
 
-      // Aceitamos tanto eventos vindos diretamente (type começa com import:)
-      // quanto envelopados em {channel:"import", type:"progress", payload:{...}}
+      // ===== Pass-through de invalidação do backend =====
+      if (data.type === "data:invalidate") {
+        try {
+          window.dispatchEvent(
+            new CustomEvent("daytrade:data-invalidate", {
+              detail: { source: "WS", ...(data.payload || {}) },
+            })
+          );
+        } catch { }
+        // Se ninguém no app tratar, recarrega
+        scheduleFallbackReload();
+        // Continua para processar mensagens import:* caso venham juntas
+      }
+
+      // Normalização dos eventos de import
       const isImportDirect =
         typeof data.type === "string" && data.type.startsWith("import:");
       const isImportChannel =
@@ -119,16 +178,13 @@ export default function ImportProgress() {
         ["begin", "progress", "done", "error"].includes(data.type);
 
       let normalized: ImportEvent | null = null;
-
-      if (isImportDirect) {
-        normalized = data as ImportEvent;
-      } else if (isImportChannel) {
+      if (isImportDirect) normalized = data as ImportEvent;
+      else if (isImportChannel) {
         normalized = {
           type: ("import:" + data.type) as ImportEvent["type"],
           payload: data.payload as ImportEventPayload,
         };
       }
-
       if (!normalized) return;
 
       const { type, payload } = normalized;
@@ -213,33 +269,91 @@ export default function ImportProgress() {
 
         return prev;
       });
+
+      // Ao concluir, disparamos o evento global e, se ninguém tratar, recarrega
+      if (type === "import:done") {
+        const g = guessFromFile(payload.file);
+        const symbol = (payload.symbol || g.symbol || "WIN").toUpperCase();
+        const timeframe = (payload.timeframe || g.timeframe || "M1").toUpperCase();
+
+        try {
+          window.dispatchEvent(
+            new CustomEvent("daytrade:data-invalidate", {
+              detail: {
+                source: "ImportProgress",
+                reason: "import-done",
+                kinds: ["candles", "signals", "projected", "pnl"],
+                file: payload.file,
+                symbol,
+                timeframe,
+                totals: {
+                  total: payload.total ?? null,
+                  processed: payload.processed ?? null,
+                  inserted: payload.inserted ?? null,
+                  updated: payload.updated ?? null,
+                },
+              },
+            })
+          );
+        } catch { }
+        scheduleFallbackReload();
+      }
     };
 
     ws.onerror = () => {
+      if (!alive) return;
       addLog("WS erro");
     };
 
     ws.onclose = () => {
+      if (!alive) return;
       setStatus("closed");
       addLog("WS desconectado");
       if (!closedByUs) {
-        // Tentativa simples de reconexão
         setTimeout(() => {
           if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
             setStatus("connecting");
-            // efeito irá recriar pois dependências não mudam; forçamos remount:
-            // Aqui mantemos simples: recarregue a página ou deixe como está.
           }
         }, 1500);
       }
     };
 
     return () => {
+      alive = false;
       closedByUs = true;
-      try {
-        ws.close();
-      } catch {}
+
+      const w = wsRef.current;
       wsRef.current = null;
+
+      try {
+        if (!w) return;
+
+        switch (w.readyState) {
+          case WebSocket.OPEN:
+          case WebSocket.CLOSING:
+            w.close();
+            break;
+
+          case WebSocket.CONNECTING: {
+            // StrictMode: se desmontar enquanto conecta, fecha assim que abrir,
+            // evitando "WebSocket is closed before the connection is established".
+            const closeOnOpen = () => {
+              try {
+                w.close();
+              } catch { }
+            };
+            try {
+              w.addEventListener("open", closeOnOpen, { once: true });
+            } catch { }
+            break;
+          }
+
+          case WebSocket.CLOSED:
+          default:
+            // nada
+            break;
+        }
+      } catch { }
     };
   }, []);
 
@@ -271,8 +385,8 @@ export default function ImportProgress() {
           total > 0
             ? Math.min(100, Math.round((fp.processed / total) * 100))
             : fp.done
-            ? 100
-            : 0;
+              ? 100
+              : 0;
 
         return (
           <Card className="mb-2" key={fp.file}>

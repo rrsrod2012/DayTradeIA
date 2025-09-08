@@ -9,27 +9,13 @@ type TF = "M1" | "M5" | "M15" | "M30" | "H1";
 const TF_MIN: Record<TF, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60 };
 const ZONE = "America/Sao_Paulo";
 
-const VERSION = "backtest:v3.5-date-normalized";
+const VERSION = "backtest:v3.6-date-normalized+warmup";
 
 /* ===== Helpers de timeframe/bucket ===== */
-function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
-  const s = String(tfRaw || "")
-    .trim()
-    .toUpperCase();
-  if (!s) return { tfU: "M5", tfMin: 5 };
-  if (s.startsWith("M") || s.startsWith("H")) {
-    const unit = s[0];
-    const num = parseInt(s.slice(1), 10) || (unit === "H" ? 1 : 5);
-    const tfU = `${unit}${num}`;
-    const tfMin = unit === "H" ? num * 60 : num;
-    return { tfU, tfMin };
-  }
-  const m = /(\d+)\s*(M|MIN|MINUTES|m)?/.exec(s);
-  if (m) {
-    const num = parseInt(m[1], 10) || 5;
-    return { tfU: `M${num}`, tfMin: num };
-  }
-  return { tfU: "M5", tfMin: 5 };
+function normalizeTf(tfRaw: string): { tfU: TF; tfMin: number } {
+  const s = String(tfRaw || "").trim().toUpperCase() as TF;
+  if (!s || !TF_MIN[s]) return { tfU: "M5", tfMin: 5 };
+  return { tfU: s, tfMin: TF_MIN[s] };
 }
 function floorTo(d: Date, tfMin: number): Date {
   const dt = DateTime.fromJSDate(d).toUTC();
@@ -56,7 +42,7 @@ function EMA(values: number[], period: number): (number | null)[] {
       out.push(ema);
       continue;
     }
-    ema = ema == null ? v : v * k + ema * (1 - k);
+    ema = ema == null ? v : v * k + (ema as number) * (1 - k);
     out.push(ema);
   }
   return out;
@@ -75,7 +61,7 @@ function diagify(e: any) {
   return { diag: lines };
 }
 
-/* ===== NOVO: parsing/normalização de datas no fuso de SP ===== */
+/* ===== Parsing/normalização de datas no fuso de SP ===== */
 function parseUserDate(raw: any): {
   ok: boolean;
   dt: DateTime;
@@ -107,9 +93,9 @@ function parseUserDate(raw: any): {
     return { ok: dt.isValid, dt, isDateOnly: true };
   }
 
-  // ISO com hora — tratamos como hora local (ignorando Z/offset se houver)
+  // ISO com hora — trata como hora local (remove offset/Z)
   if (/^\d{4}-\d{2}-\d{2}t/i.test(s)) {
-    s = s.replace(/([+-]\d{2}:?\d{2}|Z)$/i, ""); // remove offset/Z para tratar como local
+    s = s.replace(/([+-]\d{2}:?\d{2}|Z)$/i, "");
     const dt = DateTime.fromISO(s, { zone: ZONE });
     return { ok: dt.isValid, dt, isDateOnly: false };
   }
@@ -184,15 +170,13 @@ router.all("/api/debug/echo", express.json(), (req, res) => {
 router.get("/api/backtest/health", async (req, res) => {
   try {
     const { symbol, timeframe, from, to } = req.query as any;
-    const sym = String(symbol || "")
-      .toUpperCase()
-      .trim();
+    const sym = String(symbol || "").toUpperCase().trim();
     if (!sym) return res.status(200).json(bad("Faltou 'symbol'"));
 
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-    // ==== NOVO: datas como dia inteiro em SP, depois em UTC + bucket ====
-    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 5);
+    // Datas: dia inteiro em SP → UTC → buckets
+    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1); // <<< 1 dia
     let fromD: Date, toD: Date;
 
     const norm = normalizeDayRange(from, to);
@@ -207,7 +191,8 @@ router.get("/api/backtest/health", async (req, res) => {
       toD = ceilToExclusive(t.toJSDate(), tfMin);
     }
 
-    const candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD });
+    // Apenas sanidade (sem warmup aqui)
+    const candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD } as any);
     return res.status(200).json(
       ok({
         symbol: sym,
@@ -241,16 +226,14 @@ router.all("/api/backtest", express.json(), async (req, res) => {
       maxConsecLosses = 0,
     } = body as any;
 
-    const sym = String(symbol || "")
-      .toUpperCase()
-      .trim();
+    const sym = String(symbol || "").toUpperCase().trim();
     if (!sym)
       return res.status(200).json(bad("Faltou 'symbol' (ex.: WIN, WDO)"));
 
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-    // ==== NOVO: datas como dia inteiro em SP, depois em UTC + bucket ====
-    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 5);
+    // Datas: dia inteiro em SP → UTC → buckets
+    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1); // <<< 1 dia
     let fromD: Date, toD: Date;
 
     const norm = normalizeDayRange(from, to);
@@ -271,6 +254,13 @@ router.all("/api/backtest", express.json(), async (req, res) => {
         .json(bad("'from' deve ser anterior a 'to'", { from: fromD, to: toD }));
     }
 
+    // ===== WARM-UP =====
+    // Carrega um lookback para aquecer as EMAs (21 períodos + margem).
+    // Ex.: para M5 → 21*5 = 105 min. Usaremos 150 min (2.5h) ou 30*tfMin, o que for MAIOR.
+    const WARMUP_MULT = 30;
+    const warmupMin = Math.max(150, WARMUP_MULT * tfMin);
+    const fromWarm = new Date(fromD.getTime() - warmupMin * 60_000);
+
     let candles: Array<{
       time: Date;
       open: number;
@@ -279,7 +269,7 @@ router.all("/api/backtest", express.json(), async (req, res) => {
       close: number;
     }>;
     try {
-      candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD });
+      candles = await loadCandlesAnyTF(sym, tfU, { gte: fromWarm, lte: toD } as any);
     } catch (e: any) {
       return res
         .status(200)
@@ -308,12 +298,13 @@ router.all("/api/backtest", express.json(), async (req, res) => {
           pnlMoney: 0,
           lossCapApplied: Number(lossCap) || 0,
           maxConsecLossesApplied: Number(maxConsecLosses) || 0,
-          info: "sem candles no período informado (verifique ingestão/DB/símbolo/TF)",
+          info:
+            "sem candles no período informado (verifique ingestão/DB/símbolo/TF)",
         })
       );
     }
 
-    // Indicadores
+    // ===== Indicadores =====
     const closes = candles.map((c) =>
       Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0
     );
@@ -366,9 +357,13 @@ router.all("/api/backtest", express.json(), async (req, res) => {
         note,
       };
       trades.push(tr);
-      dayPnL += tr.pnl;
-      if (tr.pnl <= 0) lossStreak += 1;
-      else lossStreak = 0;
+
+      // Só contam no PnL diário/controle se a ENTRADA é dentro da janela solicitada
+      if (candles[entryIdx].time >= fromD && candles[entryIdx].time <= toD) {
+        dayPnL += tr.pnl;
+        if (tr.pnl <= 0) lossStreak += 1;
+        else lossStreak = 0;
+      }
     };
 
     const closeAt = (i: number, price: number, note?: string) => {
@@ -381,8 +376,11 @@ router.all("/api/backtest", express.json(), async (req, res) => {
       const d = toLocalDateStr(candles[i].time);
       if (d !== day) {
         day = d;
-        dayPnL = 0;
-        lossStreak = 0;
+        // reset diário só afeta contagem a partir do fromD
+        if (candles[i].time >= fromD) {
+          dayPnL = 0;
+          lossStreak = 0;
+        }
       }
 
       const prevUp =
@@ -410,16 +408,19 @@ router.all("/api/backtest", express.json(), async (req, res) => {
         ? Number(candles[nextIdx].open)
         : Number(candles[nextIdx].close) || 0;
 
-      if (pos?.side === "BUY" && crossDn)
-        closeAt(nextIdx, nextOpen, "reverse-cross");
+      // Estamos dentro da janela? Só abrimos novas posições se sim.
+      const inWindow =
+        candles[nextIdx].time >= fromD && candles[nextIdx].time <= toD;
+
+      // Fechamento por reversão só ocorre para posições abertas dentro da janela
+      if (pos?.side === "BUY" && crossDn) closeAt(nextIdx, nextOpen, "reverse-cross");
       else if (pos?.side === "SELL" && crossUp)
         closeAt(nextIdx, nextOpen, "reverse-cross");
 
-      if (!pos) {
+      if (!pos && inWindow) {
         const dailyStopped =
           (Number(lossCap) > 0 && dayPnL <= -Math.abs(Number(lossCap))) ||
-          (Number(maxConsecLosses) > 0 &&
-            lossStreak >= Number(maxConsecLosses));
+          (Number(maxConsecLosses) > 0 && lossStreak >= Number(maxConsecLosses));
         if (!dailyStopped) {
           if (crossUp)
             pos = { side: "BUY", entryIdx: nextIdx, entryPrice: nextOpen };
@@ -429,41 +430,47 @@ router.all("/api/backtest", express.json(), async (req, res) => {
       }
     }
 
+    // Se sobrou posição aberta e o último candle é <= toD, fecha no último
     if (pos) {
       const lastIdx = candles.length - 1;
+      const lastTime = candles[lastIdx].time;
       const px = Number.isFinite(candles[lastIdx].close)
         ? Number(candles[lastIdx].close)
         : Number(candles[lastIdx].open) || 0;
-      closeAt(lastIdx, px, "end");
+      if (lastTime <= toD) closeAt(lastIdx, px, "end");
     }
 
-    // Métricas
-    const wins = trades.filter((t) => t.pnl > 0).length;
-    const losses = trades.filter((t) => t.pnl < 0).length;
-    const ties = trades.filter((t) => t.pnl === 0).length;
+    // Mantemos apenas trades cuja ENTRADA está dentro da janela pedida
+    const filtered = trades.filter((t) => {
+      const et = new Date(t.entryTime);
+      return et >= fromD && et <= toD;
+    });
+
+    // ===== Métricas com base no conjunto filtrado =====
+    const wins = filtered.filter((t) => t.pnl > 0).length;
+    const losses = filtered.filter((t) => t.pnl < 0).length;
+    const ties = filtered.filter((t) => t.pnl === 0).length;
     const pnlPoints = Number(
-      trades.reduce((a, b) => a + (isFinite(b.pnl) ? b.pnl : 0), 0).toFixed(2)
+      filtered.reduce((a, b) => a + (isFinite(b.pnl) ? b.pnl : 0), 0).toFixed(2)
     );
-    const sumWin = trades
-      .filter((t) => t.pnl > 0)
-      .reduce((a, b) => a + b.pnl, 0);
+    const sumWin = filtered.filter((t) => t.pnl > 0).reduce((a, b) => a + b.pnl, 0);
     const sumLossAbs = Math.abs(
-      trades.filter((t) => t.pnl < 0).reduce((a, b) => a + b.pnl, 0)
+      filtered.filter((t) => t.pnl < 0).reduce((a, b) => a + b.pnl, 0)
     );
     const profitFactor =
       sumLossAbs > 0
         ? Number((sumWin / sumLossAbs).toFixed(3))
         : wins > 0
-        ? Infinity
-        : 0;
-    const avgPnL = trades.length
-      ? Number((pnlPoints / trades.length).toFixed(2))
+          ? Infinity
+          : 0;
+    const avgPnL = filtered.length
+      ? Number((pnlPoints / filtered.length).toFixed(2))
       : 0;
 
     let peak = 0,
       dd = 0,
       run = 0;
-    for (const t of trades) {
+    for (const t of filtered) {
       run += t.pnl;
       peak = Math.max(peak, run);
       dd = Math.min(dd, run - peak);
@@ -477,16 +484,14 @@ router.all("/api/backtest", express.json(), async (req, res) => {
         timeframe: tfU,
         from: fromD.toISOString(),
         to: toD.toISOString(),
-        candles: candles.length,
-        trades,
+        candles: candles.filter((c) => c.time >= fromD && c.time <= toD).length,
+        trades: filtered,
         summary: {
-          trades: trades.length,
+          trades: filtered.length,
           wins,
           losses,
           ties,
-          winRate: trades.length
-            ? Number((wins / trades.length).toFixed(4))
-            : 0,
+          winRate: filtered.length ? Number((wins / filtered.length).toFixed(4)) : 0,
           pnlPoints,
           avgPnL,
           profitFactor,

@@ -21,15 +21,10 @@ type Props = {
 export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [collapsed, setCollapsed] = React.useState(!!collapsedByDefault);
 
-  // ---------- Datas default = última semana ----------
+  // ---------- Datas default = HOJE ----------
   const today = React.useMemo(() => new Date(), []);
-  const weekAgo = React.useMemo(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 7);
-    return d;
-  }, []);
-  const [from, setFrom] = React.useState(fmtDate(weekAgo)); // YYYY-MM-DD
-  const [to, setTo] = React.useState(fmtDate(today)); // YYYY-MM-DD
+  const [from, setFrom] = React.useState(fmtDate(today)); // YYYY-MM-DD
+  const [to, setTo] = React.useState(fmtDate(today));     // YYYY-MM-DD
 
   // ---------- Filtros ----------
   const [symbol, setSymbol] = React.useState("WIN");
@@ -105,17 +100,17 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       setPnL(
         sum
           ? {
-              trades: sum.trades ?? 0,
-              wins: sum.wins ?? 0,
-              losses: sum.losses ?? 0,
-              ties: sum.ties ?? 0,
-              winRate: sum.winRate ?? 0,
-              pnlPoints: sum.pnlPoints ?? bt?.pnlPoints ?? 0,
-              pnlMoney: bt?.pnlMoney ?? undefined,
-              avgPnL: sum.avgPnL ?? 0,
-              profitFactor: sum.profitFactor ?? 0,
-              maxDrawdown: sum.maxDrawdown ?? 0,
-            }
+            trades: sum.trades ?? 0,
+            wins: sum.wins ?? 0,
+            losses: sum.losses ?? 0,
+            ties: sum.ties ?? 0,
+            winRate: sum.winRate ?? 0,
+            pnlPoints: sum.pnlPoints ?? bt?.pnlPoints ?? 0,
+            pnlMoney: bt?.pnlMoney ?? undefined,
+            avgPnL: sum.avgPnL ?? 0,
+            profitFactor: sum.profitFactor ?? 0,
+            maxDrawdown: sum.maxDrawdown ?? 0,
+          }
           : null
       );
     } catch (e: any) {
@@ -165,6 +160,20 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     requireMtf,
     confirmTf,
   ]);
+
+  // OUVE o evento disparado pelo backend/WS para invalidar dados do dia atual
+  React.useEffect(() => {
+    function onInvalidate() {
+      // Mantemos from/to atuais (por padrão = HOJE) e só refetch
+      fetchAllOnce();
+    }
+    // nome do evento vindo do ImportProgress / stream
+    window.addEventListener("daytrade:data-invalidate" as any, onInvalidate);
+    return () => {
+      window.removeEventListener("daytrade:data-invalidate" as any, onInvalidate);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, timeframe, from, to, rr, minProb, minEV, useMicroModel, vwapFilter, requireMtf, confirmTf]);
 
   return (
     <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>

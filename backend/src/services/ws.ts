@@ -1,6 +1,7 @@
 import type { Server } from "http";
 import { WebSocketServer } from "ws";
 import { bus } from "./events";
+import path from "path";
 
 type ClientInfo = { symbol: string; timeframe: string };
 
@@ -27,6 +28,17 @@ export function setupWS(server: Server) {
     }
   }
 
+  // Tenta extrair symbol/timeframe pelo nome do arquivo (fallback seguro)
+  function guessFromFile(file?: string): { symbol: string; timeframe: string } {
+    const base = file ? path.basename(file) : "";
+    // Exemplos: WIN_M1.csv, WDO-2025-09_M5.csv, candles_WIN_M15_*.csv
+    const symMatch = base.match(/\b([A-Z]{3,5})\b/);
+    const tfMatch = base.match(/\b((?:M|H)\d{1,2})\b/i);
+    const symbol = (symMatch?.[1] ?? "WIN").toUpperCase();
+    const timeframe = (tfMatch?.[1] ?? "M1").toUpperCase();
+    return { symbol, timeframe };
+  }
+
   // === Bridge import progress events → FE (formato novo + legado)
   try {
     bus.on("import:begin", (p: any) => {
@@ -40,6 +52,33 @@ export function setupWS(server: Server) {
     bus.on("import:done", (p: any) => {
       broadcast({ type: "import:done", payload: p }); // NOVO
       broadcast({ type: "importProgress", stage: "done", ...p }); // LEGADO
+
+      // ===== NOVO: invalidação para forçar FE a refazer fetch (gráfico/sinais/PnL)
+      const meta = {
+        symbol: String(p?.symbol || "").toUpperCase(),
+        timeframe: String(p?.timeframe || "").toUpperCase(),
+      };
+      const guess = guessFromFile(p?.file);
+      const symbol = meta.symbol || guess.symbol;
+      const timeframe = meta.timeframe || guess.timeframe;
+
+      // Envia um único evento genérico com "kinds" para máxima compatibilidade
+      broadcast({
+        type: "data:invalidate",
+        payload: {
+          kinds: ["candles", "signals", "projected", "pnl"],
+          symbol,
+          timeframe,
+          reason: "import-done",
+          file: p?.file || null,
+          totals: {
+            total: p?.total ?? null,
+            processed: p?.processed ?? null,
+            inserted: p?.inserted ?? null,
+            updated: p?.updated ?? null,
+          },
+        },
+      });
     });
     bus.on("import:error", (p: any) => {
       broadcast({ type: "import:error", payload: p }); // NOVO
@@ -51,7 +90,7 @@ export function setupWS(server: Server) {
   }
 
   // === Heartbeat
-  function noop() {}
+  function noop() { }
   function heartbeat(this: any) {
     this.isAlive = true;
   }
@@ -73,7 +112,7 @@ export function setupWS(server: Server) {
         `[ws] conectado ${req.socket.remoteAddress} symbol=${symbol} tf=${timeframe}`
       );
       (ws as any).send(JSON.stringify({ type: "hello", symbol, timeframe }));
-    } catch {}
+    } catch { }
 
     (ws as any).on("close", (code: number, reason: any) => {
       clients.delete(ws);
@@ -97,14 +136,14 @@ export function setupWS(server: Server) {
           console.warn("[ws] encerrando cliente inativo");
           // @ts-ignore
           return ws.terminate();
-        } catch {}
+        } catch { }
       }
       // @ts-ignore
       ws.isAlive = false;
       try {
         // @ts-ignore
         ws.ping(noop);
-      } catch {}
+      } catch { }
     }
   }, 15000);
 
@@ -135,7 +174,7 @@ export function setupWS(server: Server) {
           // 1: OPEN
           // @ts-ignore
           if (ws.readyState === 1) (ws as any).send(payload);
-        } catch {}
+        } catch { }
       }
     }, 3000);
   }

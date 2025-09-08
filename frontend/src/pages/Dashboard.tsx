@@ -50,28 +50,36 @@ type Projected = {
   expectedValuePoints?: number | null;
 };
 
-const LS_KEY = "dtia.settings.v3"; // bump para incluir filtros de horário
+const LS_KEY = "dtia.settings.v6";         // bump forte
+const LS_MIGRATED_FLAG = "dtia.migrated.v6";
 
-function weekBusinessRange() {
+/* ====== NOVO: util para data de hoje (local) no formato YYYY-MM-DD ====== */
+function todayLocalISO() {
   const d = new Date();
-  const day = d.getDay(); // 0..6
-  const diffToMon = (day + 6) % 7;
-  const monday = new Date(d);
-  monday.setDate(d.getDate() - diffToMon);
-  const friday = new Date(monday);
-  friday.setDate(monday.getDate() + 4);
-  const fmt = (x: Date) =>
-    `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(
-      x.getDate()
-    ).padStart(2, "0")}`;
-  return { from: fmt(monday), to: fmt(friday) };
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function todayRange() {
+  const t = todayLocalISO();
+  return { from: t, to: t };
+}
+
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
 }
 
 export default function Dashboard() {
   const [symbol, setSymbol] = useState("WIN");
   const [timeframe, setTimeframe] = useState("M5");
-  const [dateFrom, setDateFrom] = useState<string>("");
-  const [dateTo, setDateTo] = useState<string>("");
+  const [dateFrom, setDateFrom] = useState<string>(() => todayISO());
+  const [dateTo, setDateTo] = useState<string>(() => todayISO());
+
   const [loading, setLoading] = useState(false);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [signals, setSignals] = useState<any[]>([]);
@@ -129,43 +137,51 @@ export default function Dashboard() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LS_KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (s.symbol) setSymbol(s.symbol);
-        if (s.timeframe) setTimeframe(s.timeframe);
-        if (s.dateFrom) setDateFrom(s.dateFrom);
-        if (s.dateTo) setDateTo(s.dateTo);
-        if (typeof s.showFibo === "boolean") setShowFibo(s.showFibo);
-        if (typeof s.darkMode === "boolean") setDarkMode(s.darkMode);
+      if (!raw) return; // mantém HOJE (defaults dos useState)
 
-        if (typeof s.horizon === "number") setHorizon(s.horizon);
-        if (typeof s.rr === "number") setRR(s.rr);
-        if (typeof s.evalWindow === "number") setEvalWindow(s.evalWindow);
-        if (typeof s.gateRegime === "boolean") setGateRegime(s.gateRegime);
-        if (typeof s.gateToD === "boolean") setGateToD(s.gateToD);
-        if (typeof s.calibrate === "boolean") setCalibrate(s.calibrate);
-        if (typeof s.useMicroModel === "boolean")
-          setUseMicroModel(s.useMicroModel);
-        if (typeof s.minProb === "number") setMinProb(s.minProb);
-        if (typeof s.minEV === "number") setMinEV(s.minEV);
-        if (typeof s.dailyLossCap === "number") setDailyLossCap(s.dailyLossCap);
+      const s = JSON.parse(raw);
+      if (s.symbol) setSymbol(s.symbol);
+      if (s.timeframe) setTimeframe(s.timeframe);
 
-        if (typeof s.applyHourFilter === "boolean")
-          setApplyHourFilter(s.applyHourFilter);
-        if (typeof s.hourStart === "number") setHourStart(s.hourStart);
-        if (typeof s.hourEnd === "number") setHourEnd(s.hourEnd);
-      } else {
-        // valores padrão de data: semana útil
-        const r = weekBusinessRange();
-        setDateFrom(r.from);
-        setDateTo(r.to);
+      // ⚠️ NÃO restaure dateFrom/dateTo para manter Hoje→Hoje na primeira carga
+      // if (s.dateFrom) setDateFrom(s.dateFrom);
+      // if (s.dateTo) setDateTo(s.dateTo);
+
+      if (typeof s.showFibo === "boolean") setShowFibo(s.showFibo);
+      if (typeof s.darkMode === "boolean") setDarkMode(s.darkMode);
+      if (typeof s.horizon === "number") setHorizon(s.horizon);
+      if (typeof s.rr === "number") setRR(s.rr);
+      if (typeof s.evalWindow === "number") setEvalWindow(s.evalWindow);
+      if (typeof s.gateRegime === "boolean") setGateRegime(s.gateRegime);
+      if (typeof s.gateToD === "boolean") setGateToD(s.gateToD);
+      if (typeof s.calibrate === "boolean") setCalibrate(s.calibrate);
+      if (typeof s.useMicroModel === "boolean") setUseMicroModel(s.useMicroModel);
+      if (typeof s.minProb === "number") setMinProb(s.minProb);
+      if (typeof s.minEV === "number") setMinEV(s.minEV);
+      if (typeof s.dailyLossCap === "number") setDailyLossCap(s.dailyLossCap);
+      if (typeof s.applyHourFilter === "boolean") setApplyHourFilter(s.applyHourFilter);
+      if (typeof s.hourStart === "number") setHourStart(s.hourStart);
+      if (typeof s.hourEnd === "number") setHourEnd(s.hourEnd);
+
+      // opcional: remova as datas persistidas do storage para nunca mais voltarem
+      if ('dateFrom' in s || 'dateTo' in s) {
+        const { dateFrom: _df, dateTo: _dt, ...rest } = s;
+        try { localStorage.setItem(LS_KEY, JSON.stringify(rest)); } catch { }
       }
     } catch {
-      const r = weekBusinessRange();
-      setDateFrom(r.from);
-      setDateTo(r.to);
+      // fica HOJE pelos defaults dos useState
     }
   }, []);
+
+  // Garantia extra: se alguma data estiver vazia em runtime, seta HOJE
+  useEffect(() => {
+    if (!dateFrom || !dateTo) {
+      const t = todayISO();
+      if (!dateFrom) setDateFrom(t);
+      if (!dateTo) setDateTo(t);
+    }
+  }, [dateFrom, dateTo]);
+
 
   // Salva no localStorage quando qualquer parâmetro/filtro muda
   useEffect(() => {
@@ -192,7 +208,7 @@ export default function Dashboard() {
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
-    } catch {}
+    } catch { }
   }, [
     symbol,
     timeframe,
@@ -240,26 +256,43 @@ export default function Dashboard() {
       setCandles(cc.data ?? []);
 
       const ss = await api.get("/signals", { params });
-      setSignals(Array.isArray(ss.data?.signals) ? ss.data.signals : []);
+      // aceita tanto array puro quanto {signals:[]}
+      const sig =
+        Array.isArray(ss.data)
+          ? ss.data
+          : Array.isArray(ss.data?.signals)
+            ? ss.data.signals
+            : Array.isArray(ss.data?.data)
+              ? ss.data.data
+              : [];
+      setSignals(sig);
 
-      const pp = await api.get("/signals/projected", {
-        params: {
-          ...params,
-          horizon,
-          rr,
-          evalWindow,
-          regime: gateRegime ? 1 : 0,
-          tod: gateToD ? 1 : 0,
-          adaptive: 1,
-          cooldown: 1,
-          conformal: calibrate ? 1 : 0,
-          useMicroModel: useMicroModel ? 1 : 0,
-          minEV: Number(minEV) || 0,
-          lossCap: Number(dailyLossCap) || 0,
-          minProb: Number(minProb) || 0,
-        },
+      const pp = await api.post("/signals/projected", {
+        symbol,
+        timeframe,
+        from: dateFrom || undefined,
+        to: dateTo || undefined,
+        horizon,
+        rr,
+        evalWindow,
+        regime: gateRegime ? 1 : 0,
+        tod: gateToD ? 1 : 0,
+        adaptive: 1,
+        cooldown: 1,
+        conformal: calibrate ? 1 : 0,
+        useMicroModel: useMicroModel ? 1 : 0,
+        minEV: Number(minEV) || 0,
+        lossCap: Number(dailyLossCap) || 0,
+        minProb: Number(minProb) || 0,
       });
-      setProjected(pp.data?.projected ?? []);
+      const proj = Array.isArray(pp.data)
+        ? pp.data
+        : Array.isArray(pp.data?.projected)
+          ? pp.data.projected
+          : Array.isArray(pp.data?.data)
+            ? pp.data.data
+            : [];
+      setProjected(proj);
 
       const bt = await api.post("/backtest", {
         symbol,
@@ -405,8 +438,8 @@ export default function Dashboard() {
       typeof t.pnlPoints === "number"
         ? t.pnlPoints
         : typeof t.pnl === "number"
-        ? t.pnl
-        : 0;
+          ? t.pnl
+          : 0;
     const total = tradesArr.length;
     const pnlPoints = tradesArr.reduce((acc, t) => acc + toPts(t), 0);
     const wins = tradesArr.filter((t) => toPts(t) > 0).length;
@@ -423,8 +456,8 @@ export default function Dashboard() {
       grossLoss !== 0
         ? grossProfit / Math.abs(grossLoss)
         : grossProfit > 0
-        ? Infinity
-        : 0;
+          ? Infinity
+          : 0;
 
     return {
       trades: total,
@@ -442,8 +475,8 @@ export default function Dashboard() {
     const tradesArr = allTrades as any[];
     const summary =
       (pnl?.summary &&
-      typeof pnl.summary === "object" &&
-      !Array.isArray(pnl.summary)
+        typeof pnl.summary === "object" &&
+        !Array.isArray(pnl.summary)
         ? pnl.summary
         : computeSummaryFromTrades(tradesArr)) || {};
     const row = {
@@ -522,8 +555,8 @@ export default function Dashboard() {
       typeof t.pnlPoints === "number"
         ? t.pnlPoints
         : typeof t.pnl === "number"
-        ? t.pnl
-        : 0;
+          ? t.pnl
+          : 0;
 
     for (let h = 0; h < 24; h++) {
       buckets[h] = { total: 0, wins: 0, losses: 0, ties: 0, gp: 0, gl: 0 };
@@ -596,6 +629,7 @@ export default function Dashboard() {
               <ImportProgress />
             </Col>
           </Row>
+
           <Navbar.Brand className="fw-bold">DayTrade IA</Navbar.Brand>
           <div className="d-flex align-items-center gap-2 ms-auto">
             <Form.Check
@@ -738,7 +772,7 @@ export default function Dashboard() {
                     type="switch"
                     label="EMA"
                     checked={true}
-                    onChange={() => {}}
+                    onChange={() => { }}
                     disabled
                   />
                   <Form.Check

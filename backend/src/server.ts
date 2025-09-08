@@ -16,6 +16,9 @@ import { router as backtestRouter } from "./services/backtest";
 import { DateTime, Duration } from "luxon";
 import { loadCandlesAnyTF } from "./lib/aggregation";
 
+// >>> NOVO: iniciar AutoTrainer no boot (se configurado)
+import { startAutoTrainer } from "./workers/autoTrainer";
+
 const app = express();
 
 // ====== Timezone/base para normalização de filtros de data ======
@@ -110,9 +113,25 @@ function normalizeDayRange(
   return { fromLocal, toLocal };
 }
 
-// CORS + preflight
-app.use(cors());
-app.options("*", cors());
+// ===== CORS (com credenciais) + preflight =====
+const ORIGINS =
+  process.env.CORS_ORIGIN?.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean) || ["http://localhost:5173"];
+
+app.use(
+  cors({
+    origin: ORIGINS,
+    credentials: true,
+  })
+);
+app.options(
+  "*",
+  cors({
+    origin: ORIGINS,
+    credentials: true,
+  })
+);
 
 app.use(express.json({ limit: "5mb" }));
 
@@ -125,11 +144,11 @@ app.use(express.json({ limit: "5mb" }));
 app.use(backtestRouter);
 
 /* =========================
-   /api/signals/projected (inline já existente)
+   /api/signals/projected (inline)
    ========================= */
 (() => {
   const ZONE = "America/Sao_Paulo";
-  const VERSION = "signals-projected:inline-v3"; // bump
+  const VERSION = "signals-projected:inline-v3";
 
   function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
     const s = String(tfRaw || "")
@@ -273,7 +292,7 @@ app.use(backtestRouter);
 
       const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-      // ====== Range: agora interpreta 1 dia como dia inteiro no fuso de SP ======
+      // ====== Range: interpreta 1 dia como dia inteiro no fuso de SP ======
       let fromD: Date, toD: Date;
       const norm = normalizeDayRange(from, to);
       if (norm) {
@@ -281,27 +300,25 @@ app.use(backtestRouter);
         fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
         toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
       } else {
-        const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 5);
+        const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 1); // <<< alterado: 1 dia
         const now = DateTime.now().setZone(ZONE_BR).toUTC();
         const f = now.minus(Duration.fromObject({ days: fallbackDays }));
         fromD = floorTo(f.toJSDate(), tfMin);
         toD = ceilToExclusive(now.toJSDate(), tfMin);
       }
       if (fromD >= toD) {
-        return res
-          .status(200)
-          .json({
-            ok: false,
-            version: VERSION,
-            error: "'from' deve ser anterior a 'to'",
-          });
+        return res.status(200).json({
+          ok: false,
+          version: VERSION,
+          error: "'from' deve ser anterior a 'to'",
+        });
       }
 
       // Candles
       const candles = await loadCandlesAnyTF(sym, tfU, {
         gte: fromD,
         lte: toD,
-      });
+      } as any);
       if (!candles?.length)
         return res.status(200).json({ ok: true, version: VERSION, data: [] });
 
@@ -345,7 +362,7 @@ app.use(backtestRouter);
         mtfDown: boolean[] | null = null;
       if (requireMtf && confirmTf && confirmTf !== tfU) {
         const { tfU: confU } = normalizeTf(confirmTf);
-        const c2 = await loadCandlesAnyTF(sym, confU, { gte: fromD, lte: toD });
+        const c2 = await loadCandlesAnyTF(sym, confU, { gte: fromD, lte: toD } as any);
         if (c2?.length) {
           const e9b = EMA(
             c2.map((c) => Number(c.close)),
@@ -361,8 +378,8 @@ app.use(backtestRouter);
           for (let i = 0; i < candles.length; i++) {
             const t = times[i].getTime();
             while (j + 1 < c2.length && c2[j + 1].time.getTime() <= t) j++;
-            const u = e9b[j] != null && e21b[j] != null && e9b[j]! > e21b[j]!;
-            const d = e9b[j] != null && e21b[j] != null && e9b[j]! < e21b[j]!;
+            const u = e9b[j] != null && e21b[j] != null && (e9b[j] as number) > (e21b[j] as number);
+            const d = e9b[j] != null && e21b[j] != null && (e9b[j] as number) < (e21b[j] as number);
             mtfUp.push(!!u);
             mtfDown.push(!!d);
           }
@@ -390,13 +407,13 @@ app.use(backtestRouter);
         const atrv = atr[i] ?? 0;
         const vw = vwap[i] ?? c;
         const slope9 =
-          i > 0 && e9[i - 1] != null ? e9v - (e9[i - 1] as number) : 0;
+          i > 0 && e9[i - 1] != null ? (e9v as number) - (e9[i - 1] as number) : 0;
         const slope21 =
-          i > 0 && e21[i - 1] != null ? e21v - (e21[i - 1] as number) : 0;
+          i > 0 && e21[i - 1] != null ? (e21v as number) - (e21[i - 1] as number) : 0;
         const range = highs[i] - lows[i];
         const rangeRatio = atrv > 0 ? range / atrv : 0;
-        const distEma21 = e21v ? c - e21v : 0;
-        const distVwap = c - vw;
+        const distEma21 = e21v ? (c as number) - (e21v as number) : 0;
+        const distVwap = (c as number) - (vw as number);
         return {
           dist_ema21: distEma21,
           dist_vwap: distVwap,
@@ -446,8 +463,8 @@ app.use(backtestRouter);
         if (vwapFilter) {
           const vw = vwap[i];
           if (vw != null) {
-            if (crossUp && closes[i] < vw) continue;
-            if (crossDn && closes[i] > vw) continue;
+            if (crossUp && closes[i] < (vw as number)) continue;
+            if (crossDn && closes[i] > (vw as number)) continue;
           }
         }
         if (requireMtf && mtfUp && mtfDown) {
@@ -487,14 +504,15 @@ app.use(backtestRouter);
               Math.min(
                 0.05,
                 ((entry - (e21v0 as number)) / Math.max(atrv || 1e-6, 1e-6)) *
-                  0.1
+                0.1
               )
             );
           prob = Math.max(0.35, Math.min(0.65, raw));
         }
 
         const costs = Number(costPts) + Number(slippagePts);
-        const evPts = (tpPts || 0) * prob - (slPts || 0) * (1 - prob) - costs;
+        const evPts =
+          (tpPts || 0) * prob - (slPts || 0) * (1 - prob) - costs;
 
         if (prob < Number(minProb)) continue;
         if (evPts < Number(minEV)) continue;
@@ -504,16 +522,22 @@ app.use(backtestRouter);
           suggestedEntry: entry,
           stopSuggestion: sl,
           takeProfitSuggestion: tp,
-          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${
-            vwapFilter ? " + VWAP" : ""
-          }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
+          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""
+            }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
           probHit: Number(prob.toFixed(4)),
           probCalibrated: Number(prob.toFixed(4)),
-          expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
+          expectedValuePoints: Number(
+            (isFinite(evPts) ? evPts : 0).toFixed(2)
+          ),
           time: candles[i].time.toISOString(),
-          date: DateTime.fromJSDate(candles[i].time).setZone(ZONE).toISODate()!,
+          date: DateTime.fromJSDate(candles[i].time)
+            .setZone(ZONE)
+            .toISODate()!,
         });
       }
+
+      // >>> ORDENAR: mais recentes primeiro
+      out.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
 
       return res.status(200).json(out);
     } catch (e: any) {
@@ -521,20 +545,18 @@ app.use(backtestRouter);
         "[/api/signals/projected] erro:",
         e?.stack || e?.message || e
       );
-      return res
-        .status(200)
-        .json({
-          ok: false,
-          version: VERSION,
-          error: "unexpected",
-          diag: String(e?.stack || e?.message || e),
-        });
+      return res.status(200).json({
+        ok: false,
+        version: VERSION,
+        error: "unexpected",
+        diag: String(e?.stack || e?.message || e),
+      });
     }
   });
 })();
 
 /* =========================
-   Fallback /api/candles — agora com normalização de 1 dia
+   Fallback /api/candles — normalização de 1 dia
    ========================= */
 app.get("/api/candles", async (req, res) => {
   try {
@@ -554,17 +576,18 @@ app.get("/api/candles", async (req, res) => {
       f = norm.fromLocal.toUTC().toJSDate();
       t = norm.toLocal.toUTC().toJSDate();
     } else {
-      // range padrão: 5 dias
+      // range padrão: 1 dia
       const now = DateTime.now().setZone(ZONE_BR);
-      f = now.minus({ days: 5 }).startOf("day").toUTC().toJSDate();
+      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate(); // <<< 1 dia
       t = now.endOf("day").toUTC().toJSDate();
     }
 
     const rows = await loadCandlesAnyTF(symbol, timeframe, {
       gte: f,
       lte: t,
+      // @ts-ignore - se sua função não usa `limit`, isso será ignorado
       limit,
-    });
+    } as any);
     const out = (rows || []).map((c) => ({
       time: c.time.toISOString(),
       open: Number(c.open),
@@ -601,19 +624,23 @@ app.get("/api/signals", async (req, res) => {
       f = norm.fromLocal.toUTC().toJSDate();
       t = norm.toLocal.toUTC().toJSDate();
     } else {
+      // range padrão: 1 dia
       const now = DateTime.now().setZone(ZONE_BR);
-      f = now.minus({ days: 5 }).startOf("day").toUTC().toJSDate();
+      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate(); // <<< 1 dia
       t = now.endOf("day").toUTC().toJSDate();
     }
 
     const rows = await loadCandlesAnyTF(symbol, timeframe, {
       gte: f,
       lte: t,
+      // @ts-ignore
       limit,
-    });
+    } as any);
     if (!rows?.length) return res.json([]);
 
-    const closes = rows.map((c) => Number(c.close));
+    const closes = rows.map((c) =>
+      Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0
+    );
     const EMA = (values: number[], period: number): (number | null)[] => {
       const out: (number | null)[] = [];
       const k = 2 / (period + 1);
@@ -657,6 +684,10 @@ app.get("/api/signals", async (req, res) => {
         note: "EMA9xEMA21",
       });
     }
+
+    // >>> ORDENAR: mais recentes primeiro
+    out.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+
     return res.json(out);
   } catch (e: any) {
     console.error("[/api/signals] erro:", e?.message || e);
@@ -687,8 +718,9 @@ app.get("/api/debug/availability", async (_req, res) => {
           const rows = await loadCandlesAnyTF(s, tf, {
             gte: from,
             lte: to,
+            // @ts-ignore
             limit: 5_000,
-          });
+          } as any);
           out.push({
             symbol: s,
             timeframe: tf,
@@ -775,6 +807,22 @@ server.listen(PORT, () => {
     bootPipeline?.();
   } catch (e: any) {
     logger.warn("[pipeline] módulo não iniciado", { err: e?.message || e });
+  }
+
+  // >>> NOVO: tenta iniciar AutoTrainer se `MICRO_MODEL_URL` estiver setada
+  try {
+    if ((process.env.MICRO_MODEL_URL || "").trim()) {
+      const r = startAutoTrainer?.();
+      if ((r as any)?.ok !== false) {
+        logger.info("[AutoTrainer] iniciado automaticamente");
+      } else {
+        logger.warn("[AutoTrainer] não iniciou automaticamente", r);
+      }
+    } else {
+      logger.warn("[AutoTrainer] MICRO_MODEL_URL não configurada — treino contínuo inativo");
+    }
+  } catch (e: any) {
+    logger.warn("[AutoTrainer] falha ao iniciar no boot", { err: e?.message || e });
   }
 });
 
