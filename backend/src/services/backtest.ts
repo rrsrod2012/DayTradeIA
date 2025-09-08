@@ -9,7 +9,7 @@ type TF = "M1" | "M5" | "M15" | "M30" | "H1";
 const TF_MIN: Record<TF, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60 };
 const ZONE = "America/Sao_Paulo";
 
-const VERSION = "backtest:v3.6-date-normalized+warmup";
+const VERSION = "backtest:v3.7-date-normalized+warmup+runs";
 
 /* ===== Helpers de timeframe/bucket ===== */
 function normalizeTf(tfRaw: string): { tfU: TF; tfMin: number } {
@@ -150,6 +150,55 @@ function normalizeDayRange(
   return { fromLocal, toLocal };
 }
 
+/* =========================
+   Registro de execuções (em memória)
+   ========================= */
+type BacktestSnapshot = any; // snapshot completo da resposta do /api/backtest
+type RunIndexItem = {
+  id: string;
+  ts: string; // ISO
+  symbol: string;
+  timeframe: TF;
+  from: string; // ISO
+  to: string; // ISO
+  trades: number;
+  pnlPoints: number;
+  winRate: number;
+};
+const RECENT_MAX = 100;
+const RUNS_INDEX: RunIndexItem[] = [];
+const RUNS_BY_ID: Record<string, BacktestSnapshot> = {};
+
+function makeId() {
+  const ts = Date.now().toString(36);
+  const rnd = Math.random().toString(36).slice(2, 8);
+  return `${ts}${rnd}`;
+}
+function indexRun(snap: BacktestSnapshot) {
+  const id = makeId();
+  const ts = new Date().toISOString();
+  const item: RunIndexItem = {
+    id,
+    ts,
+    symbol: snap?.symbol ?? "",
+    timeframe: snap?.timeframe ?? "M5",
+    from: snap?.from ?? "",
+    to: snap?.to ?? "",
+    trades: snap?.summary?.trades ?? 0,
+    pnlPoints: snap?.pnlPoints ?? 0,
+    winRate: snap?.summary?.winRate ?? 0,
+  };
+  RUNS_BY_ID[id] = { id, ts, ...snap };
+  RUNS_INDEX.push(item);
+  // recorte para não crescer sem limite
+  if (RUNS_INDEX.length > RECENT_MAX) {
+    const overflow = RUNS_INDEX.length - RECENT_MAX;
+    const removed = RUNS_INDEX.splice(0, overflow);
+    for (const r of removed) delete RUNS_BY_ID[r.id];
+  }
+  return id;
+}
+
 /* -------- Utilitário: ecoa o payload do front -------- */
 router.all("/api/debug/echo", express.json(), (req, res) => {
   const method = req.method.toUpperCase();
@@ -176,7 +225,7 @@ router.get("/api/backtest/health", async (req, res) => {
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
     // Datas: dia inteiro em SP → UTC → buckets
-    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1); // <<< 1 dia
+    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1);
     let fromD: Date, toD: Date;
 
     const norm = normalizeDayRange(from, to);
@@ -207,6 +256,41 @@ router.get("/api/backtest/health", async (req, res) => {
   }
 });
 
+/* -------- GET /api/backtest/runs (lista) -------- */
+router.get("/api/backtest/runs", async (req, res) => {
+  try {
+    const limit = Math.max(
+      1,
+      Math.min(500, Number((req.query.limit as string) || 50))
+    );
+    // ordem decrescente por ts (mais recente primeiro)
+    const sorted = RUNS_INDEX.slice().sort(
+      (a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()
+    );
+    return res.status(200).json(
+      ok({
+        total: RUNS_INDEX.length,
+        items: sorted.slice(0, limit),
+      })
+    );
+  } catch (e: any) {
+    return res.status(200).json(bad("list failed", diagify(e)));
+  }
+});
+
+/* -------- GET /api/backtest/run/:id (detalhe) -------- */
+router.get("/api/backtest/run/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(200).json(bad("faltou 'id'"));
+    const snap = RUNS_BY_ID[id];
+    if (!snap) return res.status(200).json(bad("run não encontrada", { id }));
+    return res.status(200).json(ok({ run: snap }));
+  } catch (e: any) {
+    return res.status(200).json(bad("read failed", diagify(e)));
+  }
+});
+
 /* -------- POST/GET /api/backtest -------- */
 router.all("/api/backtest", express.json(), async (req, res) => {
   const method = req.method.toUpperCase();
@@ -233,7 +317,7 @@ router.all("/api/backtest", express.json(), async (req, res) => {
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
     // Datas: dia inteiro em SP → UTC → buckets
-    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1); // <<< 1 dia
+    const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1);
     let fromD: Date, toD: Date;
 
     const norm = normalizeDayRange(from, to);
@@ -255,8 +339,6 @@ router.all("/api/backtest", express.json(), async (req, res) => {
     }
 
     // ===== WARM-UP =====
-    // Carrega um lookback para aquecer as EMAs (21 períodos + margem).
-    // Ex.: para M5 → 21*5 = 105 min. Usaremos 150 min (2.5h) ou 30*tfMin, o que for MAIOR.
     const WARMUP_MULT = 30;
     const warmupMin = Math.max(150, WARMUP_MULT * tfMin);
     const fromWarm = new Date(fromD.getTime() - warmupMin * 60_000);
@@ -277,31 +359,38 @@ router.all("/api/backtest", express.json(), async (req, res) => {
     }
 
     if (!candles?.length) {
-      return res.status(200).json(
-        ok({
-          symbol: sym,
-          timeframe: tfU,
-          candles: 0,
-          trades: [],
-          summary: {
-            trades: 0,
-            wins: 0,
-            losses: 0,
-            ties: 0,
-            winRate: 0,
-            pnlPoints: 0,
-            avgPnL: 0,
-            profitFactor: 0,
-            maxDrawdown: 0,
-          },
+      const empty = ok({
+        symbol: sym,
+        timeframe: tfU,
+        candles: 0,
+        trades: [],
+        summary: {
+          trades: 0,
+          wins: 0,
+          losses: 0,
+          ties: 0,
+          winRate: 0,
           pnlPoints: 0,
-          pnlMoney: 0,
-          lossCapApplied: Number(lossCap) || 0,
-          maxConsecLossesApplied: Number(maxConsecLosses) || 0,
-          info:
-            "sem candles no período informado (verifique ingestão/DB/símbolo/TF)",
-        })
-      );
+          avgPnL: 0,
+          profitFactor: 0,
+          maxDrawdown: 0,
+        },
+        pnlPoints: 0,
+        pnlMoney: 0,
+        lossCapApplied: Number(lossCap) || 0,
+        maxConsecLossesApplied: Number(maxConsecLosses) || 0,
+        info:
+          "sem candles no período informado (verifique ingestão/DB/símbolo/TF)",
+      });
+      // indexa como execução também (útil para auditoria)
+      const id = indexRun({
+        ...empty,
+        symbol: sym,
+        timeframe: tfU,
+        from: fromD.toISOString(),
+        to: toD.toISOString(),
+      });
+      return res.status(200).json({ ...empty, id });
     }
 
     // ===== Indicadores =====
@@ -478,31 +567,34 @@ router.all("/api/backtest", express.json(), async (req, res) => {
     const maxDrawdown = Number(dd.toFixed(2));
     const pnlMoney = Number((pnlPoints * Number(pointValue)).toFixed(2));
 
-    return res.status(200).json(
-      ok({
-        symbol: sym,
-        timeframe: tfU,
-        from: fromD.toISOString(),
-        to: toD.toISOString(),
-        candles: candles.filter((c) => c.time >= fromD && c.time <= toD).length,
-        trades: filtered,
-        summary: {
-          trades: filtered.length,
-          wins,
-          losses,
-          ties,
-          winRate: filtered.length ? Number((wins / filtered.length).toFixed(4)) : 0,
-          pnlPoints,
-          avgPnL,
-          profitFactor,
-          maxDrawdown,
-        },
+    const payload = ok({
+      symbol: sym,
+      timeframe: tfU,
+      from: fromD.toISOString(),
+      to: toD.toISOString(),
+      candles: candles.filter((c) => c.time >= fromD && c.time <= toD).length,
+      trades: filtered,
+      summary: {
+        trades: filtered.length,
+        wins,
+        losses,
+        ties,
+        winRate: filtered.length ? Number((wins / filtered.length).toFixed(4)) : 0,
         pnlPoints,
-        pnlMoney,
-        lossCapApplied: Number(lossCap) || 0,
-        maxConsecLossesApplied: Number(maxConsecLosses) || 0,
-      })
-    );
+        avgPnL,
+        profitFactor,
+        maxDrawdown,
+      },
+      pnlPoints,
+      pnlMoney,
+      lossCapApplied: Number(lossCap) || 0,
+      maxConsecLossesApplied: Number(maxConsecLosses) || 0,
+    });
+
+    // Indexa esta execução e retorna o id
+    const id = indexRun(payload);
+
+    return res.status(200).json({ ...payload, id });
   } catch (e: any) {
     return res.status(200).json(bad("unexpected", diagify(e)));
   }

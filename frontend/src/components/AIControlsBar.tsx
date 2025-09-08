@@ -5,6 +5,7 @@ import {
   runBacktest,
 } from "../services/api";
 import { useAIStore } from "../store/ai";
+import BacktestRunsPanel from "./BacktestRunsPanel";
 
 // helpers de data (YYYY-MM-DD no fuso local)
 function fmtDate(d: Date) {
@@ -46,6 +47,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   // ---------- Estado ----------
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
+
+  // ---------- Painel Backtests ----------
+  const [showBacktests, setShowBacktests] = React.useState(false);
 
   const setProjected = useAIStore((s) => s.setProjected);
   const setConfirmed = useAIStore((s) => s.setConfirmed);
@@ -176,209 +180,224 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   }, [symbol, timeframe, from, to, rr, minProb, minEV, useMicroModel, vwapFilter, requireMtf, confirmTf]);
 
   return (
-    <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>
-      <div className="bg-body-tertiary border-bottom">
-        <div className="container py-2">
-          <div className="d-flex align-items-center gap-2">
-            <button
-              className="btn btn-sm btn-outline-secondary"
-              onClick={() => setCollapsed((c) => !c)}
-              title={collapsed ? "Expandir" : "Recolher"}
-            >
-              {collapsed ? "▸" : "▾"}
-            </button>
-            <strong>IA</strong>
-            <div className="vr mx-2" />
-
-            <div className="d-flex flex-wrap align-items-end gap-2">
-              {/* filtros principais */}
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 140 }}
-              >
-                <span className="input-group-text">Símbolo</span>
-                <input
-                  className="form-control"
-                  value={symbol}
-                  onChange={(e) => setSymbol(e.target.value)}
-                />
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 120 }}
-              >
-                <span className="input-group-text">TF</span>
-                <input
-                  className="form-control"
-                  value={timeframe}
-                  onChange={(e) => setTimeframe(e.target.value)}
-                />
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 210 }}
-              >
-                <span className="input-group-text">De</span>
-                <input
-                  type="date"
-                  className="form-control"
-                  value={from}
-                  onChange={(e) => setFrom(e.target.value)}
-                />
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 210 }}
-              >
-                <span className="input-group-text">Até</span>
-                <input
-                  type="date"
-                  className="form-control"
-                  value={to}
-                  onChange={(e) => setTo(e.target.value)}
-                />
-              </div>
-
-              {/* parâmetros — afetam apenas os Projetados */}
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 110 }}
-              >
-                <span className="input-group-text">RR</span>
-                <input
-                  type="number"
-                  step="0.1"
-                  className="form-control"
-                  value={rr}
-                  onChange={(e) => setRr(Number(e.target.value))}
-                />
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 150 }}
-              >
-                <span className="input-group-text">minProb</span>
-                <input
-                  type="number"
-                  step="0.01"
-                  min={0}
-                  max={1}
-                  className="form-control"
-                  value={minProb}
-                  onChange={(e) => setMinProb(Number(e.target.value))}
-                />
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 140 }}
-              >
-                <span className="input-group-text">minEV</span>
-                <input
-                  type="number"
-                  step="0.1"
-                  className="form-control"
-                  value={minEV}
-                  onChange={(e) => setMinEV(Number(e.target.value))}
-                />
-              </div>
-              <div className="form-check form-switch">
-                <input
-                  className="form-check-input"
-                  type="checkbox"
-                  id="ai-toggle"
-                  checked={useMicroModel}
-                  onChange={(e) => setUseMicroModel(e.target.checked)}
-                />
-                <label className="form-check-label" htmlFor="ai-toggle">
-                  Usar IA
-                </label>
-              </div>
-              <div className="form-check form-switch">
-                <input
-                  className="form-check-input"
-                  type="checkbox"
-                  id="vwap-toggle"
-                  checked={vwapFilter}
-                  onChange={(e) => setVwapFilter(e.target.checked)}
-                />
-                <label className="form-check-label" htmlFor="vwap-toggle">
-                  VWAP
-                </label>
-              </div>
-              <div className="form-check form-switch">
-                <input
-                  className="form-check-input"
-                  type="checkbox"
-                  id="mtf-toggle"
-                  checked={requireMtf}
-                  onChange={(e) => setRequireMtf(e.target.checked)}
-                />
-                <label className="form-check-label" htmlFor="mtf-toggle">
-                  MTF
-                </label>
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 150 }}
-              >
-                <span className="input-group-text">TF Conf.</span>
-                <input
-                  className="form-control"
-                  value={confirmTf}
-                  onChange={(e) => setConfirmTf(e.target.value)}
-                />
-              </div>
-
-              <div className="vr mx-1" />
-
-              {/* Auto refresh */}
-              <div className="form-check form-switch">
-                <input
-                  className="form-check-input"
-                  type="checkbox"
-                  id="auto-toggle"
-                  checked={autoRefresh}
-                  onChange={(e) => setAutoRefresh(e.target.checked)}
-                />
-                <label className="form-check-label" htmlFor="auto-toggle">
-                  Atualizar auto
-                </label>
-              </div>
-              <div
-                className="input-group input-group-sm"
-                style={{ width: 130 }}
-              >
-                <span className="input-group-text">a cada</span>
-                <input
-                  type="number"
-                  min={5}
-                  step={5}
-                  className="form-control"
-                  value={refreshSec}
-                  onChange={(e) =>
-                    setRefreshSec(Math.max(5, Number(e.target.value)))
-                  }
-                />
-                <span className="input-group-text">s</span>
-              </div>
-
+    <>
+      <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>
+        <div className="bg-body-tertiary border-bottom">
+          <div className="container py-2">
+            <div className="d-flex align-items-center gap-2">
               <button
-                className="btn btn-sm btn-primary ms-2"
-                onClick={onBuscarAgora}
-                disabled={loading}
+                className="btn btn-sm btn-outline-secondary"
+                onClick={() => setCollapsed((c) => !c)}
+                title={collapsed ? "Expandir" : "Recolher"}
               >
-                {loading ? "Atualizando..." : "Buscar agora"}
+                {collapsed ? "▸" : "▾"}
+              </button>
+              <strong>IA</strong>
+
+              {/* Botão painel Backtests */}
+              <button
+                className="btn btn-sm btn-outline-primary ms-2"
+                onClick={() => setShowBacktests((v) => !v)}
+                title="Mostrar/ocultar backtests recentes"
+              >
+                {showBacktests ? "Ocultar Backtests" : "Backtests"}
               </button>
 
-              {err && (
-                <span className="text-danger small ms-2">
-                  <strong>Erro:</strong> {err}
-                </span>
-              )}
+              <div className="vr mx-2" />
+
+              <div className="d-flex flex-wrap align-items-end gap-2">
+                {/* filtros principais */}
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 140 }}
+                >
+                  <span className="input-group-text">Símbolo</span>
+                  <input
+                    className="form-control"
+                    value={symbol}
+                    onChange={(e) => setSymbol(e.target.value)}
+                  />
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 120 }}
+                >
+                  <span className="input-group-text">TF</span>
+                  <input
+                    className="form-control"
+                    value={timeframe}
+                    onChange={(e) => setTimeframe(e.target.value)}
+                  />
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 210 }}
+                >
+                  <span className="input-group-text">De</span>
+                  <input
+                    type="date"
+                    className="form-control"
+                    value={from}
+                    onChange={(e) => setFrom(e.target.value)}
+                  />
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 210 }}
+                >
+                  <span className="input-group-text">Até</span>
+                  <input
+                    type="date"
+                    className="form-control"
+                    value={to}
+                    onChange={(e) => setTo(e.target.value)}
+                  />
+                </div>
+
+                {/* parâmetros — afetam apenas os Projetados */}
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 110 }}
+                >
+                  <span className="input-group-text">RR</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="form-control"
+                    value={rr}
+                    onChange={(e) => setRr(Number(e.target.value))}
+                  />
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 150 }}
+                >
+                  <span className="input-group-text">minProb</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={1}
+                    className="form-control"
+                    value={minProb}
+                    onChange={(e) => setMinProb(Number(e.target.value))}
+                  />
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 140 }}
+                >
+                  <span className="input-group-text">minEV</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="form-control"
+                    value={minEV}
+                    onChange={(e) => setMinEV(Number(e.target.value))}
+                  />
+                </div>
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="ai-toggle"
+                    checked={useMicroModel}
+                    onChange={(e) => setUseMicroModel(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="ai-toggle">
+                    Usar IA
+                  </label>
+                </div>
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="vwap-toggle"
+                    checked={vwapFilter}
+                    onChange={(e) => setVwapFilter(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="vwap-toggle">
+                    VWAP
+                  </label>
+                </div>
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="mtf-toggle"
+                    checked={requireMtf}
+                    onChange={(e) => setRequireMtf(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="mtf-toggle">
+                    MTF
+                  </label>
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 150 }}
+                >
+                  <span className="input-group-text">TF Conf.</span>
+                  <input
+                    className="form-control"
+                    value={confirmTf}
+                    onChange={(e) => setConfirmTf(e.target.value)}
+                  />
+                </div>
+
+                <div className="vr mx-1" />
+
+                {/* Auto refresh */}
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="auto-toggle"
+                    checked={autoRefresh}
+                    onChange={(e) => setAutoRefresh(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="auto-toggle">
+                    Atualizar auto
+                  </label>
+                </div>
+                <div
+                  className="input-group input-group-sm"
+                  style={{ width: 130 }}
+                >
+                  <span className="input-group-text">a cada</span>
+                  <input
+                    type="number"
+                    min={5}
+                    step={5}
+                    className="form-control"
+                    value={refreshSec}
+                    onChange={(e) =>
+                      setRefreshSec(Math.max(5, Number(e.target.value)))
+                    }
+                  />
+                  <span className="input-group-text">s</span>
+                </div>
+
+                <button
+                  className="btn btn-sm btn-primary ms-2"
+                  onClick={onBuscarAgora}
+                  disabled={loading}
+                >
+                  {loading ? "Atualizando..." : "Buscar agora"}
+                </button>
+
+                {err && (
+                  <span className="text-danger small ms-2">
+                    <strong>Erro:</strong> {err}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {/* Painel Backtests (fora do header sticky) */}
+      {showBacktests && <BacktestRunsPanel />}
+    </>
   );
 }
