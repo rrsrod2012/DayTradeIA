@@ -1,258 +1,255 @@
 /* eslint-disable no-console */
-import { PrismaClient } from "@prisma/client";
-import { DateTime } from "luxon";
-import { EMA, ATR, ADX } from "../services/indicators";
+import { prisma } from "../prisma";
+import logger from "../logger";
 
-const prisma = new PrismaClient();
-
-type Side = "BUY" | "SELL";
-
-const ZONE = "America/Sao_Paulo";
-const MICRO = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
-
-// ======= CONFIG =======
-const POLL_MS = Number(process.env.AUTO_TRAINER_POLL_MS || 60_000); // 1min
-const BATCH_LIMIT_SIGNALS = Number(process.env.AUTO_TRAINER_BATCH || 300);
-const LOOKBACK_CANDLES = Number(process.env.AUTO_TRAINER_LOOKBACK || 120); // p/ indicadores
-const HORIZON = Number(process.env.AUTO_TRAINER_HORIZON || 12); // janelas à frente p/ label
-const SL_ATR = Number(process.env.AUTO_TRAINER_SL_ATR || 1.0);
-const RR = Number(process.env.AUTO_TRAINER_RR || 2.0); // tp = RR * ATR
-const EPOCHS = Number(process.env.AUTO_TRAINER_EPOCHS || 1);
+type TrainExample = {
+  features: Record<string, number>;
+  label: 0 | 1; // 1 = TP antes do SL dentro do horizonte; 0 = caso contrário
+  meta?: Record<string, any>;
+};
 
 let _timer: NodeJS.Timeout | null = null;
 let _running = false;
-const _trained = new Set<number>(); // evita duplicar no ciclo do processo
+let _lastError: string | null = null;
+let _lastRunAt: Date | null = null;
+let _trainedSignals = new Set<number>(); // IDs de sinais já usados neste processo (memória)
+let _stats = {
+  sent: 0,
+  batches: 0,
+};
 
-// ======= UTILS =======
-const clamp = (n: number, lo: number, hi: number) =>
-  Math.max(lo, Math.min(hi, n));
-const okURL = () => MICRO.length > 0;
+function ms(n: number, def: number) {
+  const v = Number(n);
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
 
-async function postJSON(url: string, body: any) {
-  // @ts-ignore - fetch global no Node 18+
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const txt = await r.text();
+function okURL() {
+  const u = (process.env.MICRO_MODEL_URL || "").trim();
+  return !!u;
+}
+
+async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 4000): Promise<T> {
+  let f: typeof fetch = (global as any).fetch;
+  if (!f) {
+    const mod = await import("node-fetch");
+    // @ts-ignore
+    f = mod.default as any;
+  }
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return {
-      ok: r.ok,
-      json: txt ? JSON.parse(txt) : null,
-      status: r.status,
-      txt,
-    };
-  } catch {
-    return { ok: r.ok, json: null, status: r.status, txt };
+    const resp = await f(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      // @ts-ignore
+      signal: ctrl.signal,
+    } as any);
+    const txt = await resp.text();
+    const data = txt ? JSON.parse(txt) : null;
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText} — ${txt?.slice?.(0, 200) || ""}`);
+    }
+    return data as T;
+  } finally {
+    clearTimeout(to);
   }
 }
 
-function toLocalHourFrac(d: Date) {
-  const dt = DateTime.fromJSDate(d).setZone(ZONE);
-  return dt.hour + dt.minute / 60;
+/** ----- Indicadores utilitários ----- */
+function ema(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = [];
+  const k = 2 / (period + 1);
+  let e: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    e = e == null ? v : v * k + (e as number) * (1 - k);
+    out.push(e);
+  }
+  return out;
+}
+function atrFromCandles(candles: { high: number; low: number; close: number }[], period = 14): number | null {
+  if (!candles?.length) return null;
+  const tr: number[] = [];
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const prevClose = i > 0 ? candles[i - 1].close : c.close;
+    tr.push(
+      Math.max(
+        c.high - c.low,
+        Math.abs(c.high - prevClose),
+        Math.abs(c.low - prevClose)
+      )
+    );
+  }
+  const a = ema(tr, period);
+  const last = a[a.length - 1];
+  return typeof last === "number" && isFinite(last) ? last : null;
 }
 
-function buildFeaturesAt(
-  i: number,
-  candles: {
-    time: Date;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number | null;
-  }[],
-  e9: (number | null)[],
-  e21: (number | null)[],
-  atr: (number | null)[],
-  adx: (number | null)[]
-) {
-  const c = candles[i];
-  const prev = candles[i - 1] ?? c;
-  const _atr = (atr[i] ?? atr[i - 1] ?? 1) as number;
-  const _e9 = (e9[i] ?? e9[i - 1] ?? c.close) as number;
-  const _e21 = (e21[i] ?? e21[i - 1] ?? c.close) as number;
-
-  const slope9 = _e9 - ((e9[i - 1] ?? _e9) as number);
-  const slope21 = _e21 - ((e21[i - 1] ?? _e21) as number);
-  const ret1 = (c.close - prev.close) / Math.max(1e-6, _atr);
-
-  const hourLocal = toLocalHourFrac(c.time);
-  const angle = (hourLocal / 24) * 2 * Math.PI;
-  const adxNorm = ((adx[i] ?? adx[i - 1] ?? 0) as number) / 100;
+/**
+ * Features simples de candle base (pode enriquecer depois).
+ */
+function buildFeatures(candle: {
+  open: number; high: number; low: number; close: number; volume: number;
+  atr?: number | null;
+}) {
+  const range = candle.high - candle.low;
+  const body = Math.abs(candle.close - candle.open);
+  const dir = candle.close >= candle.open ? 1 : -1;
+  const vol = candle.volume ?? 1;
+  const atr = candle.atr ?? 0;
 
   return {
-    dist_ema21: (c.close - _e21) / Math.max(1e-6, _atr),
-    slope_e9: slope9 / Math.max(1e-6, _atr),
-    slope_e21: slope21 / Math.max(1e-6, _atr),
-    range_ratio: (c.high - c.low) / Math.max(1e-6, _atr),
-    ret1,
-    hour: Math.floor(hourLocal),
-    hour_sin: Math.sin(angle),
-    hour_cos: Math.cos(angle),
-    adx14: adxNorm,
+    range,
+    body,
+    wick_top: candle.high - Math.max(candle.open, candle.close),
+    wick_bottom: Math.min(candle.open, candle.close) - candle.low,
+    body_ratio: range > 0 ? body / range : 0,
+    direction: dir,
+    vol,
+    atr,
+    range_atr_ratio: atr > 0 ? range / atr : 0,
+    body_atr_ratio: atr > 0 ? body / atr : 0,
   };
 }
 
-function labelFromFuturePath(
-  side: Side,
-  entry: number,
-  atr: number,
-  future: { high: number; low: number }[]
-): 0 | 1 {
-  const sl = side === "BUY" ? entry - SL_ATR * atr : entry + SL_ATR * atr;
-  const tp = side === "BUY" ? entry + RR * atr : entry - RR * atr;
+/**
+ * Label por PnL: TP vs SL dentro do horizonte.
+ * - Entrada: abertura da próxima barra
+ * - SL = k_sl * ATR(14) nos candles anteriores
+ * - TP = RR * SL
+ * - Horizonte: AUTO_TRAINER_HORIZON (em número de barras)
+ */
+async function labelFromSignalPnL(sig: {
+  id: number;
+  side: "BUY" | "SELL";
+  candle: {
+    id: number;
+    time: Date;
+    instrumentId: number;
+    timeframe: number;
+    open: number; high: number; low: number; close: number; volume: number;
+  };
+}): Promise<{ label: 0 | 1; entry: number; sl: number | null; tp: number | null; atr: number | null }> {
+  const H = Math.max(1, Number(process.env.AUTO_TRAINER_HORIZON) || 12);
+  const K_SL = Number(process.env.AUTO_TRAINER_SL_ATR) || 1.0;
+  const RR = Number(process.env.AUTO_TRAINER_RR) || 2.0;
 
-  for (const f of future) {
-    if (side === "BUY") {
-      if (f.low <= sl) return 0;
-      if (f.high >= tp) return 1;
-    } else {
-      if (f.high >= sl) return 0;
-      if (f.low <= tp) return 1;
-    }
-  }
-  // Se nenhum toque, desempata por quem ficou mais perto
-  const last = future[future.length - 1];
-  if (!last) return 0;
-  const distTp = Math.abs(side === "BUY" ? tp - last.high : last.low - tp);
-  const distSl = Math.abs(side === "BUY" ? last.low - sl : sl - last.high);
-  return distTp < distSl ? 1 : 0;
-}
+  const instrId = sig.candle.instrumentId;
+  const tf = sig.candle.timeframe;
+  const t0 = sig.candle.time;
 
-// Busca uma janela de candles ao redor do tempo do candle base (do sinal)
-async function getWindowAround(
-  instrumentId: number,
-  timeframe: any,
-  t: Date,
-  lookback: number,
-  forward: number
-) {
-  // pega uma janela grande e depois recorta
-  const rows = await prisma.candle.findMany({
+  // Carrega candles anteriores (para ATR) e próximos (para horizonte)
+  const ATR_PERIOD = 14;
+
+  // anteriores (pega um pouco mais do que precisa)
+  const prev = await prisma.candle.findMany({
     where: {
-      instrumentId,
-      // timeframe tolerante: aceita string/nulo se o schema permitir
-      // no SQLite sem constraint, comparar string/null é ok; se seu schema for enum e der erro,
-      // remova 'timeframe' abaixo:
-      ...(typeof timeframe === "string" || timeframe === null
-        ? { timeframe: timeframe as any }
-        : {}),
-      time: { lte: t },
+      instrumentId: instrId,
+      timeframe: tf,
+      time: { lte: t0 },
     },
     orderBy: { time: "desc" },
-    take: lookback + 5, // pega no passado
-    select: {
-      id: true,
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-    },
+    take: ATR_PERIOD + 2,
+    select: { open: true, high: true, low: true, close: true, time: true },
   });
+  const prevAsc = prev.slice().reverse(); // em ordem cronológica
 
-  const past = rows.reverse();
-  const fut = await prisma.candle.findMany({
+  const atr = atrFromCandles(prevAsc.map(c => ({
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+  })), ATR_PERIOD);
+
+  // próxima barra (entrada)
+  const next1 = await prisma.candle.findMany({
     where: {
-      instrumentId,
-      ...(typeof timeframe === "string" || timeframe === null
-        ? { timeframe: timeframe as any }
-        : {}),
-      time: { gt: t },
+      instrumentId: instrId,
+      timeframe: tf,
+      time: { gt: t0 },
     },
     orderBy: { time: "asc" },
-    take: forward,
-    select: {
-      id: true,
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-    },
+    take: Math.max(1, H),
+    select: { time: true, open: true, high: true, low: true, close: true },
   });
 
-  const all = past.concat(fut);
-  // índice do candle exatamente igual ao tempo t
-  const idx = past.length - 1; // o último do "past" deve ser t
-  return { candles: all, idx };
-}
+  if (!next1?.length) {
+    // Sem futuras barras → não dá para avaliar PnL, marque como 0 conservadoramente
+    return { label: 0, entry: Number(sig.candle.close), sl: null, tp: null, atr };
+  }
 
-async function buildRowsForSignals(
-  signals: {
-    id: number;
-    side: Side;
-    candle: {
-      id: number;
-      time: Date;
-      instrumentId: number;
-      timeframe: any;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-      volume: number | null;
-    };
-  }[]
-) {
-  const rows: { features: Record<string, number>; label: 0 | 1 }[] = [];
+  const entry = Number(
+    Number.isFinite(next1[0].open) ? next1[0].open : next1[0].close
+  );
 
-  for (const s of signals) {
-    try {
-      const { candles, idx } = await getWindowAround(
-        s.candle.instrumentId,
-        s.candle.timeframe,
-        s.candle.time,
-        LOOKBACK_CANDLES,
-        HORIZON
-      );
-      if (!candles.length || idx < 5 || idx >= candles.length) continue;
+  // Se não conseguimos ATR, faça um fallback simples (range da barra do sinal)
+  const fallbackATR = Math.max(1e-6, Math.abs(Number(sig.candle.high) - Number(sig.candle.low)));
+  const atrUse = (atr != null && isFinite(atr) && atr > 0) ? atr : fallbackATR;
 
-      const highs = candles.map((c) => c.high);
-      const lows = candles.map((c) => c.low);
-      const closes = candles.map((c) => c.close);
+  const slPts = Math.max(atrUse * K_SL, 0);
+  const tpPts = Math.max(slPts * RR, 0);
 
-      const e9 = EMA(closes, 9);
-      const e21 = EMA(closes, 21);
-      const atr = ATR(highs, lows, closes, 14);
-      const adx = ADX(highs, lows, closes, 14);
+  const isBuy = sig.side === "BUY";
+  const sl = slPts > 0 ? (isBuy ? entry - slPts : entry + slPts) : null;
+  const tp = tpPts > 0 ? (isBuy ? entry + tpPts : entry - tpPts) : null;
 
-      if (e21[idx] == null || atr[idx] == null) continue;
+  // Varre até H barras e vê quem toca primeiro
+  // Empate na mesma barra: prioriza TP
+  let hitLabel: 0 | 1 = 0;
+  const N = Math.min(H, next1.length);
+  for (let i = 0; i < N; i++) {
+    const c = next1[i];
+    const hi = Number(c.high);
+    const lo = Number(c.low);
 
-      const entry = candles[idx].close;
-      const feats = buildFeaturesAt(idx, candles as any, e9, e21, atr, adx);
-      const future = candles
-        .slice(idx + 1, idx + 1 + HORIZON)
-        .map((c) => ({ high: c.high, low: c.low }));
-      const label = labelFromFuturePath(
-        s.side,
-        entry,
-        atr[idx] as number,
-        future
-      );
+    if (tp != null && sl != null) {
+      const tpHit = isBuy ? (hi >= tp) : (lo <= tp);
+      const slHit = isBuy ? (lo <= sl) : (hi >= sl);
 
-      rows.push({ features: feats, label });
-      _trained.add(s.id);
-    } catch (e) {
-      // segue para o próximo
-      continue;
+      if (tpHit && slHit) {
+        // mesma barra: prioriza TP
+        hitLabel = 1;
+        break;
+      } else if (tpHit) {
+        hitLabel = 1;
+        break;
+      } else if (slHit) {
+        hitLabel = 0;
+        break;
+      }
+    } else if (tp != null) {
+      const tpHit = isBuy ? (hi >= tp) : (lo <= tp);
+      if (tpHit) {
+        hitLabel = 1;
+        break;
+      }
+    } else if (sl != null) {
+      const slHit = isBuy ? (lo <= sl) : (hi >= sl);
+      if (slHit) {
+        hitLabel = 0;
+        break;
+      }
     }
   }
-  return rows;
+
+  return { label: hitLabel, entry, sl, tp, atr };
 }
 
-async function onePass() {
-  if (!okURL()) return { ok: false, reason: "MICRO_MODEL_URL não configurada" };
+/** Coleta exemplos a partir dos sinais confirmados mais recentes (evita repetir no mesmo processo). */
+async function collectExamples(limit: number): Promise<TrainExample[]> {
+  const notInIds = Array.from(_trainedSignals.values());
+  const baseWhere: any = {
+    candleId: { not: null }, // evita `not: Int` inválido
+  };
+  if (notInIds.length > 0) {
+    baseWhere.id = { notIn: notInIds };
+  }
 
-  // pega últimos N sinais confirmados (com candle vinculado) que ainda não treinamos neste processo
   const signals = await prisma.signal.findMany({
-    where: { candleId: { not: null } },
+    where: baseWhere,
     orderBy: { id: "desc" },
-    take: BATCH_LIMIT_SIGNALS,
+    take: limit,
     select: {
       id: true,
       side: true,
@@ -272,60 +269,137 @@ async function onePass() {
     },
   });
 
-  const fresh = signals.filter((s) => !_trained.has(s.id));
-  if (!fresh.length) return { ok: true, trained: 0, skipped: signals.length };
+  if (!signals?.length) return [];
 
-  const rows = await buildRowsForSignals(fresh as any);
-  if (!rows.length) return { ok: true, trained: 0, skipped: fresh.length };
+  const out: TrainExample[] = [];
+  for (const s of signals) {
+    if (!s.candle) continue;
 
-  const payload = { rows, epochs: EPOCHS };
-  const r = await postJSON(`${MICRO}/train`, payload);
-  if (!r.ok || !r.json?.ok) {
-    return {
-      ok: false,
-      error: r.json?.error || `HTTP ${r.status}`,
-      trained: 0,
-    };
+    // constrói label por PnL (TP/SL dentro do horizonte)
+    const pnl = await labelFromSignalPnL({
+      id: s.id,
+      side: s.side as any,
+      candle: {
+        id: s.candle.id,
+        time: s.candle.time as any,
+        instrumentId: s.candle.instrumentId as any,
+        timeframe: s.candle.timeframe as any,
+        open: Number(s.candle.open),
+        high: Number(s.candle.high),
+        low: Number(s.candle.low),
+        close: Number(s.candle.close),
+        volume: Number(s.candle.volume ?? 0),
+      },
+    });
+
+    const feats = buildFeatures({
+      open: Number(s.candle.open),
+      high: Number(s.candle.high),
+      low: Number(s.candle.low),
+      close: Number(s.candle.close),
+      volume: Number(s.candle.volume ?? 0),
+      atr: pnl.atr,
+    });
+
+    out.push({
+      features: feats,
+      label: pnl.label,
+      meta: {
+        signalId: s.id,
+        candleId: s.candle.id,
+        timeframe: s.candle.timeframe,
+        t: (s.candle.time as any as Date).toISOString(),
+      },
+    });
   }
-  return { ok: true, trained: rows.length };
+  return out;
 }
 
-// ======= PUBLIC API =======
-export function startAutoTrainer() {
-  if (_running) return { ok: true, already: true };
-  if (!okURL()) return { ok: false, error: "MICRO_MODEL_URL não configurada" };
-  _running = true;
-  const tick = async () => {
-    try {
-      const r = await onePass();
-      if (!r.ok) console.warn("[AutoTrainer] erro:", r);
-      else console.log("[AutoTrainer] ciclo:", r);
-    } catch (e: any) {
-      console.warn("[AutoTrainer] exceção:", e?.message || String(e));
-    } finally {
-      if (_running) _timer = setTimeout(tick, POLL_MS);
+async function onePass() {
+  _lastRunAt = new Date();
+  _lastError = null;
+
+  if (!okURL()) {
+    return { ok: false, reason: "MICRO_MODEL_URL não configurada" };
+  }
+
+  const POLL_MS = ms(Number(process.env.AUTO_TRAINER_POLL_MS), 60_000);
+  const BATCH = Math.max(1, Number(process.env.AUTO_TRAINER_BATCH) || 300);
+  const EPOCHS = Math.max(1, Number(process.env.AUTO_TRAINER_EPOCHS) || 1);
+
+  try {
+    const examples = await collectExamples(BATCH);
+    if (!examples.length) {
+      logger.info("[AutoTrainer] sem exemplos novos (aguardando próximos sinais)");
+      return { ok: true, sent: 0, waitedMs: POLL_MS };
     }
-  };
-  _timer = setTimeout(tick, 1000); // primeiro ciclo em 1s
-  return { ok: true, started: true, pollMs: POLL_MS };
-}
 
-export function stopAutoTrainer() {
-  _running = false;
-  if (_timer) {
-    clearTimeout(_timer);
-    _timer = null;
+    const url = `${(process.env.MICRO_MODEL_URL || "").trim()}/train`;
+    const payload = {
+      epochs: EPOCHS,
+      batchSize: Math.max(16, Math.min(1024, examples.length)),
+      data: examples,
+    };
+    const resp = await httpPostJSON<{ ok?: boolean; trained?: number; msg?: string }>(url, payload, 15_000);
+
+    for (const ex of examples) {
+      const sid = Number(ex.meta?.signalId);
+      if (Number.isFinite(sid)) _trainedSignals.add(sid);
+    }
+    _stats.sent += examples.length;
+    _stats.batches += 1;
+
+    logger.info("[AutoTrainer] train OK", {
+      examples: examples.length,
+      resp,
+    });
+    return { ok: true, sent: examples.length, resp };
+  } catch (e: any) {
+    _lastError = e?.message || String(e);
+    logger.warn("[AutoTrainer] exceção:", e?.stack || e?.message || e);
+    return { ok: false, error: _lastError };
   }
-  return { ok: true, stopped: true, trainedIdsCached: _trained.size };
 }
 
-export function statusAutoTrainer() {
+export async function startAutoTrainer() {
+  if (_running) {
+    return { ok: true, running: true, note: "already running" };
+  }
+  if (!okURL()) {
+    _running = false;
+    return { ok: false, running: false, reason: "MICRO_MODEL_URL não configurada" };
+  }
+
+  const POLL_MS = ms(Number(process.env.AUTO_TRAINER_POLL_MS), 60_000);
+
+  // primeira rodada imediata (não bloqueante)
+  void onePass();
+
+  _timer = setInterval(() => {
+    void onePass();
+  }, POLL_MS);
+  _running = true;
+  _lastError = null;
+  logger.info("[AutoTrainer] loop iniciado", { pollMs: POLL_MS });
+  return { ok: true, running: true };
+}
+
+export async function stopAutoTrainer() {
+  if (_timer) clearInterval(_timer);
+  _timer = null;
+  _running = false;
+  logger.info("[AutoTrainer] parado");
+  return { ok: true, running: false };
+}
+
+export async function statusAutoTrainer() {
   return {
     ok: true,
     running: _running,
-    pollMs: POLL_MS,
-    cached: _trained.size,
+    lastRunAt: _lastRunAt ? _lastRunAt.toISOString() : null,
+    lastError: _lastError,
+    stats: _stats,
+    trackedSignals: _trainedSignals.size,
+    microModelUrl: (process.env.MICRO_MODEL_URL || "").trim() || null,
   };
 }
-
-export default { startAutoTrainer, stopAutoTrainer, statusAutoTrainer };

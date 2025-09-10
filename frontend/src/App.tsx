@@ -5,10 +5,14 @@ import AIConfirmedPanel from "./components/AIConfirmedPanel";
 import AIPnLPanel from "./components/AIPnLPanel";
 import AIChartWithMarkers from "./components/AIChartWithMarkers";
 import ImportProgress from "./components/ImportProgress";
+import { AIControlsProvider } from "./components/AIControlsContext";
+
+// NOVO: tabela de trades (usa /api/trades)
+import AITradesPanel from "./components/AITradesPanel";
 
 export default function App() {
   return (
-    <>
+    <AIControlsProvider>
       {/* Progresso de importação de CSV */}
       <ImportProgress />
 
@@ -24,6 +28,10 @@ export default function App() {
 
       {/* Resumo de PnL (backtest) */}
       <AIPnLPanel />
-    </>
+
+      {/* Trades (respeita símbolo/TF e intervalo do filtro) */}
+      <AITradesPanel />
+
+    </AIControlsProvider>
   );
 }

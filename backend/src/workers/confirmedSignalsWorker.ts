@@ -28,20 +28,25 @@ function floorToBucket(d: Date, tfMin: number): Date {
   return new Date(Date.UTC(y, m, day, H, bucketMin, 0, 0));
 }
 
+/** Monta candidatos aceitos para o campo timeframe no banco, sem null */
+function tfCandidates(tf: keyof typeof TF_MINUTES): string[] {
+  const s = String(tf).toUpperCase();
+  const n = String(TF_MINUTES[tf]); // "5", "1", etc
+  const out = Array.from(new Set([s, n])).filter(Boolean);
+  return out;
+}
+
 async function getCandlesFromDB(
   instrumentId: number,
   tf: keyof typeof TF_MINUTES
 ) {
-  const tfMin = TF_MINUTES[tf];
-  // Buscamos diretamente os candles desse timeframe já persistidos no banco
-  const rows = await prisma.candle.findMany({
+  const candidates = tfCandidates(tf);
+
+  // 1ª tentativa: filtrar pelo timeframe (M5 e "5")
+  let rows = await prisma.candle.findMany({
     where: {
       instrumentId,
-      OR: [
-        { timeframe: tf },
-        { timeframe: String(tfMin) },
-        { timeframe: null },
-      ], // tolerante
+      timeframe: { in: candidates },
     },
     orderBy: { time: "asc" },
     select: {
@@ -55,6 +60,25 @@ async function getCandlesFromDB(
       timeframe: true,
     },
   });
+
+  // Fallback: se nada encontrado, tentar sem filtrar timeframe (para dados legados)
+  if (!rows.length) {
+    rows = await prisma.candle.findMany({
+      where: { instrumentId },
+      orderBy: { time: "asc" },
+      select: {
+        id: true,
+        time: true,
+        open: true,
+        high: true,
+        low: true,
+        close: true,
+        volume: true,
+        timeframe: true,
+      },
+    });
+  }
+
   return rows;
 }
 
@@ -63,20 +87,29 @@ async function findCandleIdByTime(
   tf: keyof typeof TF_MINUTES,
   t: Date
 ) {
-  const tfMin = TF_MINUTES[tf];
-  // Toleramos "M5" | "5" | null
-  const c = await prisma.candle.findFirst({
+  const candidates = tfCandidates(tf);
+
+  // 1ª tentativa: com filtro de timeframe
+  let c = await prisma.candle.findFirst({
     where: {
       instrumentId,
       time: t,
-      OR: [
-        { timeframe: tf },
-        { timeframe: String(tfMin) },
-        { timeframe: null },
-      ],
+      timeframe: { in: candidates },
     },
     select: { id: true },
   });
+
+  // Fallback: sem timeframe se não achou
+  if (!c) {
+    c = await prisma.candle.findFirst({
+      where: {
+        instrumentId,
+        time: t,
+      },
+      select: { id: true },
+    });
+  }
+
   return c?.id ?? null;
 }
 
@@ -123,9 +156,12 @@ export async function backfillCandlesAndSignals(
     if (prevDiff >= 0 && diff < 0) side = "SELL";
     if (!side) continue;
 
+    const tfMin = TF_MINUTES[tf];
+    const bucketTime = floorToBucket(candles[i].time, tfMin);
+
     const candleId =
       candles[i].id ||
-      (await findCandleIdByTime(instrumentId, tf, candles[i].time));
+      (await findCandleIdByTime(instrumentId, tf, bucketTime));
     if (!candleId) {
       // Candle não existe (ou não está com timeframe previsto); pule.
       continue;
@@ -164,6 +200,7 @@ export async function backfillCandlesAndSignals(
   return { candles: candles.length, createdOrUpdated };
 }
 
+/** Handler opcional (usado no server.ts) para gerar sinais por instrumento/TF */
 export async function handleAdminBackfill(req: any, res: any) {
   try {
     const body = req?.body || {};

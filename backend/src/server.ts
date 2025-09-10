@@ -9,7 +9,7 @@ import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
 import logger from "./logger";
 
-import { bootPipeline } from "./services/pipeline";
+import { bootPipeline, processImportedRange } from "./services/pipeline";
 // Roteador novo do backtest (mantemos)
 import { router as backtestRouter } from "./services/backtest";
 
@@ -18,6 +18,11 @@ import { loadCandlesAnyTF } from "./lib/aggregation";
 
 // >>> NOVO: iniciar AutoTrainer no boot (se configurado)
 import { startAutoTrainer } from "./workers/autoTrainer";
+
+// >>> NOVO: prisma para a rota /api/trades e helpers admin
+import { prisma } from "./prisma";
+// >>> NOVO: backfill de sinais confirmados (histórico)
+import { backfillCandlesAndSignals } from "./workers/confirmedSignalsWorker";
 
 const app = express();
 
@@ -739,6 +744,205 @@ app.get("/api/debug/availability", async (_req, res) => {
     }
     return res.json({ ok: true, data: out });
   } catch (e: any) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   /api/trades  (NOVO)
+   ========================= */
+app.get("/api/trades", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "").trim().toUpperCase() || undefined;
+    const timeframe = String(req.query.timeframe || "").trim().toUpperCase() || undefined;
+    const limit = req.query.limit ? Math.max(1, Number(req.query.limit)) : 200;
+
+    // filtro por período (usa a data do candle do entrySignal)
+    const norm = normalizeDayRange(req.query.from, req.query.to);
+    let f: Date | undefined, t: Date | undefined;
+    if (norm) {
+      f = norm.fromLocal.toUTC().toJSDate();
+      t = norm.toLocal.toUTC().toJSDate();
+    }
+
+    // Monta where
+    const where: any = {};
+    if (timeframe) where.timeframe = timeframe;
+
+    // Filtro por símbolo via relação instrument.symbol
+    const instrumentFilter = symbol
+      ? { symbol: symbol }
+      : undefined;
+
+    const trades = await prisma.trade.findMany({
+      where,
+      orderBy: { id: "desc" },
+      take: limit,
+      include: {
+        instrument: { select: { id: true, symbol: true, name: true } },
+        entrySignal: {
+          select: {
+            id: true,
+            side: true,
+            candle: {
+              select: { time: true },
+            },
+          },
+        },
+        exitSignal: {
+          select: {
+            id: true,
+            candle: { select: { time: true } },
+          },
+        },
+      },
+    });
+
+    // aplica filtros por símbolo e período pós-query (porque filtramos por relação)
+    const filtered = trades.filter((tr) => {
+      if (instrumentFilter && tr.instrument.symbol.toUpperCase() !== instrumentFilter.symbol) {
+        return false;
+      }
+      if (f || t) {
+        const et = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time) : null;
+        if (et) {
+          if (f && et < f) return false;
+          if (t && et > t) return false;
+        }
+      }
+      return true;
+    });
+
+    const out = filtered.map((tr) => {
+      const entryTime = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time).toISOString() : null;
+      const exitTime = tr.exitSignal?.candle?.time ? new Date(tr.exitSignal.candle.time).toISOString() : null;
+
+      return {
+        id: tr.id,
+        symbol: tr.instrument.symbol,
+        timeframe: tr.timeframe,
+        qty: tr.qty,
+        side: tr.entrySignal?.side || null,
+        entrySignalId: tr.entrySignalId,
+        exitSignalId: tr.exitSignalId,
+        entryPrice: tr.entryPrice,
+        exitPrice: tr.exitPrice,
+        pnlPoints: tr.pnlPoints,
+        pnlMoney: tr.pnlMoney,
+        entryTime,
+        exitTime,
+      };
+    });
+
+    return res.json(out);
+  } catch (e: any) {
+    console.error("[/api/trades] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   /admin/trades/backfill  (já existente)
+   ========================= */
+app.post("/admin/trades/backfill", async (req, res) => {
+  try {
+    // aceita por querystring ou corpo JSON
+    const q = { ...req.query, ...(req.body || {}) } as any;
+
+    const symbol = String(q.symbol || "").trim().toUpperCase() || undefined;
+    const timeframe = q.timeframe ? String(q.timeframe).trim().toUpperCase() : undefined;
+
+    // prioridade: from/to; se não vierem, usa "days" como atalho
+    const norm = normalizeDayRange(q.from, q.to);
+    let from: Date | undefined, to: Date | undefined;
+    if (norm) {
+      from = norm.fromLocal.toUTC().toJSDate();
+      to = norm.toLocal.toUTC().toJSDate();
+    } else if (q.days) {
+      const days = Math.max(1, Number(q.days) || 1);
+      const now = DateTime.now().setZone(ZONE_BR);
+      from = now.minus({ days }).startOf("day").toUTC().toJSDate();
+      to = now.endOf("day").toUTC().toJSDate();
+    }
+
+    const r = await processImportedRange({ symbol, timeframe, from, to });
+
+    return res.json({ ok: true, input: { symbol, timeframe, from, to }, result: r });
+  } catch (e: any) {
+    console.error("[/admin/trades/backfill] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   NOVO: /admin/signals/backfill  → gera sinais (EMA_CROSS) a partir dos candles históricos
+   ========================= */
+app.post("/admin/signals/backfill", async (req, res) => {
+  try {
+    const q = { ...req.query, ...(req.body || {}) } as any;
+    const symbol = String(q.symbol || "").trim().toUpperCase();
+    const timeframe = String(q.timeframe || "M5").trim().toUpperCase() as "M1" | "M5" | "M15" | "M30" | "H1";
+
+    if (!symbol) return res.status(200).json({ ok: false, error: "Faltou 'symbol'" });
+
+    const inst = await prisma.instrument.findFirst({
+      where: { symbol },
+      select: { id: true },
+    });
+    if (!inst) return res.status(200).json({ ok: false, error: "Instrumento não encontrado" });
+
+    const r = await backfillCandlesAndSignals(inst.id, timeframe);
+    return res.json({ ok: true, input: { symbol, timeframe }, result: r });
+  } catch (e: any) {
+    console.error("[/admin/signals/backfill] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
+   NOVO: /admin/rebuild/trades → roda sinais + trades (pipeline completo)
+   ========================= */
+app.post("/admin/rebuild/trades", async (req, res) => {
+  try {
+    const q = { ...req.query, ...(req.body || {}) } as any;
+    const symbol = String(q.symbol || "").trim().toUpperCase();
+    const timeframe = String(q.timeframe || "M5").trim().toUpperCase();
+
+    if (!symbol) return res.status(200).json({ ok: false, error: "Faltou 'symbol'" });
+
+    // 1) backfill de sinais históricos
+    const inst = await prisma.instrument.findFirst({
+      where: { symbol },
+      select: { id: true },
+    });
+    if (!inst) return res.status(200).json({ ok: false, error: "Instrumento não encontrado" });
+
+    const rSignals = await backfillCandlesAndSignals(inst.id, timeframe as any);
+
+    // 2) range para os trades
+    const norm = normalizeDayRange(q.from, q.to);
+    let from: Date | undefined, to: Date | undefined;
+    if (norm) {
+      from = norm.fromLocal.toUTC().toJSDate();
+      to = norm.toLocal.toUTC().toJSDate();
+    } else if (q.days) {
+      const days = Math.max(1, Number(q.days) || 1);
+      const now = DateTime.now().setZone(ZONE_BR);
+      from = now.minus({ days }).startOf("day").toUTC().toJSDate();
+      to = now.endOf("day").toUTC().toJSDate();
+    }
+
+    // 3) processar sinais em trades
+    const rTrades = await processImportedRange({ symbol, timeframe, from, to });
+
+    return res.json({
+      ok: true,
+      input: { symbol, timeframe, from, to },
+      signals: rSignals,
+      trades: rTrades,
+    });
+  } catch (e: any) {
+    console.error("[/admin/rebuild/trades] erro:", e?.message || e);
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
 });
