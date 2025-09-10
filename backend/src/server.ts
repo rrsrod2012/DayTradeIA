@@ -10,18 +10,17 @@ import { setupWS } from "./services/ws";
 import logger from "./logger";
 
 import { bootPipeline, processImportedRange } from "./services/pipeline";
-// Roteador novo do backtest (mantemos)
+// Roteador do backtest
 import { router as backtestRouter } from "./services/backtest";
 
 import { DateTime, Duration } from "luxon";
 import { loadCandlesAnyTF } from "./lib/aggregation";
 
-// >>> NOVO: iniciar AutoTrainer no boot (se configurado)
-import { startAutoTrainer } from "./workers/autoTrainer";
+// AutoTrainer
+import { startAutoTrainer, stopAutoTrainer, statusAutoTrainer as _statusAutoTrainer } from "./workers/autoTrainer";
 
-// >>> NOVO: prisma para a rota /api/trades e helpers admin
+// prisma + backfill de sinais confirmados
 import { prisma } from "./prisma";
-// >>> NOVO: backfill de sinais confirmados (histórico)
 import { backfillCandlesAndSignals } from "./workers/confirmedSignalsWorker";
 
 const app = express();
@@ -29,29 +28,24 @@ const app = express();
 // ====== Timezone/base para normalização de filtros de data ======
 const ZONE_BR = "America/Sao_Paulo";
 
+// util: sem cache p/ endpoints dinâmicos
+function noStore(res: express.Response) {
+  res.setHeader("Cache-Control", "no-store, must-revalidate");
+}
+
 /** Parse flexível: ISO (com/sem hora) ou BR "dd/MM/yyyy[ HH:mm[:ss]]" — tudo no fuso de SP */
-function parseUserDate(raw: any): {
-  ok: boolean;
-  dt: DateTime;
-  isDateOnly: boolean;
-} {
-  if (raw == null)
-    return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+function parseUserDate(raw: any): { ok: boolean; dt: DateTime; isDateOnly: boolean } {
+  if (raw == null) return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
   const s = String(raw).trim();
 
   // BR: dd/MM/yyyy [HH:mm[:ss]]
-  const brFull =
-    /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+  const brFull = /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
   const m = brFull.exec(s);
   if (m) {
-    const [_, dd, MM, yyyy, hh, mm, ss] = m;
-    const fmt = hh
-      ? ss
-        ? "dd/LL/yyyy HH:mm:ss"
-        : "dd/LL/yyyy HH:mm"
-      : "dd/LL/yyyy";
-    const dt = DateTime.fromFormat(s, fmt, { zone: ZONE_BR });
-    return { ok: dt.isValid, dt, isDateOnly: !hh };
+    const dt = DateTime.fromFormat(s, m[4] ? (m[6] ? "dd/LL/yyyy HH:mm:ss" : "dd/LL/yyyy HH:mm") : "dd/LL/yyyy", {
+      zone: ZONE_BR,
+    });
+    return { ok: dt.isValid, dt, isDateOnly: !m[4] };
   }
 
   // ISO (yyyy-MM-dd[THH:mm[:ss[.SSS]]][Z])
@@ -64,9 +58,7 @@ function parseUserDate(raw: any): {
   // Epoch ms?
   if (/^\d{10,13}$/.test(s)) {
     const n = Number(s);
-    const dt = Number.isFinite(n)
-      ? DateTime.fromMillis(n, { zone: ZONE_BR })
-      : DateTime.invalid("nan");
+    const dt = Number.isFinite(n) ? DateTime.fromMillis(n, { zone: ZONE_BR }) : DateTime.invalid("nan");
     return { ok: dt.isValid, dt, isDateOnly: false };
   }
 
@@ -81,18 +73,15 @@ function normalizeDayRange(
   const pF = parseUserDate(fromRaw);
   const pT = parseUserDate(toRaw);
 
-  // nenhum dos dois informado
   if (!pF.ok && !pT.ok) return null;
 
   let fromLocal: DateTime;
   let toLocal: DateTime;
 
   if (pF.ok && pT.ok) {
-    // se qualquer um for "só data", tratamos ambos como dia cheio
-    const sameDay =
-      pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
+    const sameDay = pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
     if (pF.isDateOnly || pT.isDateOnly || sameDay) {
-      const base = pF.dt; // usa o dia de 'from'
+      const base = pF.dt;
       fromLocal = base.startOf("day");
       toLocal = pT.dt.endOf("day");
     } else {
@@ -100,16 +89,13 @@ function normalizeDayRange(
       toLocal = pT.dt;
     }
   } else if (pF.ok && !pT.ok) {
-    // só from: cobre o dia de from
     fromLocal = pF.isDateOnly ? pF.dt.startOf("day") : pF.dt;
     toLocal = pF.isDateOnly ? pF.dt.endOf("day") : pF.dt.endOf("day");
   } else {
-    // só to: cobre o dia de to
     toLocal = pT.isDateOnly ? pT.dt.endOf("day") : pT.dt;
     fromLocal = pT.isDateOnly ? pT.dt.startOf("day") : pT.dt.startOf("day");
   }
 
-  // garante ordem
   if (toLocal < fromLocal) {
     const tmp = fromLocal;
     fromLocal = toLocal.startOf("day");
@@ -120,9 +106,7 @@ function normalizeDayRange(
 
 // ===== CORS (com credenciais) + preflight =====
 const ORIGINS =
-  process.env.CORS_ORIGIN?.split(",")
-    .map((s) => s.trim())
-    .filter(Boolean) || ["http://localhost:5173"];
+  process.env.CORS_ORIGIN?.split(",").map((s) => s.trim()).filter(Boolean) || ["http://localhost:5173"];
 
 app.use(
   cors({
@@ -153,19 +137,14 @@ app.use(backtestRouter);
    ========================= */
 (() => {
   const ZONE = "America/Sao_Paulo";
-  const VERSION = "signals-projected:inline-v3";
 
   function normalizeTf(tfRaw: string): { tfU: string; tfMin: number } {
-    const s = String(tfRaw || "")
-      .trim()
-      .toUpperCase();
+    const s = String(tfRaw || "").trim().toUpperCase();
     if (!s) return { tfU: "M5", tfMin: 5 };
     if (s.startsWith("M") || s.startsWith("H")) {
       const unit = s[0];
       const num = parseInt(s.slice(1), 10) || (unit === "H" ? 1 : 5);
-      const tfU = `${unit}${num}`;
-      const tfMin = unit === "H" ? num * 60 : num;
-      return { tfU, tfMin };
+      return { tfU: `${unit}${num}`, tfMin: unit === "H" ? num * 60 : num };
     }
     const m = /(\d+)\s*(M|MIN|MINUTES|m)?/.exec(s);
     if (m) {
@@ -175,26 +154,18 @@ app.use(backtestRouter);
     return { tfU: "M5", tfMin: 5 };
   }
   const floorTo = (d: Date, tfMin: number) =>
-    DateTime.fromJSDate(d)
-      .toUTC()
-      .set({
-        second: 0,
-        millisecond: 0,
-        minute:
-          Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin,
-      })
-      .toJSDate();
+    DateTime.fromJSDate(d).toUTC().set({
+      second: 0,
+      millisecond: 0,
+      minute: Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin,
+    }).toJSDate();
+
   const ceilToExclusive = (d: Date, tfMin: number) =>
-    DateTime.fromJSDate(d)
-      .toUTC()
-      .set({
-        second: 0,
-        millisecond: 0,
-        minute:
-          Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin +
-          tfMin,
-      })
-      .toJSDate();
+    DateTime.fromJSDate(d).toUTC().set({
+      second: 0,
+      millisecond: 0,
+      minute: Math.floor(DateTime.fromJSDate(d).toUTC().minute / tfMin) * tfMin + tfMin,
+    }).toJSDate();
 
   const EMA = (values: number[], period: number): (number | null)[] => {
     const out: (number | null)[] = [];
@@ -211,21 +182,13 @@ app.use(backtestRouter);
     }
     return out;
   };
-  const ATR = (
-    candles: { high: number; low: number; close: number }[],
-    period = 14
-  ): (number | null)[] => {
+
+  const ATR = (candles: { high: number; low: number; close: number }[], period = 14): (number | null)[] => {
     const tr: number[] = [];
     for (let i = 0; i < candles.length; i++) {
       const c = candles[i];
       const prevClose = i > 0 ? candles[i - 1].close : c.close;
-      tr.push(
-        Math.max(
-          c.high - c.low,
-          Math.abs(c.high - prevClose),
-          Math.abs(c.low - prevClose)
-        )
-      );
+      tr.push(Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose)));
     }
     const out: (number | null)[] = [];
     let ema: number | null = null;
@@ -238,15 +201,12 @@ app.use(backtestRouter);
     return out;
   };
 
-  async function httpPostJSON<T = any>(
-    url: string,
-    body: any,
-    timeoutMs = 2500
-  ): Promise<T> {
+  async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 2500): Promise<T> {
     let f: typeof fetch = (global as any).fetch;
     if (!f) {
       const mod = await import("node-fetch");
-      /* @ts-ignore */ f = mod.default as any;
+      // @ts-ignore
+      f = mod.default as any;
     }
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -255,7 +215,8 @@ app.use(backtestRouter);
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-        /* @ts-ignore */ signal: ctrl.signal,
+        // @ts-ignore
+        signal: ctrl.signal,
       } as any);
       const txt = await resp.text();
       const data = txt ? JSON.parse(txt) : null;
@@ -267,6 +228,7 @@ app.use(backtestRouter);
   }
 
   app.post("/api/signals/projected", express.json(), async (req, res) => {
+    noStore(res);
     try {
       const {
         symbol,
@@ -287,45 +249,29 @@ app.use(backtestRouter);
         k_tp = rr,
       } = req.body || {};
 
-      const sym = String(symbol || "")
-        .trim()
-        .toUpperCase();
-      if (!sym)
-        return res
-          .status(200)
-          .json({ ok: false, version: VERSION, error: "Faltou 'symbol'" });
+      const sym = String(symbol || "").trim().toUpperCase();
+      if (!sym) return res.status(200).json([]);
 
       const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
-      // ====== Range: interpreta 1 dia como dia inteiro no fuso de SP ======
+      // ====== Range ======
       let fromD: Date, toD: Date;
       const norm = normalizeDayRange(from, to);
       if (norm) {
-        // passa pelos buckets do TF
         fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
         toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
       } else {
-        const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 1); // <<< alterado: 1 dia
+        const fallbackDays = Number(process.env.PROJECTED_DEFAULT_DAYS || 1);
         const now = DateTime.now().setZone(ZONE_BR).toUTC();
         const f = now.minus(Duration.fromObject({ days: fallbackDays }));
         fromD = floorTo(f.toJSDate(), tfMin);
         toD = ceilToExclusive(now.toJSDate(), tfMin);
       }
-      if (fromD >= toD) {
-        return res.status(200).json({
-          ok: false,
-          version: VERSION,
-          error: "'from' deve ser anterior a 'to'",
-        });
-      }
+      if (fromD >= toD) return res.status(200).json([]);
 
       // Candles
-      const candles = await loadCandlesAnyTF(sym, tfU, {
-        gte: fromD,
-        lte: toD,
-      } as any);
-      if (!candles?.length)
-        return res.status(200).json({ ok: true, version: VERSION, data: [] });
+      const candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD } as any);
+      if (!candles?.length) return res.status(200).json([]);
 
       const closes = candles.map((c) => Number(c.close));
       const highs = candles.map((c) => Number(c.high));
@@ -334,22 +280,14 @@ app.use(backtestRouter);
 
       const e9 = EMA(closes, 9);
       const e21 = EMA(closes, 21);
-      const atr = ATR(
-        candles.map((c) => ({ high: c.high, low: c.low, close: c.close })),
-        Number(atrPeriod) || 14
-      );
+      const atr = ATR(candles.map((c) => ({ high: c.high, low: c.low, close: c.close })), Number(atrPeriod) || 14);
 
       // VWAP por sessão (dia local em SP)
       const vwap: (number | null)[] = [];
-      let accPV = 0,
-        accVol = 0;
-      let dLocal = DateTime.fromJSDate(times[0])
-        .setZone(ZONE)
-        .toFormat("yyyy-LL-dd");
+      let accPV = 0, accVol = 0;
+      let dLocal = DateTime.fromJSDate(times[0]).setZone(ZONE).toFormat("yyyy-LL-dd");
       for (let i = 0; i < candles.length; i++) {
-        const dl = DateTime.fromJSDate(times[i])
-          .setZone(ZONE)
-          .toFormat("yyyy-LL-dd");
+        const dl = DateTime.fromJSDate(times[i]).setZone(ZONE).toFormat("yyyy-LL-dd");
         if (dl !== dLocal) {
           accPV = 0;
           accVol = 0;
@@ -362,21 +300,14 @@ app.use(backtestRouter);
         vwap.push(accVol > 0 ? accPV / accVol : null);
       }
 
-      // (MTF opcional — inalterado)
-      let mtfUp: boolean[] | null = null,
-        mtfDown: boolean[] | null = null;
+      // (MTF opcional)
+      let mtfUp: boolean[] | null = null, mtfDown: boolean[] | null = null;
       if (requireMtf && confirmTf && confirmTf !== tfU) {
         const { tfU: confU } = normalizeTf(confirmTf);
         const c2 = await loadCandlesAnyTF(sym, confU, { gte: fromD, lte: toD } as any);
         if (c2?.length) {
-          const e9b = EMA(
-            c2.map((c) => Number(c.close)),
-            9
-          );
-          const e21b = EMA(
-            c2.map((c) => Number(c.close)),
-            21
-          );
+          const e9b = EMA(c2.map((c) => Number(c.close)), 9);
+          const e21b = EMA(c2.map((c) => Number(c.close)), 21);
           mtfUp = [];
           mtfDown = [];
           let j = 0;
@@ -411,33 +342,21 @@ app.use(backtestRouter);
         const e21v = e21[i] ?? c;
         const atrv = atr[i] ?? 0;
         const vw = vwap[i] ?? c;
-        const slope9 =
-          i > 0 && e9[i - 1] != null ? (e9v as number) - (e9[i - 1] as number) : 0;
-        const slope21 =
-          i > 0 && e21[i - 1] != null ? (e21v as number) - (e21[i - 1] as number) : 0;
+        const slope9 = i > 0 && e9[i - 1] != null ? (e9v as number) - (e9[i - 1] as number) : 0;
+        const slope21 = i > 0 && e21[i - 1] != null ? (e21v as number) - (e21[i - 1] as number) : 0;
         const range = highs[i] - lows[i];
         const rangeRatio = atrv > 0 ? range / atrv : 0;
         const distEma21 = e21v ? (c as number) - (e21v as number) : 0;
         const distVwap = (c as number) - (vw as number);
-        return {
-          dist_ema21: distEma21,
-          dist_vwap: distVwap,
-          slope_e9: slope9,
-          slope_e21: slope21,
-          range_ratio: rangeRatio,
-        };
+        return { dist_ema21: distEma21, dist_vwap: distVwap, slope_e9: slope9, slope_e21: slope21, range_ratio: rangeRatio };
       }
 
       async function getProb(_features: any): Promise<number | null> {
         const url = String(process.env.MICRO_MODEL_URL || "").trim();
         if (!(useMicroModel && url)) return null;
         try {
-          const resp = await httpPostJSON<{ probHit?: number }>(
-            `${url}/predict`,
-            { features: _features }
-          );
-          if (typeof resp?.probHit === "number" && isFinite(resp.probHit))
-            return resp.probHit;
+          const resp = await httpPostJSON<{ probHit?: number }>(`${url}/predict`, { features: _features });
+          if (typeof resp?.probHit === "number" && isFinite(resp.probHit)) return resp.probHit;
           return null;
         } catch {
           return null;
@@ -445,22 +364,10 @@ app.use(backtestRouter);
       }
 
       for (let i = 1; i < candles.length - 1; i++) {
-        const prevUp =
-          e9[i - 1] != null &&
-          e21[i - 1] != null &&
-          (e9[i - 1] as number) <= (e21[i - 1] as number);
-        const nowUp =
-          e9[i] != null &&
-          e21[i] != null &&
-          (e9[i] as number) > (e21[i] as number);
-        const prevDn =
-          e9[i - 1] != null &&
-          e21[i - 1] != null &&
-          (e9[i - 1] as number) >= (e21[i - 1] as number);
-        const nowDn =
-          e9[i] != null &&
-          e21[i] != null &&
-          (e9[i] as number) < (e21[i] as number);
+        const prevUp = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) <= (e21[i - 1] as number);
+        const nowUp = e9[i] != null && e21[i] != null && (e9[i] as number) > (e21[i] as number);
+        const prevDn = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) >= (e21[i - 1] as number);
+        const nowDn = e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
         const crossUp = prevUp && nowUp;
         const crossDn = prevDn && nowDn;
         if (!crossUp && !crossDn) continue;
@@ -477,16 +384,12 @@ app.use(backtestRouter);
           if (crossDn && !mtfDown[i]) continue;
         }
 
-        // Entrada na próxima barra
         const j = Math.min(i + 1, candles.length - 1);
-        const entry = Number.isFinite((candles[j] as any).open)
-          ? Number((candles[j] as any).open)
-          : Number((candles[j] as any).close) || Number(candles[i].close);
+        const entry = Number.isFinite((candles[j] as any).open) ? Number((candles[j] as any).open) : Number((candles[j] as any).close) || Number(candles[i].close);
 
         const atrv = atr[i] ?? 0;
         const isBuy = !!crossUp;
 
-        // SL/TP em pontos via ATR
         const slPts = atrv > 0 ? Math.max(atrv * Number(k_sl), 0) : 0;
         const tpPts = atrv > 0 ? Math.max(atrv * Number(k_tp), 0) : 0;
 
@@ -495,29 +398,17 @@ app.use(backtestRouter);
 
         let prob = await getProb(featuresAt(i));
         if (prob == null) {
-          // Heurística estável quando não há micro-model
           const e9v0 = e9[i] ?? entry;
           const e21v0 = e21[i] ?? entry;
           const raw =
             0.5 +
-            Math.max(
-              -0.08,
-              Math.min(0.08, ((e9v0 as number) - (e21v0 as number)) * 0.002)
-            ) +
-            Math.max(
-              -0.05,
-              Math.min(
-                0.05,
-                ((entry - (e21v0 as number)) / Math.max(atrv || 1e-6, 1e-6)) *
-                0.1
-              )
-            );
+            Math.max(-0.08, Math.min(0.08, ((e9v0 as number) - (e21v0 as number)) * 0.002)) +
+            Math.max(-0.05, Math.min(0.05, ((entry - (e21v0 as number)) / Math.max(atrv || 1e-6, 1e-6)) * 0.1));
           prob = Math.max(0.35, Math.min(0.65, raw));
         }
 
         const costs = Number(costPts) + Number(slippagePts);
-        const evPts =
-          (tpPts || 0) * prob - (slPts || 0) * (1 - prob) - costs;
+        const evPts = (tpPts || 0) * prob - (slPts || 0) * (1 - prob) - costs;
 
         if (prob < Number(minProb)) continue;
         if (evPts < Number(minEV)) continue;
@@ -527,35 +418,20 @@ app.use(backtestRouter);
           suggestedEntry: entry,
           stopSuggestion: sl,
           takeProfitSuggestion: tp,
-          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""
-            }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
+          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""}${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
           probHit: Number(prob.toFixed(4)),
           probCalibrated: Number(prob.toFixed(4)),
-          expectedValuePoints: Number(
-            (isFinite(evPts) ? evPts : 0).toFixed(2)
-          ),
+          expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
           time: candles[i].time.toISOString(),
-          date: DateTime.fromJSDate(candles[i].time)
-            .setZone(ZONE)
-            .toISODate()!,
+          date: DateTime.fromJSDate(candles[i].time).setZone(ZONE).toISODate()!,
         });
       }
 
-      // >>> ORDENAR: mais recentes primeiro
       out.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
-
       return res.status(200).json(out);
     } catch (e: any) {
-      console.error(
-        "[/api/signals/projected] erro:",
-        e?.stack || e?.message || e
-      );
-      return res.status(200).json({
-        ok: false,
-        version: VERSION,
-        error: "unexpected",
-        diag: String(e?.stack || e?.message || e),
-      });
+      console.error("[/api/signals/projected] erro:", e?.stack || e?.message || e);
+      return res.status(200).json([]);
     }
   });
 })();
@@ -564,16 +440,12 @@ app.use(backtestRouter);
    Fallback /api/candles — normalização de 1 dia
    ========================= */
 app.get("/api/candles", async (req, res) => {
+  noStore(res);
   try {
-    const symbol = String(req.query.symbol || "")
-      .trim()
-      .toUpperCase();
-    const timeframe = String(req.query.timeframe || "M5")
-      .trim()
-      .toUpperCase();
+    const symbol = String(req.query.symbol || "").trim().toUpperCase();
+    const timeframe = String(req.query.timeframe || "M5").trim().toUpperCase();
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
-    if (!symbol)
-      return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
+    if (!symbol) return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
 
     const norm = normalizeDayRange(req.query.from, req.query.to);
     let f: Date, t: Date;
@@ -581,18 +453,12 @@ app.get("/api/candles", async (req, res) => {
       f = norm.fromLocal.toUTC().toJSDate();
       t = norm.toLocal.toUTC().toJSDate();
     } else {
-      // range padrão: 1 dia
       const now = DateTime.now().setZone(ZONE_BR);
-      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate(); // <<< 1 dia
+      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate();
       t = now.endOf("day").toUTC().toJSDate();
     }
 
-    const rows = await loadCandlesAnyTF(symbol, timeframe, {
-      gte: f,
-      lte: t,
-      // @ts-ignore - se sua função não usa `limit`, isso será ignorado
-      limit,
-    } as any);
+    const rows = await loadCandlesAnyTF(symbol, timeframe, { gte: f, lte: t, /* @ts-ignore */ limit } as any);
     const out = (rows || []).map((c) => ({
       time: c.time.toISOString(),
       open: Number(c.open),
@@ -612,16 +478,12 @@ app.get("/api/candles", async (req, res) => {
    Fallback /api/signals (confirmados EMA) — com range de 1 dia
    ========================= */
 app.get("/api/signals", async (req, res) => {
+  noStore(res);
   try {
-    const symbol = String(req.query.symbol || "")
-      .trim()
-      .toUpperCase();
-    const timeframe = String(req.query.timeframe || "M5")
-      .trim()
-      .toUpperCase();
+    const symbol = String(req.query.symbol || "").trim().toUpperCase();
+    const timeframe = String(req.query.timeframe || "M5").trim().toUpperCase();
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
-    if (!symbol)
-      return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
+    if (!symbol) return res.status(400).json({ ok: false, error: "Faltou 'symbol'" });
 
     const norm = normalizeDayRange(req.query.from, req.query.to);
     let f: Date, t: Date;
@@ -629,30 +491,22 @@ app.get("/api/signals", async (req, res) => {
       f = norm.fromLocal.toUTC().toJSDate();
       t = norm.toLocal.toUTC().toJSDate();
     } else {
-      // range padrão: 1 dia
       const now = DateTime.now().setZone(ZONE_BR);
-      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate(); // <<< 1 dia
+      f = now.minus({ days: 1 }).startOf("day").toUTC().toJSDate();
       t = now.endOf("day").toUTC().toJSDate();
     }
 
-    const rows = await loadCandlesAnyTF(symbol, timeframe, {
-      gte: f,
-      lte: t,
-      // @ts-ignore
-      limit,
-    } as any);
+    const rows = await loadCandlesAnyTF(symbol, timeframe, { gte: f, lte: t, /* @ts-ignore */ limit } as any);
     if (!rows?.length) return res.json([]);
 
-    const closes = rows.map((c) =>
-      Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0
-    );
+    const closes = rows.map((c) => (Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0));
     const EMA = (values: number[], period: number): (number | null)[] => {
       const out: (number | null)[] = [];
       const k = 2 / (period + 1);
       let ema: number | null = null;
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
-        ema = ema == null ? v : v * k + ema * (1 - k);
+        ema = ema == null ? v : v * k + (ema as number) * (1 - k);
         out.push(ema);
       }
       return out;
@@ -662,22 +516,10 @@ app.get("/api/signals", async (req, res) => {
 
     const out: any[] = [];
     for (let i = 1; i < rows.length; i++) {
-      const prevUp =
-        e9[i - 1] != null &&
-        e21[i - 1] != null &&
-        (e9[i - 1] as number) <= (e21[i - 1] as number);
-      const nowUp =
-        e9[i] != null &&
-        e21[i] != null &&
-        (e9[i] as number) > (e21[i] as number);
-      const prevDn =
-        e9[i - 1] != null &&
-        e21[i - 1] != null &&
-        (e9[i - 1] as number) >= (e21[i - 1] as number);
-      const nowDn =
-        e9[i] != null &&
-        e21[i] != null &&
-        (e9[i] as number) < (e21[i] as number);
+      const prevUp = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) <= (e21[i - 1] as number);
+      const nowUp = e9[i] != null && e21[i] != null && (e9[i] as number) > (e21[i] as number);
+      const prevDn = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) >= (e21[i - 1] as number);
+      const nowDn = e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
       const crossUp = prevUp && nowUp;
       const crossDn = prevDn && nowDn;
       if (!crossUp && !crossDn) continue;
@@ -690,9 +532,7 @@ app.get("/api/signals", async (req, res) => {
       });
     }
 
-    // >>> ORDENAR: mais recentes primeiro
     out.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
-
     return res.json(out);
   } catch (e: any) {
     console.error("[/api/signals] erro:", e?.message || e);
@@ -705,14 +545,8 @@ app.get("/api/signals", async (req, res) => {
    ========================= */
 app.get("/api/debug/availability", async (_req, res) => {
   try {
-    const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO")
-      .split(",")
-      .map((s) => s.trim().toUpperCase())
-      .filter(Boolean);
-    const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1")
-      .split(",")
-      .map((s) => s.trim().toUpperCase())
-      .filter(Boolean);
+    const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
     const now = DateTime.now().setZone(ZONE_BR);
     const from = now.minus({ days: 30 }).startOf("day").toUTC().toJSDate();
     const to = now.endOf("day").toUTC().toJSDate();
@@ -720,12 +554,7 @@ app.get("/api/debug/availability", async (_req, res) => {
     for (const s of syms) {
       for (const tf of tfs) {
         try {
-          const rows = await loadCandlesAnyTF(s, tf, {
-            gte: from,
-            lte: to,
-            // @ts-ignore
-            limit: 5_000,
-          } as any);
+          const rows = await loadCandlesAnyTF(s, tf, { gte: from, lte: to, /* @ts-ignore */ limit: 5_000 } as any);
           out.push({
             symbol: s,
             timeframe: tf,
@@ -734,11 +563,7 @@ app.get("/api/debug/availability", async (_req, res) => {
             last: rows?.[rows.length - 1]?.time?.toISOString?.() || null,
           });
         } catch (e: any) {
-          out.push({
-            symbol: s,
-            timeframe: tf,
-            error: e?.message || String(e),
-          });
+          out.push({ symbol: s, timeframe: tf, error: e?.message || String(e) });
         }
       }
     }
@@ -749,15 +574,16 @@ app.get("/api/debug/availability", async (_req, res) => {
 });
 
 /* =========================
-   /api/trades  (NOVO)
+   /api/trades
    ========================= */
 app.get("/api/trades", async (req, res) => {
+  noStore(res);
   try {
     const symbol = String(req.query.symbol || "").trim().toUpperCase() || undefined;
     const timeframe = String(req.query.timeframe || "").trim().toUpperCase() || undefined;
     const limit = req.query.limit ? Math.max(1, Number(req.query.limit)) : 200;
 
-    // filtro por período (usa a data do candle do entrySignal)
+    // período usa a data do candle do entrySignal
     const norm = normalizeDayRange(req.query.from, req.query.to);
     let f: Date | undefined, t: Date | undefined;
     if (norm) {
@@ -765,14 +591,12 @@ app.get("/api/trades", async (req, res) => {
       t = norm.toLocal.toUTC().toJSDate();
     }
 
-    // Monta where
+    // where base
     const where: any = {};
     if (timeframe) where.timeframe = timeframe;
 
-    // Filtro por símbolo via relação instrument.symbol
-    const instrumentFilter = symbol
-      ? { symbol: symbol }
-      : undefined;
+    // símbolo via relação instrument.symbol
+    const instrumentFilter = symbol ? { symbol } : undefined;
 
     const trades = await prisma.trade.findMany({
       where,
@@ -780,29 +604,14 @@ app.get("/api/trades", async (req, res) => {
       take: limit,
       include: {
         instrument: { select: { id: true, symbol: true, name: true } },
-        entrySignal: {
-          select: {
-            id: true,
-            side: true,
-            candle: {
-              select: { time: true },
-            },
-          },
-        },
-        exitSignal: {
-          select: {
-            id: true,
-            candle: { select: { time: true } },
-          },
-        },
+        entrySignal: { select: { id: true, side: true, candle: { select: { time: true } } } },
+        exitSignal: { select: { id: true, candle: { select: { time: true } } } },
       },
     });
 
-    // aplica filtros por símbolo e período pós-query (porque filtramos por relação)
+    // filtros pós-query (por relação)
     const filtered = trades.filter((tr) => {
-      if (instrumentFilter && tr.instrument.symbol.toUpperCase() !== instrumentFilter.symbol) {
-        return false;
-      }
+      if (instrumentFilter && tr.instrument.symbol.toUpperCase() !== instrumentFilter.symbol) return false;
       if (f || t) {
         const et = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time) : null;
         if (et) {
@@ -816,7 +625,6 @@ app.get("/api/trades", async (req, res) => {
     const out = filtered.map((tr) => {
       const entryTime = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time).toISOString() : null;
       const exitTime = tr.exitSignal?.candle?.time ? new Date(tr.exitSignal.candle.time).toISOString() : null;
-
       return {
         id: tr.id,
         symbol: tr.instrument.symbol,
@@ -842,17 +650,15 @@ app.get("/api/trades", async (req, res) => {
 });
 
 /* =========================
-   /admin/trades/backfill  (já existente)
+   /admin/trades/backfill
    ========================= */
 app.post("/admin/trades/backfill", async (req, res) => {
   try {
-    // aceita por querystring ou corpo JSON
     const q = { ...req.query, ...(req.body || {}) } as any;
 
     const symbol = String(q.symbol || "").trim().toUpperCase() || undefined;
     const timeframe = q.timeframe ? String(q.timeframe).trim().toUpperCase() : undefined;
 
-    // prioridade: from/to; se não vierem, usa "days" como atalho
     const norm = normalizeDayRange(q.from, q.to);
     let from: Date | undefined, to: Date | undefined;
     if (norm) {
@@ -866,7 +672,6 @@ app.post("/admin/trades/backfill", async (req, res) => {
     }
 
     const r = await processImportedRange({ symbol, timeframe, from, to });
-
     return res.json({ ok: true, input: { symbol, timeframe, from, to }, result: r });
   } catch (e: any) {
     console.error("[/admin/trades/backfill] erro:", e?.message || e);
@@ -875,7 +680,7 @@ app.post("/admin/trades/backfill", async (req, res) => {
 });
 
 /* =========================
-   NOVO: /admin/signals/backfill  → gera sinais (EMA_CROSS) a partir dos candles históricos
+   /admin/signals/backfill  → gera sinais confirmados (EMA_CROSS)
    ========================= */
 app.post("/admin/signals/backfill", async (req, res) => {
   try {
@@ -885,10 +690,7 @@ app.post("/admin/signals/backfill", async (req, res) => {
 
     if (!symbol) return res.status(200).json({ ok: false, error: "Faltou 'symbol'" });
 
-    const inst = await prisma.instrument.findFirst({
-      where: { symbol },
-      select: { id: true },
-    });
+    const inst = await prisma.instrument.findFirst({ where: { symbol }, select: { id: true } });
     if (!inst) return res.status(200).json({ ok: false, error: "Instrumento não encontrado" });
 
     const r = await backfillCandlesAndSignals(inst.id, timeframe);
@@ -900,7 +702,7 @@ app.post("/admin/signals/backfill", async (req, res) => {
 });
 
 /* =========================
-   NOVO: /admin/rebuild/trades → roda sinais + trades (pipeline completo)
+   /admin/rebuild/trades → sinais + trades
    ========================= */
 app.post("/admin/rebuild/trades", async (req, res) => {
   try {
@@ -910,16 +712,11 @@ app.post("/admin/rebuild/trades", async (req, res) => {
 
     if (!symbol) return res.status(200).json({ ok: false, error: "Faltou 'symbol'" });
 
-    // 1) backfill de sinais históricos
-    const inst = await prisma.instrument.findFirst({
-      where: { symbol },
-      select: { id: true },
-    });
+    const inst = await prisma.instrument.findFirst({ where: { symbol }, select: { id: true } });
     if (!inst) return res.status(200).json({ ok: false, error: "Instrumento não encontrado" });
 
     const rSignals = await backfillCandlesAndSignals(inst.id, timeframe as any);
 
-    // 2) range para os trades
     const norm = normalizeDayRange(q.from, q.to);
     let from: Date | undefined, to: Date | undefined;
     if (norm) {
@@ -932,19 +729,29 @@ app.post("/admin/rebuild/trades", async (req, res) => {
       to = now.endOf("day").toUTC().toJSDate();
     }
 
-    // 3) processar sinais em trades
     const rTrades = await processImportedRange({ symbol, timeframe, from, to });
 
-    return res.json({
-      ok: true,
-      input: { symbol, timeframe, from, to },
-      signals: rSignals,
-      trades: rTrades,
-    });
+    return res.json({ ok: true, input: { symbol, timeframe, from, to }, signals: rSignals, trades: rTrades });
   } catch (e: any) {
     console.error("[/admin/rebuild/trades] erro:", e?.message || e);
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
+});
+
+/* =========================
+   Admin: AutoTrainer
+   ========================= */
+app.get("/admin/auto-trainer/status", async (_req, res) => {
+  const st = await _statusAutoTrainer();
+  res.json(st);
+});
+app.post("/admin/auto-trainer/start", async (_req, res) => {
+  const r = await startAutoTrainer();
+  res.json(r);
+});
+app.post("/admin/auto-trainer/stop", async (_req, res) => {
+  const r = await stopAutoTrainer();
+  res.json(r);
 });
 
 // ====== ROTAS LEGADAS ======
@@ -962,25 +769,15 @@ app.get("/healthz", (_req, res) =>
 
 // Error handler final
 app.use(
-  (
-    err: any,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction
-  ) => {
+  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const code = err?.status || 500;
     const payload: any = {
       ok: false,
       error: err?.message || "internal",
       where: "global",
     };
-    if (err?.stack)
-      payload.diag = String(err.stack).split("\n").slice(0, 6).join("\n");
-    logger?.error?.("[global-error]", {
-      code,
-      msg: err?.message,
-      stack: err?.stack,
-    });
+    if (err?.stack) payload.diag = String(err.stack).split("\n").slice(0, 6).join("\n");
+    logger?.error?.("[global-error]", { code, msg: err?.message, stack: err?.stack });
     res.status(code).json(payload);
   }
 );
@@ -998,9 +795,7 @@ server.listen(PORT, () => {
   try {
     bootConfirmedSignalsWorker?.();
   } catch (e: any) {
-    logger.warn("[SignalsWorker] módulo não carregado", {
-      err: e?.message || e,
-    });
+    logger.warn("[SignalsWorker] módulo não carregado", { err: e?.message || e });
   }
   try {
     setupWS?.(server);
@@ -1013,7 +808,7 @@ server.listen(PORT, () => {
     logger.warn("[pipeline] módulo não iniciado", { err: e?.message || e });
   }
 
-  // >>> NOVO: tenta iniciar AutoTrainer se `MICRO_MODEL_URL` estiver setada
+  // AutoTrainer on boot (se configurado)
   try {
     if ((process.env.MICRO_MODEL_URL || "").trim()) {
       const r = startAutoTrainer?.();

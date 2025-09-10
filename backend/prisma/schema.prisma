@@ -100,3 +100,39 @@ model BacktestRun {
   trades       Trade[]
   totalPnL     Float?
 }
+
+model TrainingRun {
+  id           Int       @id @default(autoincrement())
+  startedAt    DateTime  @default(now())
+  finishedAt   DateTime?
+  status       String    // "RUNNING" | "OK" | "ERROR"
+  symbol       String?
+  timeframe    String?
+  lookback     Int?
+  horizon      Int?
+  slAtr        Float?
+  rr           Float?
+  epochs       Int?
+  batchSize    Int?
+
+  // métricas agregadas (se o micro-model retornar)
+  loss         Float?
+  accuracy     Float?
+  evMean       Float?    // expected value médio (pts) após treino/validação
+  winRate      Float?    // [0..1]
+  notes        String?
+
+  // relacionamento 1->N com pontos de métrica (opcional)
+  metrics      TrainingMetric[]
+}
+
+model TrainingMetric {
+  id           Int       @id @default(autoincrement())
+  run          TrainingRun @relation(fields: [runId], references: [id])
+  runId        Int
+  t            Int        // passo/epoch/iter
+  loss         Float?
+  accuracy     Float?
+  ev           Float?     // expected value estimado no passo
+  createdAt    DateTime   @default(now())
+}

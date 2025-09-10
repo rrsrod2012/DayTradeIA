@@ -18,17 +18,17 @@ let _stats = {
   batches: 0,
 };
 
+/* =========================
+   Helpers básicos
+   ========================= */
 function ms(n: number, def: number) {
   const v = Number(n);
   return Number.isFinite(v) && v > 0 ? v : def;
 }
-
 function okURL() {
-  const u = (process.env.MICRO_MODEL_URL || "").trim();
-  return !!u;
+  return !!(process.env.MICRO_MODEL_URL || "").trim();
 }
-
-async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 4000): Promise<T> {
+async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 15000): Promise<T> {
   let f: typeof fetch = (global as any).fetch;
   if (!f) {
     const mod = await import("node-fetch");
@@ -56,19 +56,24 @@ async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 4000): 
   }
 }
 
-/** ----- Indicadores utilitários ----- */
+/* =========================
+   Indicadores
+   ========================= */
 function ema(values: number[], period: number): (number | null)[] {
   const out: (number | null)[] = [];
   const k = 2 / (period + 1);
   let e: number | null = null;
   for (let i = 0; i < values.length; i++) {
-    const v = values[i];
+    const v = Number(values[i]) || 0;
     e = e == null ? v : v * k + (e as number) * (1 - k);
     out.push(e);
   }
   return out;
 }
-function atrFromCandles(candles: { high: number; low: number; close: number }[], period = 14): number | null {
+function atrFromCandles(
+  candles: { high: number; low: number; close: number }[],
+  period = 14
+): number | null {
   if (!candles?.length) return null;
   const tr: number[] = [];
   for (let i = 0; i < candles.length; i++) {
@@ -87,24 +92,46 @@ function atrFromCandles(candles: { high: number; low: number; close: number }[],
   return typeof last === "number" && isFinite(last) ? last : null;
 }
 
-/**
- * Features simples de candle base (pode enriquecer depois).
- */
+/* =========================
+   Timeframe helpers
+   ========================= */
+function tfToMinutes(tf: string | null | undefined): number | null {
+  if (!tf) return null;
+  const s = String(tf).trim().toUpperCase();
+  if (/^M\d+$/.test(s)) return Number(s.slice(1));
+  if (/^\d+$/.test(s)) return Number(s);
+  if (/^H\d+$/.test(s)) return Number(s.slice(1)) * 60;
+  return null;
+}
+/** Retorna candidatos de TF a testar no where:OR (ex.: "M5" -> ["M5","5"], null -> [null]) */
+function tfCandidates(tf: string | null | undefined): string[] | (string | null)[] {
+  const s = (tf ?? "").toString().trim().toUpperCase();
+  if (!s) return [null];
+  const mins = tfToMinutes(s);
+  const out: (string | null)[] = [s];
+  if (mins != null) out.push(String(mins));
+  out.push(null); // também aceitar null
+  return out;
+}
+
+/* =========================
+   Features do candle
+   ========================= */
 function buildFeatures(candle: {
-  open: number; high: number; low: number; close: number; volume: number;
+  open: number; high: number; low: number; close: number; volume?: number;
   atr?: number | null;
 }) {
-  const range = candle.high - candle.low;
-  const body = Math.abs(candle.close - candle.open);
-  const dir = candle.close >= candle.open ? 1 : -1;
-  const vol = candle.volume ?? 1;
-  const atr = candle.atr ?? 0;
+  const range = Number(candle.high) - Number(candle.low);
+  const body = Math.abs(Number(candle.close) - Number(candle.open));
+  const dir = Number(candle.close) >= Number(candle.open) ? 1 : -1;
+  const vol = Number(candle.volume ?? 1);
+  const atr = Number(candle.atr ?? 0);
 
   return {
     range,
     body,
-    wick_top: candle.high - Math.max(candle.open, candle.close),
-    wick_bottom: Math.min(candle.open, candle.close) - candle.low,
+    wick_top: Number(candle.high) - Math.max(Number(candle.open), Number(candle.close)),
+    wick_bottom: Math.min(Number(candle.open), Number(candle.close)) - Number(candle.low),
     body_ratio: range > 0 ? body / range : 0,
     direction: dir,
     vol,
@@ -114,13 +141,9 @@ function buildFeatures(candle: {
   };
 }
 
-/**
- * Label por PnL: TP vs SL dentro do horizonte.
- * - Entrada: abertura da próxima barra
- * - SL = k_sl * ATR(14) nos candles anteriores
- * - TP = RR * SL
- * - Horizonte: AUTO_TRAINER_HORIZON (em número de barras)
- */
+/* =========================
+   Rotulagem TP/SL por horizonte
+   ========================= */
 async function labelFromSignalPnL(sig: {
   id: number;
   side: "BUY" | "SELL";
@@ -128,8 +151,8 @@ async function labelFromSignalPnL(sig: {
     id: number;
     time: Date;
     instrumentId: number;
-    timeframe: number;
-    open: number; high: number; low: number; close: number; volume: number;
+    timeframe: string | null; // <<======= ajustado
+    open: number; high: number; low: number; close: number; volume?: number;
   };
 }): Promise<{ label: 0 | 1; entry: number; sl: number | null; tp: number | null; atr: number | null }> {
   const H = Math.max(1, Number(process.env.AUTO_TRAINER_HORIZON) || 12);
@@ -137,37 +160,33 @@ async function labelFromSignalPnL(sig: {
   const RR = Number(process.env.AUTO_TRAINER_RR) || 2.0;
 
   const instrId = sig.candle.instrumentId;
-  const tf = sig.candle.timeframe;
+  const tfCands = tfCandidates(sig.candle.timeframe);
   const t0 = sig.candle.time;
 
-  // Carrega candles anteriores (para ATR) e próximos (para horizonte)
+  // ATR(14) com candles anteriores (mesmo instrumento/TF tolerante)
   const ATR_PERIOD = 14;
-
-  // anteriores (pega um pouco mais do que precisa)
   const prev = await prisma.candle.findMany({
     where: {
       instrumentId: instrId,
-      timeframe: tf,
       time: { lte: t0 },
+      OR: (tfCands as any[]).map((v) => ({ timeframe: v })),
     },
     orderBy: { time: "desc" },
-    take: ATR_PERIOD + 2,
+    take: ATR_PERIOD + 60, // sobra
     select: { open: true, high: true, low: true, close: true, time: true },
   });
-  const prevAsc = prev.slice().reverse(); // em ordem cronológica
+  const prevAsc = prev.slice().reverse();
+  const atr = atrFromCandles(
+    prevAsc.map((c) => ({ high: Number(c.high), low: Number(c.low), close: Number(c.close) })),
+    ATR_PERIOD
+  );
 
-  const atr = atrFromCandles(prevAsc.map(c => ({
-    high: Number(c.high),
-    low: Number(c.low),
-    close: Number(c.close),
-  })), ATR_PERIOD);
-
-  // próxima barra (entrada)
+  // Próximas barras (para simular saída até H)
   const next1 = await prisma.candle.findMany({
     where: {
       instrumentId: instrId,
-      timeframe: tf,
       time: { gt: t0 },
+      OR: (tfCands as any[]).map((v) => ({ timeframe: v })),
     },
     orderBy: { time: "asc" },
     take: Math.max(1, H),
@@ -175,17 +194,15 @@ async function labelFromSignalPnL(sig: {
   });
 
   if (!next1?.length) {
-    // Sem futuras barras → não dá para avaliar PnL, marque como 0 conservadoramente
+    // Sem futuras barras → conservadoramente 0
     return { label: 0, entry: Number(sig.candle.close), sl: null, tp: null, atr };
   }
 
-  const entry = Number(
-    Number.isFinite(next1[0].open) ? next1[0].open : next1[0].close
-  );
+  const entry = Number.isFinite(next1[0].open) ? Number(next1[0].open) : Number(next1[0].close);
 
-  // Se não conseguimos ATR, faça um fallback simples (range da barra do sinal)
+  // Fallback ATR (range da barra do sinal) se não houver ATR calculável
   const fallbackATR = Math.max(1e-6, Math.abs(Number(sig.candle.high) - Number(sig.candle.low)));
-  const atrUse = (atr != null && isFinite(atr) && atr > 0) ? atr : fallbackATR;
+  const atrUse = atr && isFinite(atr) && atr > 0 ? atr : fallbackATR;
 
   const slPts = Math.max(atrUse * K_SL, 0);
   const tpPts = Math.max(slPts * RR, 0);
@@ -194,21 +211,18 @@ async function labelFromSignalPnL(sig: {
   const sl = slPts > 0 ? (isBuy ? entry - slPts : entry + slPts) : null;
   const tp = tpPts > 0 ? (isBuy ? entry + tpPts : entry - tpPts) : null;
 
-  // Varre até H barras e vê quem toca primeiro
-  // Empate na mesma barra: prioriza TP
+  // Varre até H barras — empate na mesma barra prioriza TP (política definida)
   let hitLabel: 0 | 1 = 0;
   const N = Math.min(H, next1.length);
   for (let i = 0; i < N; i++) {
-    const c = next1[i];
-    const hi = Number(c.high);
-    const lo = Number(c.low);
+    const bar = next1[i];
+    const hi = Number(bar.high);
+    const lo = Number(bar.low);
 
     if (tp != null && sl != null) {
-      const tpHit = isBuy ? (hi >= tp) : (lo <= tp);
-      const slHit = isBuy ? (lo <= sl) : (hi >= sl);
-
+      const tpHit = isBuy ? hi >= tp : lo <= tp;
+      const slHit = isBuy ? lo <= sl : hi >= sl;
       if (tpHit && slHit) {
-        // mesma barra: prioriza TP
         hitLabel = 1;
         break;
       } else if (tpHit) {
@@ -219,13 +233,13 @@ async function labelFromSignalPnL(sig: {
         break;
       }
     } else if (tp != null) {
-      const tpHit = isBuy ? (hi >= tp) : (lo <= tp);
+      const tpHit = isBuy ? hi >= tp : lo <= tp;
       if (tpHit) {
         hitLabel = 1;
         break;
       }
     } else if (sl != null) {
-      const slHit = isBuy ? (lo <= sl) : (hi >= sl);
+      const slHit = isBuy ? lo <= sl : hi >= sl;
       if (slHit) {
         hitLabel = 0;
         break;
@@ -236,11 +250,14 @@ async function labelFromSignalPnL(sig: {
   return { label: hitLabel, entry, sl, tp, atr };
 }
 
-/** Coleta exemplos a partir dos sinais confirmados mais recentes (evita repetir no mesmo processo). */
+/* =========================
+   Coleta de exemplos
+   ========================= */
 async function collectExamples(limit: number): Promise<TrainExample[]> {
   const notInIds = Array.from(_trainedSignals.values());
   const baseWhere: any = {
-    candleId: { not: null }, // evita `not: Int` inválido
+    signalType: "EMA_CROSS",
+    candleId: { not: null }, // evita erro `not: Int`
   };
   if (notInIds.length > 0) {
     baseWhere.id = { notIn: notInIds };
@@ -258,7 +275,7 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
           id: true,
           time: true,
           instrumentId: true,
-          timeframe: true,
+          timeframe: true, // string | null
           open: true,
           high: true,
           low: true,
@@ -275,7 +292,7 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
   for (const s of signals) {
     if (!s.candle) continue;
 
-    // constrói label por PnL (TP/SL dentro do horizonte)
+    // Rotula via PnL (TP/SL no horizonte)
     const pnl = await labelFromSignalPnL({
       id: s.id,
       side: s.side as any,
@@ -283,7 +300,7 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
         id: s.candle.id,
         time: s.candle.time as any,
         instrumentId: s.candle.instrumentId as any,
-        timeframe: s.candle.timeframe as any,
+        timeframe: (s.candle.timeframe as string | null) ?? null,
         open: Number(s.candle.open),
         high: Number(s.candle.high),
         low: Number(s.candle.low),
@@ -315,6 +332,9 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
   return out;
 }
 
+/* =========================
+   Loop de treino
+   ========================= */
 async function onePass() {
   _lastRunAt = new Date();
   _lastError = null;
@@ -340,7 +360,8 @@ async function onePass() {
       batchSize: Math.max(16, Math.min(1024, examples.length)),
       data: examples,
     };
-    const resp = await httpPostJSON<{ ok?: boolean; trained?: number; msg?: string }>(url, payload, 15_000);
+
+    const resp = await httpPostJSON<{ ok?: boolean; trained?: number; msg?: string }>(url, payload, 60_000);
 
     for (const ex of examples) {
       const sid = Number(ex.meta?.signalId);
@@ -349,10 +370,7 @@ async function onePass() {
     _stats.sent += examples.length;
     _stats.batches += 1;
 
-    logger.info("[AutoTrainer] train OK", {
-      examples: examples.length,
-      resp,
-    });
+    logger.info("[AutoTrainer] train OK", { examples: examples.length, resp });
     return { ok: true, sent: examples.length, resp };
   } catch (e: any) {
     _lastError = e?.message || String(e);
