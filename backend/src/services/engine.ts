@@ -4,7 +4,7 @@ import { prisma } from "../prisma";
 /**
  * Motor de projeção de sinais:
  * - Busca candles do símbolo/timeframe pedidos
- * - Calcula indicadores básicos (EMA9, EMA21, ATR14)
+ * - Calcula indicadores básicos (EMA9, EMA21, ATR14, VWAP simples)
  * - Gera sinais heurísticos (cross EMA + breakout simples) com score
  * - Se houver MICRO_MODEL_URL e /predict responder, repondera o score (opcional)
  *
@@ -17,6 +17,9 @@ type Params = {
   from?: string;
   to?: string;
   limit?: number;
+  vwapFilter?: boolean; // <-- respeitado aqui, lado-sensível
+  minEV?: number; // <-- EV SELL normalizado para positivo
+  minProb?: number; // (se houver prob vindo da IA)
   [k: string]: any;
 };
 
@@ -37,6 +40,14 @@ type Projected = {
   reason: string;
   symbol: string;
   timeframe: string;
+  // campos opcionais que podem aparecer quando IA está ligada:
+  prob?: number;
+  expectedValuePoints?: number;
+  ev?: number;
+  expectedValue?: number;
+  expected_value?: number;
+  // enriquecimento local:
+  vwapOk?: boolean;
 };
 
 const tfToMinutes = (tfRaw: string) => {
@@ -103,6 +114,25 @@ function ATR(
   }
   return out;
 }
+/** VWAP acumulada simples (typical price * volume / soma volumes). */
+function VWAP(
+  high: number[],
+  low: number[],
+  close: number[],
+  volume: number[]
+): number[] {
+  const out: number[] = [];
+  let cumPV = 0;
+  let cumV = 0;
+  for (let i = 0; i < close.length; i++) {
+    const typical = (high[i] + low[i] + close[i]) / 3;
+    const v = Math.max(0, volume[i] || 0);
+    cumPV += typical * v;
+    cumV += v;
+    out.push(cumV > 0 ? cumPV / cumV : typical);
+  }
+  return out;
+}
 
 /* ---------------- Heurística de sinais ---------------- */
 function buildHeuristicSignals(
@@ -125,7 +155,6 @@ function buildHeuristicSignals(
   const N = 10;
   for (let i = 2; i < candles.length; i++) {
     const c = candles[i];
-    const prev = candles[i - 1];
 
     const ema9 = e9[i] ?? closes[i];
     const ema21 = e21[i] ?? closes[i];
@@ -173,8 +202,9 @@ function buildHeuristicSignals(
   // Se nada gatilhou, dá um “palpite” suave no último candle conforme inclinação das EMAs
   if (out.length === 0) {
     const i = candles.length - 1;
-    const ema9 = e9[i] ?? closes[i];
-    const ema21 = e21[i] ?? closes[i];
+    const closes = candles.map((c) => c.close);
+    const e9 = EMA(closes, 9);
+    const e21 = EMA(closes, 21);
     const slope9 = (e9[i] ?? closes[i]) - (e9[i - 1] ?? closes[i - 1]);
     const slope21 = (e21[i] ?? closes[i]) - (e21[i - 1] ?? closes[i - 1]);
     const bias = slope9 + 0.5 * slope21;
@@ -206,11 +236,8 @@ async function rescoreWithML(
   try {
     const base = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
     if (!base) return items;
-    // Monta features simples para os tempos dos sinais
+
     const times = new Set(items.map((i) => i.time));
-    const mapByIso = new Map<string, Candle>(
-      candles.map((c) => [c.time.toISOString(), c])
-    );
     const closes = candles.map((c) => c.close);
     const e9 = EMA(closes, 9);
     const e21 = EMA(closes, 21);
@@ -358,6 +385,60 @@ export async function generateProjectedSignals(
 
     // Opcional: IA reponderando (se disponível)
     items = await rescoreWithML(items, tail);
+
+    // === Enriquecimento com VWAP (lado-sensível) ===
+    // Calcula VWAP na mesma janela, e marca cada sinal com vwapOk: BUY => close>=VWAP; SELL => close<=VWAP.
+    const highs = tail.map((c) => c.high);
+    const lows = tail.map((c) => c.low);
+    const closes = tail.map((c) => c.close);
+    const volumes = tail.map((c) => Number(c.volume ?? 0));
+    const vwap = VWAP(highs, lows, closes, volumes);
+    const isoToIndex = new Map(tail.map((c, i) => [c.time.toISOString(), i]));
+
+    items = items.map((s: Projected) => {
+      const idx = isoToIndex.get(s.time);
+      if (idx == null) return s;
+      const ok =
+        s.side === "BUY" ? closes[idx] >= vwap[idx] : closes[idx] <= vwap[idx];
+      return { ...s, vwapOk: ok };
+    });
+
+    // === Filtro vwapFilter (se solicitado) ===
+    if (params?.vwapFilter) {
+      items = items.filter((s) => s.vwapOk !== false);
+    }
+
+    // === NORMALIZAÇÃO DE SINAL DO EV (SELL => EV positivo) ===
+    items = items.map((s: any) => {
+      const side = String(s?.side || "").toUpperCase();
+      const out: any = { ...s };
+      for (const f of [
+        "expectedValuePoints",
+        "ev",
+        "expectedValue",
+        "expected_value",
+      ]) {
+        if (out[f] != null && isFinite(Number(out[f]))) {
+          const val = Number(out[f]);
+          out[f] = side === "SELL" ? -val : val;
+        }
+      }
+      return out as Projected;
+    });
+
+    // (opcional) Respeitar minProb / minEV aqui também, se vierem nos params:
+    if (typeof params?.minProb === "number") {
+      items = items.filter(
+        (s: any) => typeof s.prob !== "number" || s.prob >= params.minProb!
+      );
+    }
+    if (typeof params?.minEV === "number") {
+      items = items.filter((s: any) => {
+        const ev =
+          s.expectedValuePoints ?? s.ev ?? s.expectedValue ?? s.expected_value;
+        return typeof ev !== "number" || ev >= params.minEV!;
+      });
+    }
 
     return items;
   } catch (e: any) {

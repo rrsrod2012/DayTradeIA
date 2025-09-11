@@ -1,5 +1,8 @@
 import React from "react";
-import { useAIStore } from "../store/ai";
+import * as AIStoreModule from "../store/ai";
+const useAIStore: any =
+  (AIStoreModule as any).useAIStore ?? (AIStoreModule as any).default;
+
 
 function pct(x: number) {
   return (x * 100).toFixed(1) + "%";

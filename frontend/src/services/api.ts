@@ -49,12 +49,36 @@ const API_BASE = (RAW_API_BASE as string).replace(/\/$/, "");
 
 /** --------- Helpers --------- */
 function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
-  if (val == null) return "FLAT";
-  const s = String(val).toUpperCase();
-  // cobre variações comuns
-  if (s.includes("BUY") || s.includes("LONG") || s === "1") return "BUY";
-  if (s.includes("SELL") || s.includes("SHORT") || s === "-1") return "SELL";
-  return "FLAT";
+  // Tornar SELL extremamente tolerante: cobre diversas variações.
+  const s = String(val ?? "")
+    .trim()
+    .toUpperCase();
+  if (
+    s === "SELL" ||
+    s === "SHORT" ||
+    s === "S" ||
+    s === "-1" ||
+    s === "DOWN" ||
+    s.includes("SELL") ||
+    s.includes("SHORT")
+  ) {
+    return "SELL";
+  }
+  if (
+    s === "BUY" ||
+    s === "LONG" ||
+    s === "B" ||
+    s === "1" ||
+    s === "UP" ||
+    s.includes("BUY") ||
+    s.includes("LONG")
+  ) {
+    return "BUY";
+  }
+  // Mantém FLAT apenas se explicitamente neutro
+  if (s === "FLAT" || s === "NEUTRAL" || s === "0") return "FLAT";
+  // Por segurança, se não reconheceu e havia algum valor, prefira NÃO eliminar (assume BUY)
+  return "BUY";
 }
 
 function toISO(t: any): string | undefined {
@@ -94,7 +118,10 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const txt = await resp.text();
   const data = txt ? JSON.parse(txt) : null;
   const backendErr =
-    data && typeof data === "object" && "ok" in data && (data as any).ok === false;
+    data &&
+    typeof data === "object" &&
+    "ok" in data &&
+    (data as any).ok === false;
 
   if (!resp.ok || backendErr) {
     const msg =
@@ -130,12 +157,27 @@ export async function projectedSignals(
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
 
     const iso = toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime);
-    const date =
-      s.date ??
-      (iso ? ymdLocalFromISO(iso) : null); // se backend não mandar, derivamos do ISO
+    const date = s.date ?? (iso ? ymdLocalFromISO(iso) : null); // se backend não mandar, derivamos do ISO
 
     // coerção numérica sem engolir 0
     const num = (v: any) => (v === undefined || v === null ? null : Number(v));
+
+    // EV bruto (pode vir como expectedValuePoints/ev/etc)
+    let evRaw =
+      s.expectedValuePoints ??
+      s.ev ??
+      s.expectedValue ??
+      s.expected_value ??
+      null;
+    evRaw = evRaw === null || evRaw === undefined ? null : Number(evRaw);
+
+    // === NORMALIZAÇÃO DO EV NO CLIENTE (SELL => EV positivo) ===
+    // Isso garante que filtros minEV=0 no backend/frontend não excluam SELL por sinal trocado.
+    let expectedValuePoints: number | null =
+      evRaw === null || !Number.isFinite(evRaw) ? null : evRaw;
+    if (expectedValuePoints !== null && side === "SELL") {
+      expectedValuePoints = Math.abs(expectedValuePoints);
+    }
 
     return {
       side,
@@ -145,9 +187,9 @@ export async function projectedSignals(
       conditionText: s.conditionText ?? s.note ?? s.reason ?? null,
       score: num(s.score),
       probHit: s.probHit != null ? Number(s.probHit) : null,
-      probCalibrated: s.probCalibrated != null ? Number(s.probCalibrated) : null,
-      expectedValuePoints:
-        s.expectedValuePoints != null ? Number(s.expectedValuePoints) : s.ev != null ? Number(s.ev) : null,
+      probCalibrated:
+        s.probCalibrated != null ? Number(s.probCalibrated) : null,
+      expectedValuePoints,
       time: iso,
       date,
     };
@@ -168,7 +210,9 @@ export async function fetchConfirmedSignals(params: {
   if (params.to) q.set("to", params.to);
   if (params.limit) q.set("limit", String(params.limit));
 
-  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, { method: "GET" });
+  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, {
+    method: "GET",
+  });
 
   const arr: any[] =
     (Array.isArray(raw) && raw) ||
@@ -181,14 +225,18 @@ export async function fetchConfirmedSignals(params: {
   return arr.map((s) => {
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
     const iso =
-      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ?? new Date().toISOString();
+      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ??
+      new Date().toISOString();
 
-    const price =
-      s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
-    const note =
-      s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
+    const price = s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
+    const note = s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
 
-    return { side, time: iso, price: price != null ? Number(price) : null, note };
+    return {
+      side,
+      time: iso,
+      price: price != null ? Number(price) : null,
+      note,
+    };
   });
 }
 

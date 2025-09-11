@@ -1,5 +1,7 @@
 import React from "react";
-import { useAIStore } from "../store/ai";
+import * as AIStoreModule from "../store/ai";
+const useAIStore: any =
+  (AIStoreModule as any).useAIStore ?? (AIStoreModule as any).default;
 
 export default function AIConfirmedPanel() {
   const rows = useAIStore((s) => s.confirmed);
