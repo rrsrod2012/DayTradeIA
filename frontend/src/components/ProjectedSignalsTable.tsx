@@ -1,5 +1,5 @@
-import React, { useMemo } from "react";
-import { Table, Badge } from "react-bootstrap";
+import React, { useMemo, useState } from "react";
+import { Table, Badge, Form } from "react-bootstrap";
 
 type Item = {
   time?: string | null; // ISO
@@ -30,17 +30,21 @@ type Visible = {
 
 type Props = { items?: Item[]; visibleCols?: Visible };
 
-function SideBadge({ side }: { side?: string | null }) {
-  const s = String(side || "").toUpperCase();
-  const variant =
-    s === "BUY" ? "success" : s === "SELL" ? "danger" : "secondary";
-  return <Badge bg={variant}>{s || "-"}</Badge>;
+function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
+  if (val == null) return "FLAT";
+  const s = String(val).toUpperCase();
+  if (s.includes("BUY") || s.includes("LONG") || s === "1") return "BUY";
+  if (s.includes("SELL") || s.includes("SHORT") || s === "-1") return "SELL";
+  return "FLAT";
 }
 
-export default function ProjectedSignalsTable({
-  items = [],
-  visibleCols,
-}: Props) {
+function SideBadge({ side }: { side?: string | null }) {
+  const s = normalizeSide(side);
+  const variant = s === "BUY" ? "success" : s === "SELL" ? "danger" : "secondary";
+  return <Badge bg={variant}>{s}</Badge>;
+}
+
+export default function ProjectedSignalsTable({ items = [], visibleCols }: Props) {
   const v = {
     date: true,
     time: true,
@@ -55,39 +59,40 @@ export default function ProjectedSignalsTable({
     ...(visibleCols || {}),
   };
 
+  // Filtro de Side (ALL/BUY/SELL/FLAT)
+  const [sideFilter, setSideFilter] = useState<"ALL" | "BUY" | "SELL" | "FLAT">("ALL");
+
   const rows = useMemo(() => {
     const safe = Array.isArray(items) ? items : [];
     return safe
-      .map((s) => ({
-        time: s?.time ?? null,
-        date: s?.date ?? null,
-        side: s?.side ?? "-",
-        suggestedEntry: Number.isFinite(s?.suggestedEntry as number)
-          ? (s!.suggestedEntry as number)
-          : null,
-        stopSuggestion: Number.isFinite(s?.stopSuggestion as number)
-          ? (s!.stopSuggestion as number)
-          : null,
-        takeProfitSuggestion: Number.isFinite(s?.takeProfitSuggestion as number)
-          ? (s!.takeProfitSuggestion as number)
-          : null,
-        conditionText: s?.conditionText ?? null,
-        score: Number.isFinite(s?.score as number)
-          ? (s!.score as number)
-          : null,
-        prob: Number.isFinite((s?.probCalibrated ?? s?.probHit) as number)
-          ? ((s!.probCalibrated ?? s!.probHit) as number)
-          : null,
-        ev: Number.isFinite(s?.expectedValuePoints as number)
-          ? (s!.expectedValuePoints as number)
-          : null,
-      }))
+      .map((s) => {
+        const side = normalizeSide(s?.side ?? "-");
+        const time = s?.time ?? null;
+        const date = s?.date ?? null;
+        const n = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : null);
+
+        return {
+          time,
+          date,
+          side,
+          suggestedEntry: n(s?.suggestedEntry),
+          stopSuggestion: n(s?.stopSuggestion),
+          takeProfitSuggestion: n(s?.takeProfitSuggestion),
+          conditionText: s?.conditionText ?? null,
+          score: n(s?.score),
+          prob: n(s?.probCalibrated ?? s?.probHit),
+          ev: n(s?.expectedValuePoints),
+        };
+      })
+      // filtro por side
+      .filter((r) => (sideFilter === "ALL" ? true : r.side === sideFilter))
+      // mais recentes primeiro
       .sort((a, b) => {
         const ta = a.time ? new Date(a.time).getTime() : 0;
         const tb = b.time ? new Date(b.time).getTime() : 0;
-        return ta - tb;
+        return tb - ta;
       });
-  }, [items]);
+  }, [items, sideFilter]);
 
   if (!rows.length) {
     return (
@@ -99,6 +104,22 @@ export default function ProjectedSignalsTable({
 
   return (
     <div style={{ overflowX: "auto" }}>
+      {/* Barra de filtro (lado direito) */}
+      <div className="d-flex justify-content-end mb-2" style={{ gap: 8 }}>
+        <Form.Select
+          size="sm"
+          style={{ width: 140 }}
+          value={sideFilter}
+          onChange={(e) => setSideFilter(e.target.value as any)}
+          aria-label="Filtrar por side"
+        >
+          <option value="ALL">Side: ALL</option>
+          <option value="BUY">Side: BUY</option>
+          <option value="SELL">Side: SELL</option>
+          <option value="FLAT">Side: FLAT</option>
+        </Form.Select>
+      </div>
+
       <Table striped bordered hover size="sm">
         <thead>
           <tr>
@@ -118,17 +139,10 @@ export default function ProjectedSignalsTable({
           {rows.map((r, i) => (
             <tr key={i}>
               {v.date && (
-                <td>
-                  {r.date ??
-                    (r.time ? new Date(r.time).toLocaleDateString() : "-")}
-                </td>
+                <td>{r.date ?? (r.time ? new Date(r.time).toLocaleDateString() : "-")}</td>
               )}
               {v.time && (
-                <td>
-                  {r.time
-                    ? new Date(r.time).toLocaleTimeString().slice(0, 5)
-                    : "-"}
-                </td>
+                <td>{r.time ? new Date(r.time).toLocaleTimeString().slice(0, 5) : "-"}</td>
               )}
               {v.side && (
                 <td>
@@ -151,21 +165,11 @@ export default function ProjectedSignalsTable({
                   {r.conditionText ?? "-"}
                 </td>
               )}
-              {v.score && (
-                <td>
-                  {typeof r.score === "number" ? r.score.toFixed(2) : "-"}
-                </td>
-              )}
+              {v.score && <td>{typeof r.score === "number" ? r.score.toFixed(2) : "-"}</td>}
               {v.prob && (
-                <td>
-                  {typeof r.prob === "number"
-                    ? `${(r.prob * 100).toFixed(1)}%`
-                    : "-"}
-                </td>
+                <td>{typeof r.prob === "number" ? `${(r.prob * 100).toFixed(1)}%` : "-"}</td>
               )}
-              {v.ev && (
-                <td>{typeof r.ev === "number" ? r.ev.toFixed(2) : "-"}</td>
-              )}
+              {v.ev && <td>{typeof r.ev === "number" ? r.ev.toFixed(2) : "-"}</td>}
             </tr>
           ))}
         </tbody>

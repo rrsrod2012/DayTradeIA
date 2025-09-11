@@ -19,8 +19,8 @@ export type ProjectedSignal = {
   probHit?: number | null;
   probCalibrated?: number | null;
   expectedValuePoints?: number | null;
-  time?: string;
-  date?: string;
+  time?: string; // ISO
+  date?: string | null; // YYYY-MM-DD no local (ou do backend)
 };
 
 export type ConfirmedSignal = {
@@ -47,6 +47,36 @@ export type ProjectedSignalsParams = {
 const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
 const API_BASE = (RAW_API_BASE as string).replace(/\/$/, "");
 
+/** --------- Helpers --------- */
+function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
+  if (val == null) return "FLAT";
+  const s = String(val).toUpperCase();
+  // cobre variações comuns
+  if (s.includes("BUY") || s.includes("LONG") || s === "1") return "BUY";
+  if (s.includes("SELL") || s.includes("SHORT") || s === "-1") return "SELL";
+  return "FLAT";
+}
+
+function toISO(t: any): string | undefined {
+  if (!t && t !== 0) return undefined;
+  if (typeof t === "string") {
+    // se já é ISO com timezone, mantém; senão converte
+    return /Z$|[+-]\d{2}:?\d{2}$/.test(t) ? t : new Date(t).toISOString();
+  }
+  if (t instanceof Date) return t.toISOString();
+  if (typeof t === "number") return new Date(t).toISOString();
+  return undefined;
+}
+
+function ymdLocalFromISO(iso?: string): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 /** Fetch JSON com tratamento de erro padrão do backend (ok=false) */
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl =
@@ -55,7 +85,6 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 
   const resp = await fetch(fullUrl, {
     headers: { "content-type": "application/json", ...(init?.headers || {}) },
-    // ⚠️ CORS: sem cookies/credenciais (o backend usa ACAO: *)
     credentials: "omit",
     mode: "cors",
     cache: "no-cache",
@@ -65,10 +94,7 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const txt = await resp.text();
   const data = txt ? JSON.parse(txt) : null;
   const backendErr =
-    data &&
-    typeof data === "object" &&
-    "ok" in data &&
-    (data as any).ok === false;
+    data && typeof data === "object" && "ok" in data && (data as any).ok === false;
 
   if (!resp.ok || backendErr) {
     const msg =
@@ -91,45 +117,41 @@ export async function projectedSignals(
     body: JSON.stringify(params),
   });
 
-  let arr: any[] = [];
-  if (Array.isArray(raw)) arr = raw;
-  else if (Array.isArray(raw?.data)) arr = raw.data;
-  else if (Array.isArray(raw?.rows)) arr = raw.rows;
-  else if (Array.isArray(raw?.signals)) arr = raw.signals;
-  else if (Array.isArray(raw?.items)) arr = raw.items;
+  // aceita vários formatos {data|rows|signals|items} ou array direto
+  const arr: any[] =
+    (Array.isArray(raw) && raw) ||
+    raw?.data ||
+    raw?.rows ||
+    raw?.signals ||
+    raw?.items ||
+    [];
 
-  const out: ProjectedSignal[] = arr.map((s) => {
-    const sideRaw = s.side ?? s.direction ?? s.type ?? s.signalSide;
-    const side = String(sideRaw || "").toUpperCase();
-    const normSide: "BUY" | "SELL" | "FLAT" = side.includes("BUY")
-      ? "BUY"
-      : side.includes("SELL")
-      ? "SELL"
-      : "FLAT";
+  return arr.map((s) => {
+    const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
 
-    const t = s.time ?? s.timestamp ?? s.date ?? s.datetime;
-    let iso: string | undefined;
-    if (typeof t === "string")
-      iso = t.match(/Z$|[+-]\d{2}:?\d{2}$/) ? t : new Date(t).toISOString();
-    else if (t instanceof Date) iso = t.toISOString();
-    else if (typeof t === "number") iso = new Date(t).toISOString();
+    const iso = toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime);
+    const date =
+      s.date ??
+      (iso ? ymdLocalFromISO(iso) : null); // se backend não mandar, derivamos do ISO
+
+    // coerção numérica sem engolir 0
+    const num = (v: any) => (v === undefined || v === null ? null : Number(v));
 
     return {
-      side: normSide,
-      suggestedEntry: s.suggestedEntry ?? s.entry ?? null,
-      stopSuggestion: s.stopSuggestion ?? s.sl ?? s.stop ?? null,
-      takeProfitSuggestion: s.takeProfitSuggestion ?? s.tp ?? null,
+      side,
+      suggestedEntry: num(s.suggestedEntry ?? s.entry),
+      stopSuggestion: num(s.stopSuggestion ?? s.sl ?? s.stop),
+      takeProfitSuggestion: num(s.takeProfitSuggestion ?? s.tp),
       conditionText: s.conditionText ?? s.note ?? s.reason ?? null,
-      score: s.score ?? null,
-      probHit: s.probHit ?? s.prob ?? null,
-      probCalibrated: s.probCalibrated ?? null,
-      expectedValuePoints: s.expectedValuePoints ?? s.ev ?? null,
+      score: num(s.score),
+      probHit: s.probHit != null ? Number(s.probHit) : null,
+      probCalibrated: s.probCalibrated != null ? Number(s.probCalibrated) : null,
+      expectedValuePoints:
+        s.expectedValuePoints != null ? Number(s.expectedValuePoints) : s.ev != null ? Number(s.ev) : null,
       time: iso,
-      date: s.date ?? null,
+      date,
     };
   });
-
-  return out;
 }
 
 export async function fetchConfirmedSignals(params: {
@@ -146,45 +168,28 @@ export async function fetchConfirmedSignals(params: {
   if (params.to) q.set("to", params.to);
   if (params.limit) q.set("limit", String(params.limit));
 
-  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, {
-    method: "GET",
+  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, { method: "GET" });
+
+  const arr: any[] =
+    (Array.isArray(raw) && raw) ||
+    raw?.data ||
+    raw?.rows ||
+    raw?.signals ||
+    raw?.items ||
+    [];
+
+  return arr.map((s) => {
+    const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
+    const iso =
+      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ?? new Date().toISOString();
+
+    const price =
+      s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
+    const note =
+      s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
+
+    return { side, time: iso, price: price != null ? Number(price) : null, note };
   });
-
-  let arr: any[] = [];
-  if (Array.isArray(raw)) arr = raw;
-  else if (Array.isArray(raw?.data)) arr = raw.data;
-  else if (Array.isArray(raw?.rows)) arr = raw.rows;
-  else if (Array.isArray(raw?.signals)) arr = raw.signals;
-  else if (Array.isArray(raw?.items)) arr = raw.items;
-
-  const out: ConfirmedSignal[] = arr.map((s) => {
-    const sideRaw = s.side ?? s.direction ?? s.type ?? s.signalSide;
-    const side = String(sideRaw || "").toUpperCase();
-    const normSide: "BUY" | "SELL" | "FLAT" = side.includes("BUY")
-      ? "BUY"
-      : side.includes("SELL")
-      ? "SELL"
-      : "FLAT";
-
-    const t = s.time ?? s.timestamp ?? s.date ?? s.datetime;
-    let iso: string;
-    if (typeof t === "string") {
-      iso = t.match(/Z$|[+-]\d{2}:?\d{2}$/) ? t : new Date(t).toISOString();
-    } else if (t instanceof Date) {
-      iso = t.toISOString();
-    } else if (typeof t === "number") {
-      iso = new Date(t).toISOString();
-    } else {
-      iso = new Date().toISOString();
-    }
-
-    const price = s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
-    const note = s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
-
-    return { side: normSide, time: iso, price, note };
-  });
-
-  return out;
 }
 
 export async function runBacktest(params: {
