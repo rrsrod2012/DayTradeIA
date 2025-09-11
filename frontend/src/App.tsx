@@ -28,10 +28,6 @@ export default function App() {
 
       {/* Resumo de PnL (backtest) */}
       <AIPnLPanel />
-
-      {/* Trades (respeita símbolo/TF e intervalo do filtro) */}
-      <AITradesPanel />
-
     </AIControlsProvider>
   );
 }

@@ -108,6 +108,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const setProjected = useAIStore((s) => s.setProjected);
   const setConfirmed = useAIStore((s) => s.setConfirmed);
   const setPnL = useAIStore((s) => s.setPnL);
+  const setTrades = useAIStore((s) => s.setTrades);
 
   const baseParams = React.useCallback(
     () => ({
@@ -123,7 +124,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     [symbol, timeframe, from, to]
   );
 
-  /** Busca PROJETADOS + CONFIRMADOS + PnL de uma vez só */
+  /** Busca PROJETADOS + CONFIRMADOS + PnL + Trades */
   async function fetchAllOnce() {
     setLoading(true);
     setErr(null);
@@ -182,8 +183,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       const conf = await fetchConfirmedSignals({ ...params, limit: 2000 });
       setConfirmed(conf || [], params);
 
-      // 3) PnL
+      // 3) Backtest (PnL + Trades)
       const bt = await runBacktest(params as any);
+
       const sum = bt?.summary || null;
       setPnL(
         sum
@@ -201,6 +203,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
             }
           : null
       );
+
+      // Captura trades (várias chaves possíveis)
+      const rawTrades =
+        (Array.isArray(bt?.trades) && bt?.trades) ||
+        (Array.isArray(bt?.rows) && bt?.rows) ||
+        (Array.isArray(bt?.items) && bt?.items) ||
+        (Array.isArray(bt?.data) && bt?.data) ||
+        [];
+
+      setTrades(rawTrades);
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
     } finally {

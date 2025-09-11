@@ -14,6 +14,18 @@ type PnLSummary = {
   maxDrawdown: number;
 } | null;
 
+export type Trade = {
+  side: "BUY" | "SELL";
+  entryTime: string; // ISO
+  exitTime?: string | null; // ISO
+  entryPrice?: number | null;
+  exitPrice?: number | null;
+  pnlPoints?: number | null;
+  pnlMoney?: number | null;
+  rr?: number | null;
+  note?: string | null;
+};
+
 type AIState = {
   // filtros usados na última consulta (qualquer tipo)
   lastParams: Record<string, any> | null;
@@ -22,11 +34,13 @@ type AIState = {
   projected: ProjectedSignal[];
   confirmed: ConfirmedSignal[];
   pnl: PnLSummary;
+  trades: Trade[];
 
   // setters
   setProjected: (rows: ProjectedSignal[], params?: Record<string, any>) => void;
   setConfirmed: (rows: ConfirmedSignal[], params?: Record<string, any>) => void;
   setPnL: (summary: PnLSummary) => void;
+  setTrades: (rows: any[], meta?: any) => void; // meta opcional para pointValue
   clear: () => void;
 };
 
@@ -58,7 +72,7 @@ function normSide(raw: any): "BUY" | "SELL" | "FLAT" {
     return "BUY";
   }
   if (s === "FLAT" || s === "NEUTRAL" || s === "0") return "FLAT";
-  // fallback: não descartar; assume BUY para não sumir com o ponto
+  // fallback: assume BUY para não sumir com o ponto
   return "BUY";
 }
 
@@ -82,11 +96,174 @@ function normalizeEVForSide(
   return side === "SELL" ? Math.abs(n) : n;
 }
 
+function toISO(t: any): string | null {
+  if (!t && t !== 0) return null;
+  if (typeof t === "string") {
+    return /Z$|[+-]\d{2}:?\d{2}$/.test(t) ? t : new Date(t).toISOString();
+  }
+  if (t instanceof Date) return t.toISOString();
+  if (typeof t === "number") return new Date(t).toISOString();
+  return null;
+}
+
+// Normalização de trade (suporta vários formatos de backend)
+function normalizeTrade(row: any): Trade | null {
+  if (!row || typeof row !== "object") return null;
+
+  const side = normSide(
+    row.side ?? row.direction ?? row.type ?? row.signalSide ?? row.position
+  );
+  if (side === "FLAT") return null;
+
+  const entryTime =
+    toISO(
+      row.entryTime ??
+        row.openTime ??
+        row.inTime ??
+        row.timeIn ??
+        row.time_open ??
+        row.start ??
+        row.time
+    ) || new Date().toISOString();
+
+  const exitTime =
+    toISO(
+      row.exitTime ??
+        row.closeTime ??
+        row.outTime ??
+        row.timeOut ??
+        row.time_close ??
+        row.end ??
+        row.closeAt
+    ) || null;
+
+  const num = (v: any) => (v === undefined || v === null ? null : Number(v));
+
+  const entryPrice = num(
+    row.entryPrice ?? row.openPrice ?? row.priceIn ?? row.entry
+  );
+  const exitPrice = num(
+    row.exitPrice ?? row.closePrice ?? row.priceOut ?? row.exit
+  );
+
+  const pnlPoints = num(
+    row.pnlPoints ??
+      row.pnl_points ??
+      row.points ??
+      row.plPoints ??
+      row.resultPoints ??
+      row.pnl
+  );
+  const pnlMoney = num(
+    row.pnlMoney ?? row.plMoney ?? row.money ?? row.resultMoney
+  );
+  const rr = num(
+    row.rr ?? row.rmult ?? row.rMultiple ?? row.rMultipleCalc ?? row.RR
+  );
+
+  const note =
+    row.note ??
+    row.reason ??
+    row.comment ??
+    row.conditionText ??
+    row.obs ??
+    null;
+
+  return {
+    side: side as "BUY" | "SELL",
+    entryTime,
+    exitTime,
+    entryPrice,
+    exitPrice,
+    pnlPoints,
+    pnlMoney,
+    rr,
+    note,
+  };
+}
+
+/* ---------- Config dinâmica para PnL$ e RR ----------
+
+Você pode definir em runtime (no index.html, por exemplo):
+
+  <script>
+    window.DAYTRADE_CFG = {
+      pointValueBySymbol: { WIN: 1.0, WDO: 10.0 },
+      defaultRiskPoints: 100
+    }
+  </script>
+
+Ou via .env do Vite:
+  VITE_POINT_VALUE_WIN=1.0
+  VITE_POINT_VALUE_WDO=10
+  VITE_DEFAULT_RISK_POINTS=100
+
+O store usa nessa ordem:
+  meta.pointValue (do backtest) > window.DAYTRADE_CFG > variáveis .env
+------------------------------------------------------- */
+
+declare global {
+  interface Window {
+    DAYTRADE_CFG?: {
+      pointValueBySymbol?: Record<string, number>;
+      defaultRiskPoints?: number;
+    };
+  }
+}
+
+function readEnvPointValue(symbol: string): number | null {
+  const key = `VITE_POINT_VALUE_${symbol}`;
+  const val =
+    (import.meta as any)?.env?.[key] ??
+    (import.meta as any)?.env?.[key.toUpperCase()];
+  const n = Number(val);
+  return Number.isFinite(n) ? n : null;
+}
+function readEnvDefaultRiskPoints(): number | null {
+  const val = (import.meta as any)?.env?.VITE_DEFAULT_RISK_POINTS;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : null;
+}
+
+function inferPointValue(
+  symbol: string | undefined,
+  meta?: any
+): number | null {
+  // 1) meta.pointValue do backtest
+  const m = meta?.pointValue ?? meta?.meta?.pointValue;
+  if (m != null && Number.isFinite(Number(m))) return Number(m);
+
+  const sym = String(symbol || "").toUpperCase();
+  // 2) window.DAYTRADE_CFG
+  const byWin = window?.DAYTRADE_CFG?.pointValueBySymbol?.[sym];
+  if (byWin != null && Number.isFinite(Number(byWin))) return Number(byWin);
+  // 3) .env
+  const fromEnv = readEnvPointValue(sym);
+  if (fromEnv != null) return fromEnv;
+
+  return null; // sem palpite perigoso
+}
+
+function inferDefaultRiskPoints(meta?: any): number | null {
+  // 1) do backtest meta
+  const m = meta?.defaultRiskPoints ?? meta?.meta?.defaultRiskPoints;
+  if (m != null && Number.isFinite(Number(m))) return Number(m);
+  // 2) window
+  const byWin = window?.DAYTRADE_CFG?.defaultRiskPoints;
+  if (byWin != null && Number.isFinite(Number(byWin))) return Number(byWin);
+  // 3) .env
+  const fromEnv = readEnvDefaultRiskPoints();
+  if (fromEnv != null) return fromEnv;
+
+  return null;
+}
+
 const useAIStore = create<AIState>((set) => ({
   lastParams: null,
   projected: [],
   confirmed: [],
   pnl: null,
+  trades: [],
 
   setProjected: (rows, params) =>
     set(() => {
@@ -184,10 +361,82 @@ const useAIStore = create<AIState>((set) => ({
 
   setPnL: (summary) => set(() => ({ pnl: summary })),
 
+  setTrades: (rows, meta) =>
+    set((state) => {
+      // detecta coleção
+      const src = Array.isArray(rows)
+        ? rows
+        : Array.isArray(rows?.data)
+        ? rows.data
+        : Array.isArray(rows?.rows)
+        ? rows.rows
+        : Array.isArray(rows?.items)
+        ? rows.items
+        : [];
+
+      const mapped = src
+        .map((r) => normalizeTrade(r))
+        .filter((x): x is Trade => !!x);
+
+      // Fallbacks para pnlMoney e rr
+      const symbol =
+        String(state.lastParams?.symbol || "").toUpperCase() || undefined;
+      const pointValue = inferPointValue(symbol, meta ?? rows);
+      const defaultRiskPoints = inferDefaultRiskPoints(meta ?? rows);
+
+      for (const t of mapped) {
+        // PnL em $
+        if (
+          (t.pnlMoney == null || !Number.isFinite(Number(t.pnlMoney))) &&
+          t.pnlPoints != null &&
+          Number.isFinite(Number(t.pnlPoints)) &&
+          pointValue != null &&
+          Number.isFinite(Number(pointValue))
+        ) {
+          t.pnlMoney = Number(t.pnlPoints) * Number(pointValue);
+        }
+
+        // R/R
+        if (t.rr == null || !Number.isFinite(Number(t.rr))) {
+          if (
+            t.pnlPoints != null &&
+            Number.isFinite(Number(t.pnlPoints)) &&
+            defaultRiskPoints != null &&
+            Number.isFinite(Number(defaultRiskPoints)) &&
+            Number(defaultRiskPoints) !== 0
+          ) {
+            t.rr = Number(t.pnlPoints) / Number(defaultRiskPoints);
+          }
+        }
+      }
+
+      if (process.env.NODE_ENV !== "production") {
+        // eslint-disable-next-line no-console
+        const buy = mapped.filter((t) => t.side === "BUY").length;
+        const sell = mapped.filter((t) => t.side === "SELL").length;
+        console.log("[AIStore] setTrades", {
+          received: src.length,
+          mapped: mapped.length,
+          buy,
+          sell,
+          pointValue,
+          defaultRiskPoints,
+          example: mapped[0] || null,
+        });
+      }
+
+      return { trades: mapped };
+    }),
+
   clear: () =>
-    set({ projected: [], confirmed: [], pnl: null, lastParams: null }),
+    set({
+      projected: [],
+      confirmed: [],
+      pnl: null,
+      trades: [],
+      lastParams: null,
+    }),
 }));
 
-// Exporte nos dois formatos para eliminar divergência de import em qualquer componente.
 export { useAIStore };
 export default useAIStore;

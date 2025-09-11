@@ -208,11 +208,6 @@ export default function AIProjectedPanel() {
               </tbody>
             </table>
           </div>
-
-          <div className="text-muted small mt-2">
-            A lista não aplica nenhum filtro além dos parâmetros do backend. Se
-            existir SELL no retorno, ele aparece aqui e no gráfico.
-          </div>
         </div>
       </div>
     </div>
