@@ -28,7 +28,7 @@ type FiltersState = {
   symbol: string;
   timeframe: string;
   from: string | null; // "YYYY-MM-DD" ou null
-  to: string | null; // "YYYY-MM-DD" ou null
+  to: string | null;   // "YYYY-MM-DD" ou null
 };
 type FiltersAPI = {
   get: () => FiltersState;
@@ -112,12 +112,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   const baseParams = React.useCallback(
     () => ({
-      symbol: String(symbol || "")
-        .trim()
-        .toUpperCase(),
-      timeframe: String(timeframe || "")
-        .trim()
-        .toUpperCase(),
+      symbol: String(symbol || "").trim().toUpperCase(),
+      timeframe: String(timeframe || "").trim().toUpperCase(),
       from: from || undefined,
       to: to || undefined,
     }),
@@ -131,6 +127,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     try {
       const params = baseParams();
 
+      // Salva para debug
+      (window as any).__dbgLastParams = { ...params, rr, minProb, minEV, useMicroModel, vwapFilter, requireMtf, confirmTf };
+
       // 1) Projetados — PATCH TEMPORÁRIO: desligar filtros que podem suprimir SELL
       const payload: any = {
         ...params,
@@ -140,9 +139,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         useMicroModel,
         vwapFilter,
         requireMtf,
-        confirmTf: String(confirmTf || "")
-          .trim()
-          .toUpperCase(),
+        confirmTf: String(confirmTf || "").trim().toUpperCase(),
       };
 
       // --- overrides temporários ---
@@ -179,32 +176,13 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         confirmTf,
       });
 
-      // 2) Confirmados (sem patch)
-      const conf = await fetchConfirmedSignals({ ...params, limit: 2000 });
-      setConfirmed(conf || [], params);
+      // 2) Confirmados (sem patch) + salva debug bruto
+      const confRaw = await fetchConfirmedSignals({ ...params, limit: 2000 });
+      (window as any).__dbgConfirmedRaw = confRaw;
+      setConfirmed(confRaw || [], params);
 
-      // 3) Backtest (PnL + Trades)
+      // 3) Backtest (PnL + Trades) + salva debug bruto
       const bt = await runBacktest(params as any);
-
-      const sum = bt?.summary || null;
-      setPnL(
-        sum
-          ? {
-              trades: sum.trades ?? 0,
-              wins: sum.wins ?? 0,
-              losses: sum.losses ?? 0,
-              ties: sum.ties ?? 0,
-              winRate: sum.winRate ?? 0,
-              pnlPoints: sum.pnlPoints ?? bt?.pnlPoints ?? 0,
-              pnlMoney: bt?.pnlMoney ?? undefined,
-              avgPnL: sum.avgPnL ?? 0,
-              profitFactor: sum.profitFactor ?? 0,
-              maxDrawdown: sum.maxDrawdown ?? 0,
-            }
-          : null
-      );
-
-      // Captura trades (várias chaves possíveis)
       const rawTrades =
         (Array.isArray(bt?.trades) && bt?.trades) ||
         (Array.isArray(bt?.rows) && bt?.rows) ||
@@ -212,7 +190,28 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         (Array.isArray(bt?.data) && bt?.data) ||
         [];
 
-      setTrades(rawTrades);
+      (window as any).__dbgTradesRaw = rawTrades;
+
+      const sum = bt?.summary || null;
+      setPnL(
+        sum
+          ? {
+            trades: sum.trades ?? 0,
+            wins: sum.wins ?? 0,
+            losses: sum.losses ?? 0,
+            ties: sum.ties ?? 0,
+            winRate: sum.winRate ?? 0,
+            pnlPoints: sum.pnlPoints ?? bt?.pnlPoints ?? 0,
+            pnlMoney: bt?.pnlMoney ?? undefined,
+            avgPnL: sum.avgPnL ?? 0,
+            profitFactor: sum.profitFactor ?? 0,
+            maxDrawdown: sum.maxDrawdown ?? 0,
+          }
+          : null
+      );
+
+      setTrades(rawTrades, bt?.meta);
+
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
     } finally {
@@ -267,10 +266,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     }
     window.addEventListener("daytrade:data-invalidate" as any, onInvalidate);
     return () => {
-      window.removeEventListener(
-        "daytrade:data-invalidate" as any,
-        onInvalidate
-      );
+      window.removeEventListener("daytrade:data-invalidate" as any, onInvalidate);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -315,34 +311,29 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
               <div className="d-flex flex-wrap align-items-end gap-2">
                 {/* filtros principais (ligados ao store global) */}
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 140 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 140 }}>
                   <span className="input-group-text">Símbolo</span>
                   <input
                     className="form-control"
                     value={symbol}
-                    onChange={(e) => setFilters({ symbol: e.target.value })}
+                    onChange={(e) =>
+                      setFilters({ symbol: e.target.value })
+                    }
                   />
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 120 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 120 }}>
                   <span className="input-group-text">TF</span>
                   <input
                     className="form-control"
                     value={timeframe}
-                    onChange={(e) => setFilters({ timeframe: e.target.value })}
+                    onChange={(e) =>
+                      setFilters({ timeframe: e.target.value })
+                    }
                   />
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 210 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 210 }}>
                   <span className="input-group-text">De</span>
                   <input
                     type="date"
@@ -354,24 +345,20 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 210 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 210 }}>
                   <span className="input-group-text">Até</span>
                   <input
                     type="date"
                     className="form-control"
                     value={to ?? ""}
-                    onChange={(e) => setFilters({ to: e.target.value || null })}
+                    onChange={(e) =>
+                      setFilters({ to: e.target.value || null })
+                    }
                   />
                 </div>
 
                 {/* parâmetros — afetam apenas os Projetados */}
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 110 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 110 }}>
                   <span className="input-group-text">RR</span>
                   <input
                     type="number"
@@ -382,10 +369,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 150 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 150 }}>
                   <span className="input-group-text">minProb</span>
                   <input
                     type="number"
@@ -398,10 +382,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 140 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 140 }}>
                   <span className="input-group-text">minEV</span>
                   <input
                     type="number"
@@ -451,10 +432,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   </label>
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 150 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 150 }}>
                   <span className="input-group-text">TF Conf.</span>
                   <input
                     className="form-control"
@@ -479,10 +457,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   </label>
                 </div>
 
-                <div
-                  className="input-group input-group-sm"
-                  style={{ width: 130 }}
-                >
+                <div className="input-group input-group-sm" style={{ width: 130 }}>
                   <span className="input-group-text">a cada</span>
                   <input
                     type="number"

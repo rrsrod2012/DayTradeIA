@@ -374,9 +374,8 @@ router.post("/api/signals/projected", express.json(), async (req, res) => {
         suggestedEntry: entry,
         stopSuggestion: sl,
         takeProfitSuggestion: tp,
-        conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${
-          vwapFilter ? " + VWAP" : ""
-        }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
+        conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""
+          }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
         probHit: Number(prob.toFixed(4)),
         probCalibrated: Number(prob.toFixed(4)),
         expectedValuePoints: Number(evPts.toFixed(2)),
