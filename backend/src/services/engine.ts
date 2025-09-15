@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 import { prisma } from "../prisma";
+import { loadCandlesAnyTF } from "../lib/aggregation";
 
 /**
  * Motor de projeção de sinais:
@@ -296,6 +297,11 @@ async function rescoreWithML(
 }
 
 /* ---------------- Consulta de candles ---------------- */
+/**
+ * Agora prioriza o agregador central (M1 -> TF) via loadCandlesAnyTF,
+ * garantindo que Projected e Confirmed partam da MESMA série.
+ * Mantém um fallback para a consulta direta via Prisma.
+ */
 async function fetchCandles(
   symbol: string,
   timeframe: string,
@@ -303,28 +309,82 @@ async function fetchCandles(
   to?: string,
   limit?: number
 ): Promise<Candle[]> {
-  const tfMin = tfToMinutes(timeframe);
-  const variants = Array.from(
-    new Set([symbol, symbol.toUpperCase(), symbol.toLowerCase()])
-  );
-  const whereAny: any = {};
-  if (from || to) {
+  try {
     const range: any = {};
     if (from)
       range.gte = new Date(from.includes("T") ? from : `${from}T00:00:00.000Z`);
     if (to) range.lte = new Date(to.includes("T") ? to : `${to}T23:59:59.999Z`);
-    whereAny.time = range;
-  }
-  // Tentativa com relação e timeframe tolerante
-  try {
+    if (limit && Number(limit) > 0) range.limit = Number(limit);
+
+    const rows = await loadCandlesAnyTF(
+      String(symbol).toUpperCase(),
+      String(timeframe).toUpperCase(),
+      range
+    );
+
+    return rows.map((r: any, idx: number) => ({
+      id: idx,
+      time: r.time instanceof Date ? r.time : new Date(r.time),
+      open: Number(r.open),
+      high: Number(r.high),
+      low: Number(r.low),
+      close: Number(r.close),
+      volume: r.volume == null ? null : Number(r.volume),
+    }));
+  } catch (e) {
+    // Fallback para o comportamento anterior (tolerante a timeframe "M5" ou "5")
+    const tfMin = tfToMinutes(timeframe);
+    const variants = Array.from(
+      new Set([
+        symbol,
+        String(symbol).toUpperCase(),
+        String(symbol).toLowerCase(),
+      ])
+    );
+    const whereAny: any = {};
+    if (from || to) {
+      const range: any = {};
+      if (from)
+        range.gte = new Date(
+          from.includes("T") ? from : `${from}T00:00:00.000Z`
+        );
+      if (to)
+        range.lte = new Date(to.includes("T") ? to : `${to}T23:59:59.999Z`);
+      whereAny.time = range;
+    }
+
+    try {
+      const rows = await prisma.candle.findMany({
+        where: {
+          ...(whereAny.time ? { time: whereAny.time } : {}),
+          OR: variants.map((v) => ({ instrument: { is: { symbol: v } } })),
+          timeframe: { in: [String(timeframe).toUpperCase(), String(tfMin)] },
+        },
+        orderBy: { time: "asc" },
+        take:
+          limit && !whereAny.time
+            ? Math.max(100, (limit as number) * 5)
+            : undefined,
+        select: {
+          id: true,
+          time: true,
+          open: true,
+          high: true,
+          low: true,
+          close: true,
+          volume: true,
+        },
+      });
+      if (rows.length) return rows as any;
+    } catch {
+      // cai no fallback final
+    }
+
     const rows = await prisma.candle.findMany({
-      where: {
-        ...(whereAny.time ? { time: whereAny.time } : {}),
-        OR: variants.map((v) => ({ instrument: { is: { symbol: v } } })),
-        timeframe: { in: [timeframe.toUpperCase(), String(tfMin)] },
-      },
+      where: whereAny.time ? { time: whereAny.time } : undefined,
       orderBy: { time: "asc" },
-      take: limit && !whereAny.time ? Math.max(100, limit * 5) : undefined,
+      take:
+        limit && !whereAny.time ? Math.max(100, (limit as number) * 5) : 1000,
       select: {
         id: true,
         time: true,
@@ -335,26 +395,8 @@ async function fetchCandles(
         volume: true,
       },
     });
-    if (rows.length) return rows as any;
-  } catch {
-    // cai no fallback
+    return rows as any;
   }
-  // Fallback: sem relação/timeframe (pega por tempo apenas)
-  const rows = await prisma.candle.findMany({
-    where: whereAny.time ? { time: whereAny.time } : undefined,
-    orderBy: { time: "asc" },
-    take: limit && !whereAny.time ? Math.max(100, limit * 5) : 1000,
-    select: {
-      id: true,
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-    },
-  });
-  return rows as any;
 }
 
 /* ---------------- API principal ---------------- */

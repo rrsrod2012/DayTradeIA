@@ -1,6 +1,7 @@
 /* eslint-disable no-console */
 import { PrismaClient } from "@prisma/client";
 import { ADX } from "../services/indicators";
+import { loadCandlesAnyTF } from "../lib/aggregation";
 
 const prisma = new PrismaClient();
 
@@ -36,52 +37,44 @@ function tfCandidates(tf: keyof typeof TF_MINUTES): string[] {
   return out;
 }
 
+/**
+ * Busca candles usando o AGREGADOR central (sempre parte de M1 quando necessário),
+ * garantindo que confirmados e projetados usem a MESMA série por TF.
+ */
 async function getCandlesFromDB(
   instrumentId: number,
   tf: keyof typeof TF_MINUTES
 ) {
-  const candidates = tfCandidates(tf);
-
-  // 1ª tentativa: filtrar pelo timeframe (M5 e "5")
-  let rows = await prisma.candle.findMany({
-    where: {
-      instrumentId,
-      timeframe: { in: candidates },
-    },
-    orderBy: { time: "asc" },
-    select: {
-      id: true,
-      time: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-      timeframe: true,
-    },
+  const inst = await prisma.instrument.findUnique({
+    where: { id: instrumentId },
+    select: { symbol: true },
   });
+  if (!inst?.symbol) return [];
 
-  // Fallback: se nada encontrado, tentar sem filtrar timeframe (para dados legados)
-  if (!rows.length) {
-    rows = await prisma.candle.findMany({
-      where: { instrumentId },
-      orderBy: { time: "asc" },
-      select: {
-        id: true,
-        time: true,
-        open: true,
-        high: true,
-        low: true,
-        close: true,
-        volume: true,
-        timeframe: true,
-      },
-    });
-  }
+  const rows = await loadCandlesAnyTF(
+    String(inst.symbol).toUpperCase(),
+    String(tf).toUpperCase()
+  );
 
-  return rows;
+  return rows.map((r: any, idx: number) => ({
+    id: idx, // placeholder; o id real é resolvido por time
+    time: r.time instanceof Date ? r.time : new Date(r.time),
+    open: Number(r.open),
+    high: Number(r.high),
+    low: Number(r.low),
+    close: Number(r.close),
+    volume: r.volume == null ? null : Number(r.volume),
+    timeframe: String(tf).toUpperCase(),
+  }));
 }
 
+/**
+ * Resolve o candleId no banco para um horário agregado (bucket).
+ * Ordem nova (segura):
+ *  1) instrumentId + time + timeframe candidato (ex.: "M5" ou "5")
+ *  2) instrumentId + time
+ *  (não usar lookup global só por time)
+ */
 async function findCandleIdByTime(
   instrumentId: number,
   tf: keyof typeof TF_MINUTES,
@@ -89,27 +82,18 @@ async function findCandleIdByTime(
 ) {
   const candidates = tfCandidates(tf);
 
-  // 1ª tentativa: com filtro de timeframe
+  // 1) instrumentId + time + timeframe
   let c = await prisma.candle.findFirst({
-    where: {
-      instrumentId,
-      time: t,
-      timeframe: { in: candidates },
-    },
+    where: { instrumentId, time: t, timeframe: { in: candidates } },
     select: { id: true },
   });
+  if (c?.id) return c.id;
 
-  // Fallback: sem timeframe se não achou
-  if (!c) {
-    c = await prisma.candle.findFirst({
-      where: {
-        instrumentId,
-        time: t,
-      },
-      select: { id: true },
-    });
-  }
-
+  // 2) instrumentId + time (sem timeframe)
+  c = await prisma.candle.findFirst({
+    where: { instrumentId, time: t },
+    select: { id: true },
+  });
   return c?.id ?? null;
 }
 
@@ -132,7 +116,7 @@ export async function backfillCandlesAndSignals(
   const candles = await getCandlesFromDB(instrumentId, tf);
   if (!candles.length) {
     logger.warn(
-      `[SignalsWorker] nenhum candle persistido para TF=${tf}. Pulei geração de sinais confirmados.`
+      `[SignalsWorker] nenhum candle (via agregador) para TF=${tf}. Pulei geração de sinais confirmados.`
     );
     return { createdOrUpdated: 0, candles: 0 };
   }
@@ -147,38 +131,34 @@ export async function backfillCandlesAndSignals(
 
   let createdOrUpdated = 0;
 
+  const tfMin = TF_MINUTES[tf];
+
   for (let i = 1; i < candles.length; i++) {
     const prevDiff = e9[i - 1] - e21[i - 1];
     const diff = e9[i] - e21[i];
 
     let side: "BUY" | "SELL" | null = null;
-    if (prevDiff <= 0 && diff > 0) side = "BUY";
-    if (prevDiff >= 0 && diff < 0) side = "SELL";
-    if (!side) continue;
+    // comparações estritas para evitar duplo disparo
+    if (prevDiff < 0 && diff > 0) side = "BUY";
+    else if (prevDiff > 0 && diff < 0) side = "SELL";
+    else continue;
 
-    const tfMin = TF_MINUTES[tf];
     const bucketTime = floorToBucket(candles[i].time, tfMin);
 
-    const candleId =
-      candles[i].id ||
-      (await findCandleIdByTime(instrumentId, tf, bucketTime));
-    if (!candleId) {
-      // Candle não existe (ou não está com timeframe previsto); pule.
-      continue;
-    }
+    const candleId = await findCandleIdByTime(instrumentId, tf, bucketTime);
+    if (!candleId) continue;
 
     const reason =
       side === "BUY"
         ? `EMA9 cross above EMA21 • ADX14=${(adx[i] ?? 0).toFixed(1)}`
         : `EMA9 cross below EMA21 • ADX14=${(adx[i] ?? 0).toFixed(1)}`;
 
-    // Upsert por (candleId, signalType, side)
     const existing = await prisma.signal.findFirst({
       where: { candleId, signalType: "EMA_CROSS", side },
       select: { id: true },
     });
 
-    if (existing) {
+    if (existing?.id) {
       await prisma.signal.update({
         where: { id: existing.id },
         data: { score: Math.abs(diff) / (Math.abs(e21[i]) || 1), reason },
