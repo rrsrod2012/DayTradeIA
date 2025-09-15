@@ -1,6 +1,7 @@
 /* eslint-disable no-console */
 import { DateTime } from "luxon";
 import { prisma } from "../prisma";
+import { loadCandlesAnyTF } from "../lib/aggregation";
 
 /**
  * Pipeline para:
@@ -15,9 +16,9 @@ import { prisma } from "../prisma";
 // =========================
 const CFG = {
   LOOKBACK: numFromEnv(process.env.AUTO_TRAINER_LOOKBACK, 120), // barras para trás para calcular ATR
-  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12),    // barras à frente para procurar TP/SL
-  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0),     // k do SL em ATRs
-  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0),             // takeProfit = RR * ATR
+  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12), // barras à frente para procurar TP/SL
+  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0), // k do SL em ATRs
+  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0), // takeProfit = RR * ATR
   DEFAULT_QTY: 1,
 };
 
@@ -39,7 +40,9 @@ function numFromEnv(v: any, def: number) {
 }
 
 function tfToMinutes(tf: string): number | null {
-  const s = String(tf || "").trim().toUpperCase();
+  const s = String(tf || "")
+    .trim()
+    .toUpperCase();
   if (TF_MINUTES[s]) return TF_MINUTES[s];
 
   // tolerar "5", "15"
@@ -51,7 +54,10 @@ function tfToMinutes(tf: string): number | null {
   return null;
 }
 
-function atrEMA(candles: { high: number; low: number; close: number }[], period = 14): (number | null)[] {
+function atrEMA(
+  candles: { high: number; low: number; close: number }[],
+  period = 14
+): (number | null)[] {
   // True Range
   const tr: number[] = [];
   for (let i = 0; i < candles.length; i++) {
@@ -78,10 +84,14 @@ function atrEMA(candles: { high: number; low: number; close: number }[], period 
 }
 
 // =========================
-// Carregamento de dados
+// Carregamento via agregador M1→TF
 // =========================
 
-/** Carrega candles para o mesmo instrumento/TF do sinal em uma janela ao redor do tempo do sinal. */
+/**
+ * Carrega candles usando o agregador central para o mesmo instrumento/TF do sinal
+ * em uma janela ao redor do tempo do sinal. Resolve (em lote) os candleIds
+ * persistidos no banco para cada timestamp retornado, quando houver.
+ */
 async function loadCandlesWindow(params: {
   instrumentId: number;
   timeframe: string | null;
@@ -90,48 +100,70 @@ async function loadCandlesWindow(params: {
   horizon: number;
 }) {
   const { instrumentId, timeframe, signalTime, lookback, horizon } = params;
-  const tfMin = timeframe ? tfToMinutes(timeframe) : null;
 
-  // janela temporal aproximada (em minutos) para filtrar por time
-  const minutes = Math.max(1, tfMin || 5);
+  // Resolve símbolo
+  const inst = await prisma.instrument.findUnique({
+    where: { id: instrumentId },
+    select: { symbol: true },
+  });
+  if (!inst?.symbol) return [];
 
-  const from = DateTime.fromJSDate(signalTime).minus({ minutes: lookback * minutes }).toUTC().toJSDate();
-  const to = DateTime.fromJSDate(signalTime).plus({ minutes: (horizon + 2) * minutes }).toUTC().toJSDate();
+  const tfStr = (timeframe ? String(timeframe) : "M5").toUpperCase();
+  const tfMin = tfToMinutes(tfStr) ?? 5;
 
-  // Aceitar "M5" e "5" (quando aplicável). Nada de null aqui.
-  const tfFilter = timeframe ? String(timeframe).toUpperCase() : null;
-  const tfMinStr = tfMin != null ? String(tfMin) : null;
-  const tfIn = [tfFilter, tfMinStr].filter(Boolean) as string[];
+  // Janela temporal aproximada (em minutos)
+  const from = DateTime.fromJSDate(signalTime)
+    .minus({ minutes: lookback * tfMin })
+    .toUTC()
+    .toJSDate();
+  const to = DateTime.fromJSDate(signalTime)
+    .plus({ minutes: (horizon + 2) * tfMin })
+    .toUTC()
+    .toJSDate();
 
-  const where: any = {
-    instrumentId,
-    time: { gte: from, lte: to },
-  };
-  if (tfIn.length) {
-    where.timeframe = { in: tfIn };
-  }
+  // 1) Série agregada coerente com Projected/Confirmed
+  const series = await loadCandlesAnyTF(
+    String(inst.symbol).toUpperCase(),
+    tfStr,
+    {
+      gte: from,
+      lte: to,
+    }
+  );
+  if (!series?.length) return [];
 
-  const rows = await prisma.candle.findMany({
-    where,
-    orderBy: { time: "asc" },
-    select: {
-      id: true,
-      time: true,
-      instrumentId: true,
-      timeframe: true,
-      open: true,
-      high: true,
-      low: true,
-      close: true,
-      volume: true,
-    },
+  // 2) Mapa (time -> id) dos candles persistidos na janela (sem restringir timeframe)
+  const persisted = await prisma.candle.findMany({
+    where: { instrumentId, time: { gte: from, lte: to } },
+    select: { id: true, time: true },
+  });
+  const idByTime = new Map<number, number>();
+  for (const r of persisted) idByTime.set(new Date(r.time).getTime(), r.id);
+
+  // 3) Normaliza shape + injeta id quando existir
+  const rows = series.map((r: any) => {
+    const t = r.time instanceof Date ? r.time : new Date(r.time);
+    const id = idByTime.get(t.getTime()) ?? undefined;
+    return {
+      id: id ?? undefined, // pode ficar undefined se não houver esse bucket persistido
+      time: t,
+      instrumentId,
+      timeframe: tfStr,
+      open: Number(r.open),
+      high: Number(r.high),
+      low: Number(r.low),
+      close: Number(r.close),
+      volume: r.volume == null ? null : Number(r.volume),
+    };
   });
 
   return rows;
 }
 
 /** Resolve instrumentId a partir do símbolo (se fornecido). */
-async function resolveInstrumentId(symbol?: string): Promise<number | undefined> {
+async function resolveInstrumentId(
+  symbol?: string
+): Promise<number | undefined> {
   if (!symbol) return undefined;
   const inst = await prisma.instrument.findFirst({
     where: { symbol: String(symbol).toUpperCase() },
@@ -145,17 +177,19 @@ async function resolveInstrumentId(symbol?: string): Promise<number | undefined>
 // =========================
 
 type ProcessArgs = {
-  symbol?: string;            // filtra por símbolo (Instrument.symbol)
-  timeframe?: string;         // filtra por TF (ex: "M5")
-  from?: Date;                // filtra por período (candle do sinal >= from)
-  to?: Date;                  // filtra por período (candle do sinal <= to)
+  symbol?: string; // filtra por símbolo (Instrument.symbol)
+  timeframe?: string; // filtra por TF (ex: "M5")
+  from?: Date; // filtra por período (candle do sinal >= from)
+  to?: Date; // filtra por período (candle do sinal <= to)
 };
 
 export async function processImportedRange(args: ProcessArgs) {
   const t0 = Date.now();
 
   const instrumentIdFilter = await resolveInstrumentId(args.symbol);
-  const timeframeFilter = args.timeframe ? String(args.timeframe).toUpperCase() : undefined;
+  const timeframeFilter = args.timeframe
+    ? String(args.timeframe).toUpperCase()
+    : undefined;
 
   // Monta filtro por timeframe para a relação candle (aceita "M5" e "5")
   const tfCands: string[] = [];
@@ -214,13 +248,15 @@ export async function processImportedRange(args: ProcessArgs) {
   }
 
   let tradesTouched = 0;
-  let tp = 0, sl = 0, none = 0;
+  let tp = 0,
+    sl = 0,
+    none = 0;
 
   for (const sig of signals) {
     const c = sig.candle;
     if (!c) continue;
 
-    // Carrega janela de candles ao redor do candle do sinal
+    // Janela de candles ao redor do candle do sinal (via agregador)
     const win = await loadCandlesWindow({
       instrumentId: c.instrumentId,
       timeframe: c.timeframe,
@@ -253,7 +289,7 @@ export async function processImportedRange(args: ProcessArgs) {
       iSignal = j;
     }
 
-    // Entrada = open da próxima barra
+    // Entrada = open da próxima barra no MESMO TF
     const iEntry = iSignal + 1;
     if (iEntry >= win.length) {
       // não há barra seguinte
@@ -263,12 +299,16 @@ export async function processImportedRange(args: ProcessArgs) {
       continue;
     }
     const entryBar = win[iEntry];
-    const entryPrice = Number.isFinite(entryBar.open) ? Number(entryBar.open) : Number(entryBar.close);
+    const entryPrice = Number.isFinite(entryBar.open)
+      ? Number(entryBar.open)
+      : Number(entryBar.close);
     const side = String(sig.side || "").toUpperCase() as "BUY" | "SELL";
 
     // ATR no candle do sinal (usa janela até iSignal)
     const atrArr = atrEMA(
-      win.slice(0, iSignal + 1).map((r) => ({ high: r.high, low: r.low, close: r.close })),
+      win
+        .slice(0, iSignal + 1)
+        .map((r) => ({ high: r.high, low: r.low, close: r.close })),
       14
     );
     const atrNow = atrArr[atrArr.length - 1] ?? 0;
@@ -278,16 +318,22 @@ export async function processImportedRange(args: ProcessArgs) {
     const tpPts = atr * CFG.RR;
 
     const isBuy = side === "BUY";
-    const slLevel = slPts > 0 ? (isBuy ? entryPrice - slPts : entryPrice + slPts) : null;
-    const tpLevel = tpPts > 0 ? (isBuy ? entryPrice + tpPts : entryPrice - tpPts) : null;
+    const slLevel =
+      slPts > 0 ? (isBuy ? entryPrice - slPts : entryPrice + slPts) : null;
+    const tpLevel =
+      tpPts > 0 ? (isBuy ? entryPrice + tpPts : entryPrice - tpPts) : null;
 
     // Escaneia HORIZON barras para frente para determinar saída
     let exitPrice: number | null = null;
     let outcome: "TP" | "SL" | "NONE" = "NONE";
     let iExit: number | null = null;
 
-    // Conservador: se a barra tocar TP e SL, consideramos SL primeiro.
-    for (let k = iEntry; k < Math.min(win.length, iEntry + CFG.HORIZON + 1); k++) {
+    // Conservador: se a barra tocar SL e TP, considerar SL primeiro.
+    for (
+      let k = iEntry;
+      k < Math.min(win.length, iEntry + CFG.HORIZON + 1);
+      k++
+    ) {
       const bar = win[k];
       const high = Number(bar.high);
       const low = Number(bar.low);
@@ -324,41 +370,56 @@ export async function processImportedRange(args: ProcessArgs) {
 
     let pnlPoints: number | null = null;
     if (exitPrice != null) {
-      pnlPoints = isBuy ? (exitPrice - entryPrice) : (entryPrice - exitPrice);
+      pnlPoints = isBuy ? exitPrice - entryPrice : entryPrice - exitPrice;
     }
 
     if (outcome === "TP") tp++;
     else if (outcome === "SL") sl++;
     else none++;
 
-    // cria/vincula um signal de saída no candle correspondente (para termos exitTime)
+    // cria/vincula um signal de saída no candle correspondente (para termos referência de saída)
     let exitSignalId: number | null = null;
-    if (iExit != null && iExit >= 0 && iExit < win.length && exitPrice != null) {
+    if (
+      iExit != null &&
+      iExit >= 0 &&
+      iExit < win.length &&
+      exitPrice != null
+    ) {
       const exitBar = win[iExit];
-      const exitCandleId = exitBar.id;
-      const exitType = outcome === "TP" ? "EXIT_TP" : (outcome === "SL" ? "EXIT_SL" : "EXIT_NONE");
+      const exitCandleId = exitBar.id; // pode estar undefined se não houver bucket persistido
 
-      const existingExit = await prisma.signal.findFirst({
-        where: { candleId: exitCandleId, signalType: exitType },
-        select: { id: true },
-      });
-
-      if (existingExit) {
-        exitSignalId = existingExit.id;
-      } else {
-        const createdExit = await prisma.signal.create({
-          data: {
-            candleId: exitCandleId,
-            signalType: exitType,
-            side: side,
-            score: 1.0,
-            reason:
-              exitType === "EXIT_TP" ? "Take Profit atingido" :
-                exitType === "EXIT_SL" ? "Stop Loss atingido" : "Saída neutra",
-          },
+      if (exitCandleId != null) {
+        const exitType =
+          outcome === "TP"
+            ? "EXIT_TP"
+            : outcome === "SL"
+            ? "EXIT_SL"
+            : "EXIT_NONE";
+        const existingExit = await prisma.signal.findFirst({
+          where: { candleId: exitCandleId, signalType: exitType },
           select: { id: true },
         });
-        exitSignalId = createdExit.id;
+
+        if (existingExit) {
+          exitSignalId = existingExit.id;
+        } else {
+          const createdExit = await prisma.signal.create({
+            data: {
+              candleId: exitCandleId,
+              signalType: exitType,
+              side: side, // lado do movimento até a saída (mesmo do entry)
+              score: 1.0,
+              reason:
+                exitType === "EXIT_TP"
+                  ? "Take Profit atingido"
+                  : exitType === "EXIT_SL"
+                  ? "Stop Loss atingido"
+                  : "Saída neutra",
+            },
+            select: { id: true },
+          });
+          exitSignalId = createdExit.id;
+        }
       }
     }
 
@@ -397,7 +458,7 @@ export async function processImportedRange(args: ProcessArgs) {
 }
 
 // =========================
-// Upserts
+// Upserts (sem side / sem entryTime no Trade)
 // =========================
 
 async function upsertTrade(
@@ -421,7 +482,7 @@ async function upsertTrade(
     await prisma.trade.update({
       where: { id: existing.id },
       data: {
-        // ⚠️ Schema atual exige relação, não campo escalar instrumentId
+        // relação obrigatória
         instrument: { connect: { id: data.instrumentId } },
         timeframe: data.timeframe,
         qty: data.qty,
@@ -436,10 +497,9 @@ async function upsertTrade(
   } else {
     await prisma.trade.create({
       data: {
-        // ⚠️ relação obrigatória
         instrument: { connect: { id: data.instrumentId } },
         timeframe: data.timeframe,
-        entrySignal: { connect: { id: signal.id } },
+        entrySignal: { connect: { id: signal.id } }, // lado fica no entrySignal.side
         ...(data.exitSignalId
           ? { exitSignal: { connect: { id: data.exitSignalId } } }
           : {}),
@@ -476,7 +536,9 @@ async function upsertTradeEmpty(
 // Helpers
 // =========================
 
-function inferTfStringFromRow(r: { timeframe: string | null } | undefined): string | null {
+function inferTfStringFromRow(
+  r: { timeframe: string | null } | undefined
+): string | null {
   if (!r) return null;
   const sRaw = r.timeframe ? String(r.timeframe) : "";
   const s = sRaw.toUpperCase();
