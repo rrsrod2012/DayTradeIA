@@ -8,7 +8,6 @@ import {
   stopAutoTrainer,
   statusAutoTrainer,
 } from "./workers/autoTrainer";
-
 import { loadCandlesAnyTF } from "./lib/aggregation";
 
 const router = express.Router();
@@ -51,8 +50,10 @@ function toUtcRange(from?: string, to?: string) {
   if (to) out.lte = parse(to, true);
   return out;
 }
+const toLocalDateTime = (d: Date) =>
+  DateTime.fromJSDate(d).setZone(ZONE);
 const toLocalDateStr = (d: Date) =>
-  DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd HH:mm:ss");
+  toLocalDateTime(d).toFormat("yyyy-LL-dd HH:mm:ss");
 
 /* ---------------- helpers TF ---------------- */
 function tfToMinutes(tf: string) {
@@ -61,6 +62,11 @@ function tfToMinutes(tf: string) {
   const m = s.match(/^M(\d+)$/);
   return m ? Number(m[1]) : 5;
 }
+
+/* ----------------- HEALTHCHECK ----------------- */
+router.get("/healthz", (_req, res) => {
+  res.json({ ok: true, now: new Date().toISOString() });
+});
 
 /* ----------------- ROTA CANDLES ----------------- */
 router.get("/candles", async (req, res) => {
@@ -101,6 +107,22 @@ router.get("/candles", async (req, res) => {
   }
 });
 
+/* ---------------- util: último candle por símbolo ---------------- */
+async function lastCandleTimeForSymbol(symbolUpper?: string): Promise<Date | null> {
+  if (!symbolUpper) return null;
+  const inst = await prisma.instrument.findFirst({
+    where: { symbol: symbolUpper },
+    select: { id: true },
+  });
+  if (!inst) return null;
+  const last = await prisma.candle.findFirst({
+    where: { instrumentId: inst.id },
+    orderBy: { time: "desc" },
+    select: { time: true },
+  });
+  return last?.time ?? null;
+}
+
 /* ------------------------ /signals (CONFIRMADOS) ----------------------- */
 router.get("/signals", async (req, res) => {
   try {
@@ -121,15 +143,27 @@ router.get("/signals", async (req, res) => {
 
     const from = (_from as string) || (dateFrom as string) || undefined;
     const to = (_to as string) || (dateTo as string) || undefined;
-    const range = toUtcRange(from, to);
+    const reqRange = toUtcRange(from, to);
+
+    const nowUtc = new Date();
+    // lte = min(agora, último candle do símbolo se houver)
+    const lastCandle = await lastCandleTimeForSymbol(symbol);
+    const hardUpper = lastCandle && lastCandle < nowUtc ? lastCandle : nowUtc;
+
+    const timeWhere: { gte?: Date; lte?: Date } = {};
+    if (reqRange?.gte) timeWhere.gte = reqRange.gte;
+    timeWhere.lte =
+      reqRange?.lte && reqRange.lte < hardUpper ? reqRange.lte : hardUpper;
+
     const effLimit = Number(limit) || 200;
 
-    const whereBase: any = {};
-    if (range) whereBase.candle = { is: { time: range } } as any;
+    const whereBase: any = {
+      candle: { is: { time: timeWhere, ...(symbol ? {} : {}) } },
+    };
 
     const signals = await prisma.signal.findMany({
       where: whereBase,
-      orderBy: [{ id: "desc" }],
+      orderBy: [{ candle: { time: "desc" as const } }, { id: "desc" }],
       take: effLimit,
       include: {
         candle: {
@@ -138,6 +172,11 @@ router.get("/signals", async (req, res) => {
             time: true,
             timeframe: true,
             instrument: { select: { symbol: true } },
+            open: true,
+            high: true,
+            low: true,
+            close: true,
+            volume: true,
           },
         },
       },
@@ -151,18 +190,26 @@ router.get("/signals", async (req, res) => {
           return false;
         return true;
       })
-      .map((s) => ({
-        id: s.id,
-        candleId: s.candleId,
-        time: s.candle.time.toISOString(),
-        date: toLocalDateStr(s.candle.time),
-        timeframe: s.candle.timeframe,
-        symbol: s.candle.instrument.symbol,
-        type: s.type,
-        side: s.side,
-        score: s.score,
-        meta: s.meta,
-      }));
+      .map((s) => {
+        const tJs = s.candle.time;
+        const dtLocal = toLocalDateTime(tJs);
+        return {
+          id: s.id,
+          candleId: s.candleId,
+          time: tJs.toISOString(),               // UTC ISO
+          date: toLocalDateStr(tJs),             // yyyy-LL-dd HH:mm:ss (BRT)
+          timeframe: s.candle.timeframe,
+          symbol: s.candle.instrument.symbol,
+          type: s.type,
+          side: s.side,
+          score: s.score,
+          meta: s.meta,
+          // novos campos "display" para o frontend:
+          dateLocalBr: dtLocal.toFormat("dd/LL/yyyy"),
+          timeLocalBr: dtLocal.toFormat("HH:mm:ss"),
+          tz: ZONE,
+        };
+      });
 
     res.json(items);
   } catch (err: any) {
@@ -171,7 +218,7 @@ router.get("/signals", async (req, res) => {
   }
 });
 
-/* -------------------- /ml/projected (SINAIS PROJETADOS) -------------------- */
+/* -------------------- /ml/projected (GET legacy) -------------------- */
 router.get("/ml/projected", async (req, res) => {
   try {
     const { symbol = "WIN", timeframe = "M5", ...rest } = req.query as any;
@@ -208,6 +255,82 @@ router.get("/ml/projected", async (req, res) => {
   } catch (err: any) {
     logger.error("[/ml/projected] erro", { message: err?.message });
     res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+/* -------------------- /signals/projected (POST para o frontend) -------------------- */
+router.post("/signals/projected", async (req, res) => {
+  try {
+    const body = (req.body || {}) as Record<string, any>;
+    const symbol = String(body.symbol || "").trim().toUpperCase();
+    const timeframe = String(body.timeframe || "").trim().toUpperCase();
+    const from = body.from ? String(body.from) : undefined;
+    const to = body.to ? String(body.to) : undefined;
+    const limit = body.limit != null ? Number(body.limit) : undefined;
+
+    if (!symbol || !timeframe) {
+      logger.warn("[/signals/projected] missing params", { symbol, timeframe });
+      return res.json([]);
+    }
+
+    const range = toUtcRange(from, to);
+    const effLimit = range ? undefined : (Number(limit || 500) as number | undefined);
+
+    // carrega candles para garantir série mínima
+    let candles: any[] = [];
+    try {
+      const rangeForLoad = {
+        ...(range || {}),
+        ...(effLimit ? { limit: effLimit } : {}),
+      } as any;
+      candles = await loadCandlesAnyTF(symbol, timeframe, rangeForLoad);
+    } catch (e: any) {
+      logger.warn("[/signals/projected] loadCandlesAnyTF falhou", {
+        err: e?.message || e,
+        symbol,
+        timeframe,
+        from,
+        to,
+      });
+      return res.json([]);
+    }
+
+    if (!Array.isArray(candles) || candles.length < 30) {
+      logger.info("[/signals/projected] série insuficiente", {
+        count: Array.isArray(candles) ? candles.length : -1,
+        symbol,
+        timeframe,
+      });
+      return res.json([]);
+    }
+
+    let items: any[] = [];
+    try {
+      items =
+        ((await generateProjectedSignals?.({
+          symbol,
+          timeframe,
+          range,
+          limit: effLimit,
+          ...Object.fromEntries(
+            Object.entries(body).filter(
+              ([k]) => !["symbol", "timeframe", "from", "to", "limit"].includes(k)
+            )
+          ),
+        })) as any[]) || [];
+    } catch (e: any) {
+      logger.warn("[/signals/projected] generateProjectedSignals falhou", {
+        err: e?.message || e,
+        symbol,
+        timeframe,
+      });
+      items = [];
+    }
+
+    return res.json(items);
+  } catch (err: any) {
+    logger.error("[/signals/projected] erro inesperado", { message: err?.message });
+    return res.json([]);
   }
 });
 

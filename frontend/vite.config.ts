@@ -10,7 +10,7 @@ export default defineConfig({
     port: 5173, // ajuste se usar outra porta no seu setup
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:4000", // BACKEND em IPv4
+        target: "http://127.0.0.1:3000", // BACKEND em IPv4
         changeOrigin: true,
         secure: false,
         ws: false,
@@ -19,7 +19,7 @@ export default defineConfig({
       },
       // se você estiver chamando o microserviço IA direto do FE (geralmente não precisa)
       "/ml": {
-        target: "http://127.0.0.1:4000",
+        target: "http://127.0.0.1:3000",
         changeOrigin: true,
         secure: false,
         ws: false,

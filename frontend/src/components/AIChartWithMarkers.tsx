@@ -5,6 +5,57 @@ import * as AIStoreModule from "../store/ai";
 const useAIStore: any =
   (AIStoreModule as any).useAIStore ?? (AIStoreModule as any).default;
 
+const TZ = "America/Sao_Paulo";
+
+/* ---------- Formatadores de data/hora em BRT ---------- */
+const fmtDateShortBRT = new Intl.DateTimeFormat("pt-BR", {
+  timeZone: TZ,
+  year: "2-digit",
+  month: "2-digit",
+  day: "2-digit",
+});
+const fmtTimeBRT = new Intl.DateTimeFormat("pt-BR", {
+  timeZone: TZ,
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+const fmtTimeNoSecBRT = new Intl.DateTimeFormat("pt-BR", {
+  timeZone: TZ,
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+// usado pelo crosshair/tooltip
+function timeFormatterBRT(t: any): string {
+  if (typeof t === "number") {
+    const d = new Date(t * 1000);
+    return fmtTimeBRT.format(d); // HH:mm:ss em BRT
+  }
+  if (t && typeof t === "object" && "year" in t && "month" in t && "day" in t) {
+    const d = new Date(Date.UTC((t as any).year, (t as any).month - 1, (t as any).day));
+    return fmtDateShortBRT.format(d); // dd/mm/aa em BRT
+  }
+  return String(t ?? "");
+}
+
+// usado pelos rótulos do eixo de tempo
+function tickMarkFormatterBRT(time: any /* Time */, _tickType: any): string {
+  if (typeof time === "number") {
+    // time = UTCTimestamp (segundos)
+    const d = new Date(time * 1000);
+    return fmtTimeNoSecBRT.format(d); // HH:mm
+  }
+  if (time && typeof time === "object" && "year" in time) {
+    // BusinessDay
+    const d = new Date(Date.UTC(time.year, time.month - 1, time.day));
+    return fmtDateShortBRT.format(d); // dd/mm/aa
+  }
+  return String(time ?? "");
+}
+
 function isoToUtcTs(iso: string | undefined | null): UTCTimestamp | null {
   if (!iso) return null;
   const t = Date.parse(iso);
@@ -46,13 +97,13 @@ type Marker = ReturnType<
   ReturnType<IChartApi["addCandlestickSeries"]>["setMarkers"]
 > extends void
   ? {
-      time: UTCTimestamp;
-      position: "aboveBar" | "belowBar";
-      color: string;
-      shape: any;
-      text?: string;
-      size?: number;
-    }
+    time: UTCTimestamp;
+    position: "aboveBar" | "belowBar";
+    color: string;
+    shape: any;
+    text?: string;
+    size?: number;
+  }
   : never;
 
 export default function AIChartWithMarkers() {
@@ -91,7 +142,19 @@ export default function AIChartWithMarkers() {
         secondsVisible: false,
       },
       crosshair: { mode: 0 },
+      // crosshair/tooltip (não afeta eixo)
+      localization: {
+        locale: "pt-BR",
+        timeFormatter: (t: any) => timeFormatterBRT(t),
+      } as any,
     });
+
+    // >>> AQUI: rótulos do eixo de tempo em BRT
+    chart.timeScale().applyOptions({
+      tickMarkFormatter: (time: any, tickType: any, _locale?: string) =>
+        tickMarkFormatterBRT(time, tickType),
+    } as any);
+
     const series = chart.addCandlestickSeries({
       upColor: "#22c55e",
       downColor: "#ef4444",
@@ -140,12 +203,12 @@ export default function AIChartWithMarkers() {
             close: c.close,
           }))
           .filter((d) => d.time !== null) as Array<{
-          time: UTCTimestamp;
-          open: number;
-          high: number;
-          low: number;
-          close: number;
-        }>;
+            time: UTCTimestamp;
+            open: number;
+            high: number;
+            low: number;
+            close: number;
+          }>;
 
         data.sort((a, b) => (a.time as number) - (b.time as number));
         seriesRef.current!.setData(data);
@@ -157,10 +220,12 @@ export default function AIChartWithMarkers() {
           const last =
             candleTimesRef.current[candleTimesRef.current.length - 1];
           // eslint-disable-next-line no-console
-          console.log("[AIChart] candles range", {
+          console.log("[AIChart] candles range (UTC seconds)", {
             count: candleTimesRef.current.length,
             first,
             last,
+            first_brt: first ? fmtTimeBRT.format(new Date((first as number) * 1000)) : null,
+            last_brt: last ? fmtTimeBRT.format(new Date((last as number) * 1000)) : null,
           });
         }
       } catch (e) {
@@ -198,8 +263,7 @@ export default function AIChartWithMarkers() {
     []
   );
 
-  // Aplica markers (Projetados + Confirmados)
-  // *** Removido qualquer pré-filtro por lado/FLAT: SEMPRE normalizamos localmente ***
+  // Aplica markers (Projetados + Confirmados) com clamp de futuro
   const [diag, setDiag] = React.useState<{
     srcBuy: number;
     srcSell: number;
@@ -224,6 +288,20 @@ export default function AIChartWithMarkers() {
     let srcBuy = 0,
       srcSell = 0;
 
+    // Limites temporais: agora (UTC) e extremos da série de candles
+    const nowTs = Math.floor(Date.now() / 1000) as UTCTimestamp;
+    const arr = candleTimesRef.current;
+    const firstBar = arr.length ? (arr[0] as number) : null;
+    const lastBar = arr.length ? (arr[arr.length - 1] as number) : null;
+
+    const inRange = (ts: UTCTimestamp | null) => {
+      if (ts == null) return false;
+      if (firstBar != null && ts < firstBar) return false;
+      if (lastBar != null && ts > lastBar) return false;
+      if (ts > (nowTs as number)) return false; // clamp “no futuro”
+      return true;
+    };
+
     // ---------- Projetados ----------
     const projMarkers: Marker[] = projSrc
       .map((r, idx) => {
@@ -231,6 +309,7 @@ export default function AIChartWithMarkers() {
         if (side === "BUY") srcBuy++;
         else if (side === "SELL") srcSell++;
         const tsRaw = isoToUtcTs((r as any).time);
+        if (!inRange(tsRaw)) return null;
         const ts = snapToExistingBar(tsRaw);
         if (ts == null) return null;
 
@@ -267,6 +346,7 @@ export default function AIChartWithMarkers() {
       .map((s, idx) => {
         const side = normSide((s as any).side);
         const tsRaw = isoToUtcTs((s as any).time);
+        if (!inRange(tsRaw)) return null;
         const ts = snapToExistingBar(tsRaw);
         if (ts == null) return null;
 
@@ -277,9 +357,8 @@ export default function AIChartWithMarkers() {
           position: isBuy ? ("belowBar" as const) : ("aboveBar" as const),
           color,
           shape: "circle" as any,
-          text: `CONF ${isBuy ? "BUY" : "SELL"}${
-            (s as any).note ? ` • ${(s as any).note}` : ""
-          }`,
+          text: `CONF ${isBuy ? "BUY" : "SELL"}${(s as any).note ? ` • ${(s as any).note}` : ""
+            }`,
           size: 1,
           // @ts-ignore
           __k: `c${idx}`,
@@ -297,7 +376,7 @@ export default function AIChartWithMarkers() {
       const ash = String(a.shape);
       const bsh = String(b.shape);
       if (ash === bsh) {
-        return String(a.__k || "").localeCompare(String(b.__k || ""));
+        return String(a.__k || "").localeCompare(String(b.__k || "")); // estável
       }
       if (ash === "circle") return -1;
       if (bsh === "circle") return 1;
@@ -321,7 +400,7 @@ export default function AIChartWithMarkers() {
       );
     }
 
-    // Diagnóstico: quantos foram plotados BUY/SELL e quantos caíram por timestamp
+    // Diagnóstico (considerando projetados para manter compat com seu log atual)
     const plottedBuy = projMarkers.filter(
       (m: any) => m.__isBuy === true
     ).length;
@@ -342,11 +421,6 @@ export default function AIChartWithMarkers() {
         plottedSell,
         droppedByTime,
       });
-      // eslint-disable-next-line no-console
-      console.log(
-        "[AIChart] example SELL from store",
-        projSrc.find((r: any) => normSide(r?.side) === "SELL") || null
-      );
     }
   }, [projectedRaw, confirmedRaw, snapToExistingBar]);
 
@@ -359,25 +433,7 @@ export default function AIChartWithMarkers() {
               Candles + Marcadores (Projetados & Confirmados)
             </h6>
             <div className="text-muted small">
-              {params ? (
-                <>
-                  <code>{params.symbol}</code> · <code>{params.timeframe}</code>
-                  {params.from ? (
-                    <>
-                      {" "}
-                      · de <code>{params.from}</code>
-                    </>
-                  ) : null}
-                  {params.to ? (
-                    <>
-                      {" "}
-                      até <code>{params.to}</code>
-                    </>
-                  ) : null}
-                </>
-              ) : (
-                "—"
-              )}
+              {/* params apenas informativo */}
             </div>
           </div>
           <div ref={containerRef} style={{ width: "100%", height: 420 }} />
@@ -390,22 +446,7 @@ export default function AIChartWithMarkers() {
               Confirmados: <span style={{ color: "#2563eb" }}>BUY ●</span> /{" "}
               <span style={{ color: "#f59e0b" }}>SELL ●</span>
             </span>
-            {/* Diagnóstico visual (não interfere na funcionalidade) */}
-            <span className="ms-auto">
-              <strong>Diag:</strong> src BUY {diag.srcBuy} · src SELL{" "}
-              {diag.srcSell} ·&nbsp; plot BUY {diag.plottedBuy} · plot SELL{" "}
-              {diag.plottedSell} ·&nbsp; drop(ts) {diag.droppedByTime}
-            </span>
           </div>
-          {diag.srcSell > 0 && diag.plottedSell === 0 && (
-            <div className="mt-2 alert alert-warning py-1 px-2 small">
-              Recebemos SELL na store, mas 0 foram plotados. Isso normalmente
-              indica timestamps fora da série de candles atual ou normalização
-              de lado em outro ponto do front. Se quiser, me envie{" "}
-              <code>store/ai.ts</code> (completo) e o container/página que
-              carrega <code>projected</code> que eu ajusto 1:1.
-            </div>
-          )}
         </div>
       </div>
     </div>
