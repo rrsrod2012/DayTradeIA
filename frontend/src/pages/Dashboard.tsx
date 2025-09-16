@@ -48,12 +48,18 @@ type Projected = {
   probHit?: number | null;
   probCalibrated?: number | null;
   expectedValuePoints?: number | null;
+  // opcionalmente presentes no backend:
+  vwapOk?: boolean;
+  ev?: number | null;
+  expectedValue?: number | null;
+  expected_value?: number | null;
+  prob?: number | null;
 };
 
 const LS_KEY = "dtia.settings.v6";         // bump forte
 const LS_MIGRATED_FLAG = "dtia.migrated.v6";
 
-/* ====== NOVO: util para data de hoje (local) no formato YYYY-MM-DD ====== */
+/* ====== util para data de hoje (local) no formato YYYY-MM-DD ====== */
 function todayLocalISO() {
   const d = new Date();
   const y = d.getFullYear();
@@ -65,13 +71,44 @@ function todayRange() {
   const t = todayLocalISO();
   return { from: t, to: t };
 }
-
 function todayISO() {
   const d = new Date();
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
+}
+
+/* ====== EMA simples para plot ====== */
+function emaSeries(values: number[], period: number): (number | null)[] {
+  if (!Array.isArray(values) || values.length === 0 || period <= 1) {
+    return values.map(() => null);
+  }
+  const out: (number | null)[] = [];
+  const k = 2 / (period + 1);
+  let e: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = Number(values[i]) || 0;
+    e = e == null ? v : v * k + (e as number) * (1 - k);
+    out.push(e);
+  }
+  return out;
+}
+
+/* ====== NOVO: range com offset local (para alinhar com backend) ====== */
+function localOffsetStr() {
+  const offMin = new Date().getTimezoneOffset(); // minutos atrás do UTC
+  const sign = offMin > 0 ? "-" : "+";
+  const abs = Math.abs(offMin);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+}
+function toZonedRange(fromDate?: string, toDate?: string) {
+  const off = localOffsetStr();
+  const fromZ = fromDate ? `${fromDate}T00:00:00${off}` : undefined;
+  const toZ = toDate ? `${toDate}T23:59:59.999${off}` : undefined;
+  return { fromZ, toZ };
 }
 
 export default function Dashboard() {
@@ -97,6 +134,9 @@ export default function Dashboard() {
   const [applyHourFilter, setApplyHourFilter] = useState<boolean>(false);
   const [hourStart, setHourStart] = useState<number>(9);
   const [hourEnd, setHourEnd] = useState<number>(17);
+
+  // Filtro por VWAP (lado-sensível)
+  const [vwapFilter, setVwapFilter] = useState<boolean>(false);
 
   // Tabelas
   const [showColsConfirmed] = useState({
@@ -137,16 +177,13 @@ export default function Dashboard() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return; // mantém HOJE (defaults dos useState)
+      if (!raw) return; // mantém HOJE
 
       const s = JSON.parse(raw);
       if (s.symbol) setSymbol(s.symbol);
       if (s.timeframe) setTimeframe(s.timeframe);
 
-      // ⚠️ NÃO restaure dateFrom/dateTo para manter Hoje→Hoje na primeira carga
-      // if (s.dateFrom) setDateFrom(s.dateFrom);
-      // if (s.dateTo) setDateTo(s.dateTo);
-
+      // não restaura datas para manter Hoje→Hoje
       if (typeof s.showFibo === "boolean") setShowFibo(s.showFibo);
       if (typeof s.darkMode === "boolean") setDarkMode(s.darkMode);
       if (typeof s.horizon === "number") setHorizon(s.horizon);
@@ -162,18 +199,17 @@ export default function Dashboard() {
       if (typeof s.applyHourFilter === "boolean") setApplyHourFilter(s.applyHourFilter);
       if (typeof s.hourStart === "number") setHourStart(s.hourStart);
       if (typeof s.hourEnd === "number") setHourEnd(s.hourEnd);
+      if (typeof s.vwapFilter === "boolean") setVwapFilter(s.vwapFilter);
 
-      // opcional: remova as datas persistidas do storage para nunca mais voltarem
-      if ('dateFrom' in s || 'dateTo' in s) {
+      // limpa datas antigas do storage
+      if ("dateFrom" in s || "dateTo" in s) {
         const { dateFrom: _df, dateTo: _dt, ...rest } = s;
         try { localStorage.setItem(LS_KEY, JSON.stringify(rest)); } catch { }
       }
-    } catch {
-      // fica HOJE pelos defaults dos useState
-    }
+    } catch { }
   }, []);
 
-  // Garantia extra: se alguma data estiver vazia em runtime, seta HOJE
+  // Garantia extra: se alguma data estiver vazia, seta HOJE
   useEffect(() => {
     if (!dateFrom || !dateTo) {
       const t = todayISO();
@@ -182,8 +218,7 @@ export default function Dashboard() {
     }
   }, [dateFrom, dateTo]);
 
-
-  // Salva no localStorage quando qualquer parâmetro/filtro muda
+  // Persiste filtros/parâmetros
   useEffect(() => {
     const payload = {
       symbol,
@@ -205,6 +240,7 @@ export default function Dashboard() {
       applyHourFilter,
       hourStart,
       hourEnd,
+      vwapFilter,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
@@ -229,6 +265,7 @@ export default function Dashboard() {
     applyHourFilter,
     hourStart,
     hourEnd,
+    vwapFilter,
   ]);
 
   // Tema
@@ -237,26 +274,46 @@ export default function Dashboard() {
     return () => document.body.classList.remove("theme-dark");
   }, [darkMode]);
 
+  // === Range com offset local (ALINHAMENTO) ===
+  const { fromZ, toZ } = useMemo(
+    () => toZonedRange(dateFrom, dateTo),
+    [dateFrom, dateTo]
+  );
+
+  // Params base para GET /candles e /signals
   const params = useMemo(
     () => ({
       symbol: symbol.toUpperCase(),
       timeframe: timeframe.toUpperCase(),
-      from: dateFrom || undefined,
-      to: dateTo || undefined,
+      from: fromZ, // com offset local
+      to: toZ,     // com offset local
     }),
-    [symbol, timeframe, dateFrom, dateTo]
+    [symbol, timeframe, fromZ, toZ]
   );
+
+  // EMA para o gráfico
+  useEffect(() => {
+    if (!candles?.length) {
+      setEma9([]);
+      setEma21([]);
+      return;
+    }
+    const closes = candles.map((c) => Number(c.close) || 0);
+    setEma9(emaSeries(closes, 9));
+    setEma21(emaSeries(closes, 21));
+  }, [candles]);
 
   const loadAll = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
 
+      // Candles (gráfico)
       const cc = await api.get("/candles", { params });
       setCandles(cc.data ?? []);
 
+      // Sinais confirmados
       const ss = await api.get("/signals", { params });
-      // aceita tanto array puro quanto {signals:[]}
       const sig =
         Array.isArray(ss.data)
           ? ss.data
@@ -267,11 +324,12 @@ export default function Dashboard() {
               : [];
       setSignals(sig);
 
+      // Projetados (IA + heurística, com filtros/gates)
       const pp = await api.post("/signals/projected", {
         symbol,
         timeframe,
-        from: dateFrom || undefined,
-        to: dateTo || undefined,
+        from: fromZ,
+        to: toZ,
         horizon,
         rr,
         evalWindow,
@@ -284,6 +342,7 @@ export default function Dashboard() {
         minEV: Number(minEV) || 0,
         lossCap: Number(dailyLossCap) || 0,
         minProb: Number(minProb) || 0,
+        vwapFilter: vwapFilter ? 1 : 0, // lado-sensível
       });
       const proj = Array.isArray(pp.data)
         ? pp.data
@@ -294,12 +353,18 @@ export default function Dashboard() {
             : [];
       setProjected(proj);
 
+      // Backtest (trades) — agora também recebe os mesmos gates para “casar” com Projetados
       const bt = await api.post("/backtest", {
         symbol,
         timeframe,
-        from: dateFrom || undefined,
-        to: dateTo || undefined,
+        from: fromZ,
+        to: toZ,
         lossCap: Number(dailyLossCap) || 0,
+        // se o backend não usar, ele ignora:
+        minProb: Number(minProb) || 0,
+        minEV: Number(minEV) || 0,
+        useMicroModel: useMicroModel ? 1 : 0,
+        vwapFilter: vwapFilter ? 1 : 0,
       });
       setPnL(bt.data ?? { pnlPoints: 0, pnlMoney: 0 });
     } catch (e: any) {
@@ -314,8 +379,8 @@ export default function Dashboard() {
   }, [
     symbol,
     timeframe,
-    dateFrom,
-    dateTo,
+    fromZ,
+    toZ,
     horizon,
     rr,
     evalWindow,
@@ -326,12 +391,23 @@ export default function Dashboard() {
     minProb,
     minEV,
     dailyLossCap,
+    vwapFilter,
     params,
   ]);
 
+  // Carrega quando as dependências mudarem
   useEffect(() => {
-    if (dateFrom && dateTo) loadAll();
-  }, [loadAll, dateFrom, dateTo]);
+    if (fromZ && toZ) loadAll();
+  }, [loadAll, fromZ, toZ]);
+
+  // Polling quando “Realtime” estiver ON
+  useEffect(() => {
+    if (!realtime) return;
+    const id = setInterval(() => {
+      loadAll();
+    }, 10000);
+    return () => clearInterval(id);
+  }, [realtime, loadAll]);
 
   // ---- util de PnL/trades
   const allTrades = useMemo(
@@ -346,13 +422,12 @@ export default function Dashboard() {
       const end = Math.max(0, Math.min(23, Number(hourEnd) || 0));
       const inRange = (h: number) => {
         if (start <= end) return h >= start && h <= end;
-        // faixa cruzando meia-noite (ex.: 22->2)
-        return h >= start || h <= end;
+        return h >= start || h <= end; // faixa cruzando meia-noite
       };
       return trades.filter((t) => {
         const d = t?.entryTime ? new Date(t.entryTime) : null;
         const hr = d ? d.getHours() : null;
-        if (hr === null) return false; // sem hora, não entra no filtro
+        if (hr === null) return false;
         return inRange(hr);
       });
     },
@@ -395,8 +470,13 @@ export default function Dashboard() {
         take: p.takeProfitSuggestion,
         condition: p.conditionText,
         score: p.score,
-        prob: p.probCalibrated ?? p.probHit,
-        ev_points: p.expectedValuePoints,
+        prob: p.probCalibrated ?? p.probHit ?? p.prob,
+        ev_points:
+          p.expectedValuePoints ??
+          p.ev ??
+          p.expectedValue ??
+          p.expected_value,
+        vwap_ok: typeof p.vwapOk === "boolean" ? (p.vwapOk ? 1 : 0) : "",
       })),
       [
         "time",
@@ -409,6 +489,7 @@ export default function Dashboard() {
         "score",
         "prob",
         "ev_points",
+        "vwap_ok",
       ]
     );
     downloadCSV(
@@ -752,7 +833,16 @@ export default function Dashboard() {
                   }
                 />
               </Col>
-              <Col sm={5} className="text-end">
+              <Col sm={3}>
+                {/* Filtro por VWAP lado-sensível */}
+                <Form.Check
+                  type="switch"
+                  label="Filtrar por VWAP (lado)"
+                  checked={vwapFilter}
+                  onChange={(e) => setVwapFilter(e.currentTarget.checked)}
+                />
+              </Col>
+              <Col sm={2} className="text-end">
                 <div className="text-muted small">
                   Dica: use o heatmap abaixo para escolher as horas mais fortes.
                 </div>

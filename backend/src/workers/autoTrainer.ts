@@ -1,10 +1,12 @@
 /* eslint-disable no-console */
 import { prisma } from "../prisma";
 import logger from "../logger";
+import { loadCandlesAnyTF } from "../lib/aggregation";
 
 type TrainExample = {
   features: Record<string, number>;
-  label: 0 | 1;
+  label: 0 | 1;                // TP antes de SL (binário)
+  evPoints: number;            // PnL em pontos (regressão)
   meta?: Record<string, any>;
 };
 
@@ -15,6 +17,7 @@ let _lastRunAt: Date | null = null;
 let _trainedSignals = new Set<number>();
 let _stats = { sent: 0, batches: 0 };
 
+/* ================== Utils TF / ENV ================== */
 function tfCandidates(tf?: string | null) {
   if (!tf) return ["M1", "M5", "M15", "M30", "H1"];
   const T = String(tf).toUpperCase();
@@ -25,8 +28,122 @@ function tfCandidates(tf?: string | null) {
   if (T.startsWith("H1")) return ["H1", "M30", "M15"];
   return ["M1", "M5", "M15", "M30", "H1"];
 }
+function envNumber(name: string, def?: number) {
+  const v = process.env[name];
+  if (!v && v !== "0") return def;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+function envBool(name: string, def = false) {
+  const v = (process.env[name] || "").trim().toLowerCase();
+  if (!v) return def;
+  return v === "1" || v === "true" || v === "yes";
+}
 
-function atr14(values: { high: number; low: number; close: number }[]) {
+/* ================== Indicadores ================== */
+function EMA(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = [];
+  const k = 2 / (period + 1);
+  let e: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = Number(values[i]) || 0;
+    e = e == null ? v : v * k + (e as number) * (1 - k);
+    out.push(e);
+  }
+  return out;
+}
+function ATR(high: number[], low: number[], close: number[], period = 14): (number | null)[] {
+  const len = close.length;
+  const tr: number[] = new Array(len).fill(0);
+  for (let i = 1; i < len; i++) {
+    const trueRange = Math.max(
+      high[i] - low[i],
+      Math.abs(high[i] - close[i - 1]),
+      Math.abs(low[i] - close[i - 1])
+    );
+    tr[i] = trueRange;
+  }
+  const out: (number | null)[] = [];
+  let acc = 0;
+  for (let i = 0; i < len; i++) {
+    const v = tr[i] || 0;
+    if (i === 0) {
+      out.push(null);
+      acc = v;
+    } else if (i < period) {
+      acc += v;
+      out.push(null);
+    } else if (i === period) {
+      const first = (acc + v) / period;
+      out.push(first);
+    } else {
+      const prev = out[i - 1] as number;
+      out.push((prev * (period - 1) + v) / period);
+    }
+  }
+  return out;
+}
+function VWAP(high: number[], low: number[], close: number[], volume: number[]): number[] {
+  const out: number[] = [];
+  let cumPV = 0;
+  let cumV = 0;
+  for (let i = 0; i < close.length; i++) {
+    const typical = (high[i] + low[i] + close[i]) / 3;
+    const v = Math.max(0, volume[i] || 0);
+    cumPV += typical * v;
+    cumV += v;
+    out.push(cumV > 0 ? cumPV / cumV : typical);
+  }
+  return out;
+}
+function ADX(high: number[], low: number[], close: number[], period = 14) {
+  const len = close.length;
+  const plusDM: number[] = [0], minusDM: number[] = [0], tr: number[] = [0];
+  for (let i = 1; i < len; i++) {
+    const upMove = high[i] - high[i - 1];
+    const downMove = low[i - 1] - low[i];
+    plusDM[i] = upMove > downMove && upMove > 0 ? upMove : 0;
+    minusDM[i] = downMove > upMove && downMove > 0 ? downMove : 0;
+    tr[i] = Math.max(
+      high[i] - low[i],
+      Math.abs(high[i] - close[i - 1]),
+      Math.abs(low[i] - close[i - 1])
+    );
+  }
+  const smooth = (arr: number[]) => EMA(arr, period).map((v) => (v ?? 0));
+  const trN = smooth(tr);
+  const pDMN = smooth(plusDM);
+  const mDMN = smooth(minusDM);
+
+  const pDI: number[] = [], mDI: number[] = [], dx: number[] = [];
+  for (let i = 0; i < len; i++) {
+    const trv = trN[i] || 1e-9;
+    const p = 100 * (pDMN[i] || 0) / trv;
+    const m = 100 * (mDMN[i] || 0) / trv;
+    pDI.push(p);
+    mDI.push(m);
+    dx.push(100 * Math.abs(p - m) / Math.max(p + m, 1e-9));
+  }
+  return EMA(dx, period).map((v) => (v ?? 0));
+}
+function slope(arr: (number | null)[], lookback = 5) {
+  const buf = arr.map((x) => (x == null ? NaN : Number(x)));
+  const n = Math.min(lookback, buf.length);
+  if (n < 2) return 0;
+  const a = buf.slice(-n);
+  if (a.some((v) => !Number.isFinite(v))) return 0;
+  const xBar = (n - 1) / 2;
+  const yBar = a.reduce((p, v) => p + v, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xBar) * (a[i] - yBar);
+    den += (i - xBar) * (i - xBar);
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+/* ================== ATR “rápido” (uso no label) ================== */
+function atr14Quick(values: { high: number; low: number; close: number }[]) {
   if (!values?.length) return null;
   let prevClose = values[0].close;
   let trs: number[] = [];
@@ -46,7 +163,8 @@ function atr14(values: { high: number; low: number; close: number }[]) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-async function labelFromSignalPnL(args: {
+/* ================== Avaliação do sinal: label & EV ================== */
+async function evaluateSignalOutcome(args: {
   id: number;
   side: "BUY" | "SELL";
   candle: {
@@ -64,6 +182,8 @@ async function labelFromSignalPnL(args: {
   const H = Math.max(1, Number(process.env.AUTO_TRAINER_HORIZON) || 12);
   const K_SL = Number(process.env.AUTO_TRAINER_SL_ATR) || 1.0;
   const RR = Number(process.env.AUTO_TRAINER_RR) || 2.0;
+  const USE_HOLD_PNL = envBool("AUTO_TRAINER_HOLD_PNL_AT_H", true);
+
   const entry = args.candle.close;
 
   const atrCands = await prisma.candle.findMany({
@@ -77,11 +197,13 @@ async function labelFromSignalPnL(args: {
     select: { high: true, low: true, close: true },
   });
 
-  const atr = atr14(atrCands);
-  if (!Number.isFinite(atr) || !atr) return 0;
+  const atr = atr14Quick(atrCands);
+  if (!Number.isFinite(atr) || !atr) {
+    return { label: 0 as 0 | 1, evPoints: 0 };
+  }
 
-  const sl = K_SL * atr;
-  const tp = RR * sl;
+  const slPts = K_SL * atr;
+  const tpPts = RR * slPts;
 
   const win = await prisma.candle.findMany({
     where: {
@@ -94,83 +216,155 @@ async function labelFromSignalPnL(args: {
     select: { high: true, low: true, close: true },
   });
 
-  if (!win?.length) return 0;
+  if (!win?.length) return { label: 0, evPoints: 0 };
 
   if (args.side === "BUY") {
-    let hitSL = false;
     for (const w of win) {
-      if (w.low <= entry - sl) {
-        hitSL = true;
-        break;
-      }
-      if (w.high >= entry + tp) {
-        return 1;
-      }
+      if (w.low <= entry - slPts) return { label: 0, evPoints: -slPts };
+      if (w.high >= entry + tpPts) return { label: 1, evPoints: +tpPts };
     }
-    return hitSL ? 0 : 0;
+    // sem toque em SL/TP no horizonte
+    const hold = (win[win.length - 1].close - entry);
+    return { label: 0, evPoints: USE_HOLD_PNL ? hold : 0 };
   } else {
-    let hitSL = false;
     for (const w of win) {
-      if (w.high >= entry + sl) {
-        hitSL = true;
-        break;
-      }
-      if (w.low <= entry - tp) {
-        return 1;
-      }
+      if (w.high >= entry + slPts) return { label: 0, evPoints: -slPts };
+      if (w.low <= entry - tpPts) return { label: 1, evPoints: +tpPts };
     }
-    return hitSL ? 0 : 0;
+    const hold = (entry - win[win.length - 1].close);
+    return { label: 0, evPoints: USE_HOLD_PNL ? hold : 0 };
   }
 }
 
-function featureize(sig: {
-  id: number;
-  side: "BUY" | "SELL";
-  candle: {
-    id: number;
-    time: Date;
-    instrumentId: number;
-    timeframe: string | null;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number | null;
-  };
-}) {
-  const c = sig.candle;
+/* ================== Feature set (enriquecido) ================== */
+function baseCandleFeatures(c: {
+  open: number; high: number; low: number; close: number; volume: number | null;
+}, side: "BUY" | "SELL") {
   const body = Math.abs(c.close - c.open);
   const range = c.high - c.low;
   const upperShadow = c.high - Math.max(c.open, c.close);
   const lowerShadow = Math.min(c.open, c.close) - c.low;
   const dir = c.close >= c.open ? 1 : -1;
-
   return {
-    body,
-    range,
-    upperShadow,
-    lowerShadow,
-    dir,
+    body, range, upperShadow, lowerShadow, dir,
     close: c.close,
     open: c.open,
     volume: c.volume ?? 0,
-    sideBuy: sig.side === "BUY" ? 1 : 0,
+    sideBuy: side === "BUY" ? 1 : 0,
   } as Record<string, number>;
 }
 
-async function buildTrainBatch(signals: any[]) {
+function techFeaturesAtIndex(i: number, series: {
+  high: number[]; low: number[]; close: number[]; vol: number[];
+  e9: (number | null)[]; e21: (number | null)[]; atr: (number | null)[];
+  vwap: number[]; adx: number[];
+}) {
+  const c = series.close[i];
+  const e21 = (series.e21[i] ?? c) as number;
+  const atr = (series.atr[i] ?? series.atr[i - 1] ?? 1) as number;
+  const slope21 = slope(series.e21.slice(0, i + 1), Math.min(5, i));
+  return {
+    dist_ema21: (c - e21) / Math.max(1e-6, atr),
+    slope_e21: slope21 / Math.max(1e-6, atr),
+    range_ratio: (series.high[i] - series.low[i]) / Math.max(1e-6, atr),
+    dist_vwap_atr: Math.abs(c - series.vwap[i]) / Math.max(1e-6, atr),
+    adx14: series.adx[i] ?? 0,
+  };
+}
+
+/* ================== Filtros do engine (alinhados) ================== */
+function passesEngineFilters(i: number, side: "BUY" | "SELL", series: {
+  high: number[]; low: number[]; close: number[]; vol: number[];
+  e9: (number | null)[]; e21: (number | null)[]; atr: (number | null)[];
+  vwap: number[]; adx: number[];
+}) {
+  const MIN_ADX = envNumber("ENGINE_MIN_ADX", 20)!;
+  const MIN_SLOPE = envNumber("ENGINE_MIN_SLOPE", 0.02)!; // em ATR
+  const MAX_DIST_VWAP_ATR = envNumber("ENGINE_MAX_DIST_VWAP_ATR", 0.15)!; // 0 desliga
+  const REQUIRE_BREAKOUT = envBool("ENGINE_REQUIRE_BREAKOUT", true);
+  const N = 10;
+
+  if (i < 2) return false;
+
+  const c = series.close[i];
+  const ema9 = (series.e9[i] ?? c) as number;
+  const ema21 = (series.e21[i] ?? c) as number;
+  const prevDiff = (series.e9[i - 1] ?? series.close[i - 1])! - (series.e21[i - 1] ?? series.close[i - 1])!;
+  const diff = ema9 - ema21;
+
+  const winStart = Math.max(0, i - N);
+  const winHigh = Math.max(...series.high.slice(winStart, i));
+  const winLow = Math.min(...series.low.slice(winStart, i));
+  const _atr = (series.atr[i] ?? series.atr[i - 1] ?? 1) as number;
+
+  const adxOk = (series.adx[i] ?? 0) >= MIN_ADX;
+
+  const s21 = slope(series.e21.slice(0, i + 1), Math.min(5, i));
+  const sNorm = _atr > 0 ? s21 / _atr : 0;
+  const slopeOkBuy = sNorm >= MIN_SLOPE;
+  const slopeOkSell = sNorm <= -MIN_SLOPE;
+
+  const distVWAP = Math.abs(c - series.vwap[i]);
+  const distOk = MAX_DIST_VWAP_ATR <= 0 ? true : distVWAP >= MAX_DIST_VWAP_ATR * _atr;
+
+  const crossedUp = (series.e9[i - 1] ?? series.close[i - 1])! <= (series.e21[i - 1] ?? series.close[i - 1])! && ema9 > ema21;
+  const crossedDn = (series.e9[i - 1] ?? series.close[i - 1])! >= (series.e21[i - 1] ?? series.close[i - 1])! && ema9 < ema21;
+
+  const breakoutUp = REQUIRE_BREAKOUT ? c > winHigh : true;
+  const breakoutDn = REQUIRE_BREAKOUT ? c < winLow : true;
+
+  if (side === "BUY") {
+    return crossedUp && breakoutUp && adxOk && slopeOkBuy && distOk;
+  } else {
+    return crossedDn && breakoutDn && adxOk && slopeOkSell && distOk;
+  }
+}
+
+/* ================== Construção do batch alinhado ================== */
+async function buildTrainBatchAligned(signals: any[]) {
   const out: TrainExample[] = [];
+
   for (const s of signals) {
     if (!s.candle) continue;
+    const symbol = (s.candle.instrument?.symbol || "WIN").toString().toUpperCase();
+    const timeframe = (s.candle.timeframe as string | null) ?? "M5";
 
-    const pnl = await labelFromSignalPnL({
+    const rows = await loadCandlesAnyTF(symbol, String(timeframe).toUpperCase(), {
+      lte: s.candle.time,
+      limit: 600,
+    });
+    if (!Array.isArray(rows) || rows.length < 50) continue;
+
+    const timesISO = rows.map((r: any) => (r.time instanceof Date ? r.time : new Date(r.time)).toISOString());
+    const targetISO = (s.candle.time as Date).toISOString();
+    const idx = timesISO.lastIndexOf(targetISO);
+    if (idx < 2) continue;
+
+    const highs = rows.map((r: any) => Number(r.high));
+    const lows = rows.map((r: any) => Number(r.low));
+    const closes = rows.map((r: any) => Number(r.close));
+    const vols = rows.map((r: any) => Number(r.volume ?? 0));
+    const e9 = EMA(closes, 9);
+    const e21 = EMA(closes, 21);
+    const atr = ATR(highs, lows, closes, 14);
+    const vwap = VWAP(highs, lows, closes, vols);
+    const adx = ADX(highs, lows, closes, 14);
+    const series = { high: highs, low: lows, close: closes, vol: vols, e9, e21, atr, vwap, adx };
+
+    const side = (s.side as "BUY" | "SELL") || "BUY";
+
+    // Só treina exemplos que passariam pelos filtros do engine
+    if (!passesEngineFilters(idx, side, series)) continue;
+
+    // Avalia label e EV
+    const outcome = await evaluateSignalOutcome({
       id: s.id,
-      side: s.side as any,
+      side,
       candle: {
         id: s.candle.id,
         time: s.candle.time as any,
         instrumentId: s.candle.instrumentId as any,
-        timeframe: (s.candle.timeframe as string | null) ?? null,
+        timeframe: timeframe,
         open: Number(s.candle.open),
         high: Number(s.candle.high),
         low: Number(s.candle.low),
@@ -179,10 +373,30 @@ async function buildTrainBatch(signals: any[]) {
       },
     });
 
+    // Features base + técnicas
+    const base = baseCandleFeatures(
+      {
+        open: Number(s.candle.open),
+        high: Number(s.candle.high),
+        low: Number(s.candle.low),
+        close: Number(s.candle.close),
+        volume: s.candle.volume == null ? 0 : Number(s.candle.volume),
+      },
+      side
+    );
+    const tech = techFeaturesAtIndex(idx, series);
+
     out.push({
-      features: featureize(s),
-      label: pnl ? 1 : 0,
-      meta: { signalId: s.id, candleId: s.candle.id },
+      features: { ...base, ...tech },
+      label: outcome.label,
+      evPoints: Number.isFinite(outcome.evPoints) ? outcome.evPoints : 0,
+      meta: {
+        signalId: s.id,
+        candleId: s.candle.id,
+        symbol,
+        timeframe,
+        timeISO: targetISO,
+      },
     });
 
     _trainedSignals.add(s.id);
@@ -190,11 +404,11 @@ async function buildTrainBatch(signals: any[]) {
   return out;
 }
 
+/* ================== Coleta de exemplos ================== */
 async function collectExamples(limit: number): Promise<TrainExample[]> {
   const notInIds = Array.from(_trainedSignals.values());
   const baseWhere: any = {
     signalType: "EMA_CROSS",
-    // em vez de candleId != null, usa relação
     candle: { isNot: null },
   };
   if (notInIds.length > 0) {
@@ -219,15 +433,17 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
           low: true,
           close: true,
           volume: true,
+          instrument: { select: { symbol: true } },
         },
       },
     },
   });
 
   if (!signals?.length) return [];
-  return await buildTrainBatch(signals);
+  return await buildTrainBatchAligned(signals);
 }
 
+/* ================== HTTP / Scheduler ================== */
 function ms(n: number, def: number) {
   const v = Number(n);
   return Number.isFinite(v) && v > 0 ? v : def;
@@ -235,15 +451,18 @@ function ms(n: number, def: number) {
 function okURL() {
   return !!(process.env.MICRO_MODEL_URL || "").trim();
 }
+
 async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 15000): Promise<T> {
   let f: typeof fetch = (global as any).fetch;
   if (!f) {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
       f = require("node-fetch");
     } catch {
       throw new Error("fetch indisponível e node-fetch não encontrado");
     }
   }
+  // @ts-expect-error AbortController global pode não existir em versões antigas
   const ctl = new (global as any).AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -263,7 +482,8 @@ async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 15000):
   }
 }
 
-async function runOnce() {
+/** Agora exportado e com EV */
+export async function runOnce() {
   _lastRunAt = new Date();
   _lastError = null;
 
@@ -275,19 +495,25 @@ async function runOnce() {
 
     const examples = await collectExamples(BATCH);
     if (!examples.length) {
-      logger.info("[AutoTrainer] nenhum exemplo novo no momento");
+      logger.info("[AutoTrainer] nenhum exemplo novo no momento (após filtros do engine)");
       return;
     }
 
-    const payload = {
+    const payload: any = {
       inputs: examples.map((e) => e.features),
-      labels: examples.map((e) => e.label),
+      labels: examples.map((e) => e.label),             // classificação
+      targetEV: examples.map((e) => e.evPoints),        // regressão (EV em pontos)
       meta: examples.map((e) => e.meta || null),
       epochs: EPOCHS,
     };
 
-    const url = `${(process.env.MICRO_MODEL_URL || "").trim().replace(/\/+$/, "")}/train`;
-    const res = await httpPostJSON<{ ok: boolean; trained: number }>(url, payload, ms(Number(process.env.AUTO_TRAINER_HTTP_TIMEOUT_MS) || 0, 20000));
+    const base = (process.env.MICRO_MODEL_URL || "").trim().replace(/\/+$/, "");
+    const url = `${base}/train`;
+    const res = await httpPostJSON<{ ok: boolean; trained: number }>(
+      url,
+      payload,
+      ms(Number(process.env.AUTO_TRAINER_HTTP_TIMEOUT_MS) || 0, 20000)
+    );
 
     if (!res?.ok) throw new Error("Treino retornou ok=false");
 
@@ -347,4 +573,9 @@ export async function statusAutoTrainer() {
     trackedSignals: _trainedSignals.size,
     microModelUrl: (process.env.MICRO_MODEL_URL || "").trim() || null,
   };
+}
+
+/** Alias opcional */
+export async function pokeAutoTrainer() {
+  return runOnce();
 }

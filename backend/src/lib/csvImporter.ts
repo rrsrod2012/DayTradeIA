@@ -216,6 +216,38 @@ async function importCsv(filePath: string) {
   const t0 = Date.now();
   const file = path.basename(filePath);
   const { symbol, timeframe } = inferSymbolAndTFFromFilename(filePath);
+
+  // ---- Guardrail opcional: aceitar apenas CSVs M1 quando IMPORT_M1_ONLY=true
+  const __M1_ONLY = String(process.env.IMPORT_M1_ONLY || "").toLowerCase() === "true";
+  if (__M1_ONLY && timeframe !== "M1") {
+    const totalLines = await countLines(filePath);
+    try {
+      eventBus?.emit?.("csv:skipped", {
+        file,
+        symbol,
+        timeframe,
+        reason: "IMPORT_M1_ONLY",
+        total: totalLines ?? null,
+      });
+    } catch { }
+    const durationMs = Date.now() - t0;
+    const outSkip = {
+      ok: true,
+      skipped: true,
+      reason: "IMPORT_M1_ONLY",
+      file,
+      symbol,
+      timeframe,
+      inserted: 0,
+      updated: 0,
+      processed: 0,
+      total: totalLines ?? 0,
+      durationMs,
+    };
+    console.warn(JSON.stringify({ msg: "[CSVImporter] ignorado IMPORT_M1_ONLY", ...outSkip }));
+    return outSkip;
+  }
+
   const instrumentId = await upsertInstrument(symbol);
 
   const totalLines = await countLines(filePath);
@@ -373,6 +405,30 @@ async function importCsv(filePath: string) {
     total,
     durationMs,
   };
+
+  // ---- Gatilho opcional: rodar uma passada do AutoTrainer imediatamente
+  try {
+    const POKE = String(process.env.AUTO_TRAINER_POKE_ON_IMPORT || "").toLowerCase() === "true";
+    if (POKE) {
+      const at = require("../workers/autoTrainer");
+      const runOnce =
+        at?.runOnce ||
+        at?.pokeAutoTrainer || // fallback se existir com outro nome
+        (typeof at === "function" ? at : null);
+      if (typeof runOnce === "function") {
+        console.log(JSON.stringify({ msg: "[CSVImporter] AUTO_TRAINER_POKE_ON_IMPORT → runOnce" }));
+        await runOnce();
+      }
+    }
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        msg: "[CSVImporter] erro ao acionar AutoTrainer",
+        err: String((err && err.message) || err),
+      })
+    );
+  }
+
   console.log(JSON.stringify({ msg: "[CSVImporter] concluído", ...out }));
   return out;
 }

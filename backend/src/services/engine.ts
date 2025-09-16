@@ -200,7 +200,7 @@ function buildHeuristicSignals(
     }
   }
 
-  // Se nada gatilhou, dá um “palpite” suave no último candle conforme inclinação das EMAs
+  // Fallback suave
   if (out.length === 0) {
     const i = candles.length - 1;
     const closes = candles.map((c) => c.close);
@@ -276,19 +276,33 @@ async function rescoreWithML(
     });
     const text = await r.text();
     const j = text ? JSON.parse(text) : null;
-    if (!r.ok || !j?.ok || !Array.isArray(j?.scores)) return items;
+    if (!r.ok || !j?.ok) return items;
 
-    // Repondera de forma suave
+    // Arrays opcionais que o micro-modelo pode retornar:
+    //  - j.scores[]           -> probabilidade (0..1)
+    //  - j.ev[] ou j.ev_points[] -> EV previsto em pontos
+    const probs: number[] | undefined = Array.isArray(j?.scores) ? j.scores : undefined;
+    const evArr: number[] | undefined =
+      Array.isArray(j?.ev) ? j.ev :
+        Array.isArray(j?.ev_points) ? j.ev_points :
+          Array.isArray(j?.expectedValuePoints) ? j.expectedValuePoints : undefined;
+
     const rescored: Projected[] = [];
     let k = 0;
     for (const it of items) {
-      const ml = j.scores[k++];
-      const w = typeof ml === "number" ? Math.min(1, Math.max(0, ml)) : 0.5;
-      const score = Math.min(
-        1,
-        Math.max(0.1, (it.score * 0.6 + w * 0.8) / 1.2)
-      );
-      rescored.push({ ...it, score });
+      const p = probs && typeof probs[k] === "number" ? Math.min(1, Math.max(0, probs[k])) : undefined;
+      const ev = evArr && typeof evArr[k] === "number" ? evArr[k] : undefined;
+
+      let score = it.score;
+      if (typeof p === "number") {
+        score = Math.min(1, Math.max(0.1, (it.score * 0.6 + p * 0.8) / 1.2));
+      }
+
+      const out: Projected = { ...it, score };
+      if (typeof p === "number") out.prob = p;
+      if (typeof ev === "number") out.expectedValuePoints = ev;
+      rescored.push(out);
+      k++;
     }
     return rescored;
   } catch {
@@ -413,7 +427,6 @@ export async function generateProjectedSignals(
     const candles = await fetchCandles(symbol, timeframe, from, to, limit);
     if (!candles.length) return [];
 
-    // Se veio range, usamos os próprios candles do range; se não, usamos a cauda
     const tail =
       from || to
         ? candles
@@ -425,11 +438,10 @@ export async function generateProjectedSignals(
     // Reordena e limita
     items = items.sort((a, b) => a.time.localeCompare(b.time)).slice(-limit);
 
-    // Opcional: IA reponderando (se disponível)
+    // IA reponderando (se disponível) — agora também preenche prob/EV
     items = await rescoreWithML(items, tail);
 
     // === Enriquecimento com VWAP (lado-sensível) ===
-    // Calcula VWAP na mesma janela, e marca cada sinal com vwapOk: BUY => close>=VWAP; SELL => close<=VWAP.
     const highs = tail.map((c) => c.high);
     const lows = tail.map((c) => c.low);
     const closes = tail.map((c) => c.close);
@@ -450,7 +462,7 @@ export async function generateProjectedSignals(
       items = items.filter((s) => s.vwapOk !== false);
     }
 
-    // === NORMALIZAÇÃO DE SINAL DO EV (SELL => EV positivo) ===
+    // === NORMALIZAÇÃO EV (SELL => positivo) ===
     items = items.map((s: any) => {
       const side = String(s?.side || "").toUpperCase();
       const out: any = { ...s };
@@ -468,7 +480,7 @@ export async function generateProjectedSignals(
       return out as Projected;
     });
 
-    // (opcional) Respeitar minProb / minEV aqui também, se vierem nos params:
+    // Thresholds opcionais vindos do cliente
     if (typeof params?.minProb === "number") {
       items = items.filter(
         (s: any) => typeof s.prob !== "number" || s.prob >= params.minProb!

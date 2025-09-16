@@ -34,6 +34,8 @@ type BacktestSummary = {
     maxDrawdown: number;
 };
 
+type PartialFill = { atIndex: number; price: number; qty: number };
+
 type Trade = {
     entryIdx: number;
     exitIdx: number;
@@ -44,6 +46,26 @@ type Trade = {
     exitPrice: number;
     pnl: number;
     note?: string;
+
+    // --- campos opcionais (Pacote #1) ---
+    movedToBE?: boolean;
+    trailEvents?: number;
+    partials?: PartialFill[];
+};
+
+type ExitPolicy = {
+    kSL?: number;
+    rr?: number;
+    kTrail?: number;
+    timeStopBars?: number;
+    breakEvenAtR?: number;
+    beOffsetR?: number;
+    partial1R?: number;
+    partial2R?: number;
+    partialRemainTrail?: boolean;
+    slippagePts?: number;
+    costPts?: number;
+    horizonBars?: number;
 };
 
 type BacktestRunSnapshot = {
@@ -62,6 +84,17 @@ type BacktestRunSnapshot = {
     pnlMoney?: number;
     lossCapApplied?: number;
     maxConsecLossesApplied?: number;
+
+    // --- campos opcionais adicionados para exibir configuração/saídas ---
+    config?: {
+        vwapFilter?: boolean;
+        minProb?: number;
+        minEV?: number;
+        metaMinProb?: number;
+        // outros campos que o backend possa enviar
+        [k: string]: any;
+    };
+    policy?: ExitPolicy;
 };
 
 function formatDateTime(iso?: string) {
@@ -74,10 +107,24 @@ function formatDateTime(iso?: string) {
     }
 }
 function pct(x: number, digits = 1) {
-    return `${(x * 100).toFixed(digits)}%`;
+    const v = Number(x);
+    if (!Number.isFinite(v)) return "-";
+    return `${(v * 100).toFixed(digits)}%`;
 }
-function n2(x: number, digits = 2) {
-    return Number.isFinite(x) ? x.toFixed(digits) : String(x);
+function n2(x: any, digits = 2) {
+    if (x === "Infinity") return "Infinity";
+    const v = Number(x);
+    return Number.isFinite(v) ? v.toFixed(digits) : String(x ?? "-");
+}
+function hasExtraTradeInfo(t: Trade) {
+    return !!(t?.movedToBE || (t?.trailEvents && t.trailEvents > 0) || (t?.partials && t.partials.length > 0));
+}
+function flagsForTrade(t: Trade) {
+    const bits: string[] = [];
+    if (t.movedToBE) bits.push("BE");
+    if (t.trailEvents && t.trailEvents > 0) bits.push(`TR${t.trailEvents}`);
+    if (t.partials && t.partials.length > 0) bits.push(`P${t.partials.length}`);
+    return bits.join(" · ");
 }
 
 export default function BacktestRunsPanel() {
@@ -131,27 +178,44 @@ export default function BacktestRunsPanel() {
         }
     }, []);
 
+    // Auto-refresh que respeita o switch
     React.useEffect(() => {
         let alive = true;
         let timer: any = null;
+
         async function tick() {
             if (!alive) return;
             await loadRuns();
             if (!alive) return;
-            timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
+            if (autoRefresh) {
+                timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
+            }
         }
+
+        // carrega imediatamente
         tick();
+
         return () => {
             alive = false;
             if (timer) clearTimeout(timer);
         };
-    }, [loadRuns, refreshSec]);
+    }, [loadRuns, refreshSec, autoRefresh]);
 
     const filtered = runs.filter((it) => {
         const okSym = filterSym ? it.symbol?.toUpperCase().includes(filterSym.toUpperCase()) : true;
         const okTf = filterTf ? it.timeframe?.toUpperCase().includes(filterTf.toUpperCase()) : true;
         return okSym && okTf;
     });
+
+    // helpers para cartões do resumo
+    const pfLabel = selected?.summary?.profitFactor === "Infinity"
+        ? "Infinity"
+        : n2(selected?.summary?.profitFactor, 3);
+
+    const hasAnyFlags = React.useMemo(
+        () => !!(selected?.trades || []).some((t) => hasExtraTradeInfo(t)),
+        [selected]
+    );
 
     return (
         <div className="container my-3">
@@ -284,7 +348,43 @@ export default function BacktestRunsPanel() {
                                     </div>
                                 </div>
 
-                                <div className="row row-cols-2 row-cols-md-4 g-2 my-2">
+                                {/* Chips de configurações aplicadas (se presentes) */}
+                                {(selected.lossCapApplied || selected.maxConsecLossesApplied || selected.config || selected.policy) && (
+                                    <div className="d-flex flex-wrap gap-2 mt-2">
+                                        {typeof selected.lossCapApplied === "number" && selected.lossCapApplied > 0 && (
+                                            <span className="badge bg-warning text-dark">LossCap: {n2(selected.lossCapApplied, 0)} pts</span>
+                                        )}
+                                        {typeof selected.maxConsecLossesApplied === "number" && selected.maxConsecLossesApplied > 0 && (
+                                            <span className="badge bg-warning text-dark">Max Losses: {selected.maxConsecLossesApplied}</span>
+                                        )}
+                                        {selected.config && typeof selected.config === "object" && (
+                                            <>
+                                                {"minProb" in selected.config && <span className="badge bg-info">minProb: {n2(selected.config.minProb, 2)}</span>}
+                                                {"minEV" in selected.config && <span className="badge bg-info">minEV: {n2(selected.config.minEV, 2)}</span>}
+                                                {"metaMinProb" in selected.config && <span className="badge bg-secondary">metaMinProb: {n2(selected.config.metaMinProb, 2)}</span>}
+                                                {"vwapFilter" in selected.config && <span className="badge bg-secondary">VWAP: {selected.config.vwapFilter ? "ON" : "OFF"}</span>}
+                                            </>
+                                        )}
+                                        {selected.policy && (
+                                            <>
+                                                {"kSL" in selected.policy && <span className="badge bg-light text-dark">SL: {n2(selected.policy.kSL, 2)} ATR</span>}
+                                                {"rr" in selected.policy && <span className="badge bg-light text-dark">R:R {n2(selected.policy.rr, 2)}</span>}
+                                                {"kTrail" in selected.policy && <span className="badge bg-light text-dark">Trail: {n2(selected.policy.kTrail, 2)} ATR</span>}
+                                                {"breakEvenAtR" in selected.policy && <span className="badge bg-light text-dark">BE @ {n2(selected.policy.breakEvenAtR, 2)}R</span>}
+                                                {"partial1R" in selected.policy && <span className="badge bg-light text-dark">P1: {n2(selected.policy.partial1R, 2)}R</span>}
+                                                {"partial2R" in selected.policy && <span className="badge bg-light text-dark">P2: {n2(selected.policy.partial2R, 2)}R</span>}
+                                                {"slippagePts" in selected.policy && Number(selected.policy.slippagePts) > 0 && (
+                                                    <span className="badge bg-danger">Slippage: {n2(selected.policy.slippagePts, 1)} pts</span>
+                                                )}
+                                                {"costPts" in selected.policy && Number(selected.policy.costPts) > 0 && (
+                                                    <span className="badge bg-danger">Custo: {n2(selected.policy.costPts, 1)} pts</span>
+                                                )}
+                                            </>
+                                        )}
+                                    </div>
+                                )}
+
+                                <div className="row row-cols-2 row-cols-md-6 g-2 my-2">
                                     <div className="col">
                                         <div className="border rounded p-2">
                                             <div className="small text-muted">Trades</div>
@@ -309,6 +409,18 @@ export default function BacktestRunsPanel() {
                                             <div className="fw-bold">{n2(selected.summary.maxDrawdown)}</div>
                                         </div>
                                     </div>
+                                    <div className="col">
+                                        <div className="border rounded p-2">
+                                            <div className="small text-muted">Profit Factor</div>
+                                            <div className="fw-bold">{pfLabel}</div>
+                                        </div>
+                                    </div>
+                                    <div className="col">
+                                        <div className="border rounded p-2">
+                                            <div className="small text-muted">Avg PnL</div>
+                                            <div className="fw-bold">{n2(selected.summary.avgPnL, 3)}</div>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <div className="table-responsive mt-3">
@@ -321,6 +433,7 @@ export default function BacktestRunsPanel() {
                                                 <th style={{ textAlign: "right" }}>Entry</th>
                                                 <th style={{ textAlign: "right" }}>Exit</th>
                                                 <th style={{ textAlign: "right" }}>PnL</th>
+                                                {hasAnyFlags && <th style={{ whiteSpace: "nowrap" }}>Flags</th>}
                                                 <th>Obs</th>
                                             </tr>
                                         </thead>
@@ -333,12 +446,13 @@ export default function BacktestRunsPanel() {
                                                     <td style={{ textAlign: "right" }}>{n2(t.entryPrice, 1)}</td>
                                                     <td style={{ textAlign: "right" }}>{n2(t.exitPrice, 1)}</td>
                                                     <td style={{ textAlign: "right" }}>{n2(t.pnl, 2)}</td>
+                                                    {hasAnyFlags && <td style={{ whiteSpace: "nowrap" }}>{flagsForTrade(t) || "-"}</td>}
                                                     <td>{t.note || "-"}</td>
                                                 </tr>
                                             ))}
                                             {!selected.trades?.length && (
                                                 <tr>
-                                                    <td colSpan={7} className="text-center text-muted">
+                                                    <td colSpan={hasAnyFlags ? 8 : 7} className="text-center text-muted">
                                                         Sem trades nessa execução.
                                                     </td>
                                                 </tr>

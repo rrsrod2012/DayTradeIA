@@ -13,6 +13,12 @@ type Item = {
   probHit?: number | null;
   probCalibrated?: number | null;
   expectedValuePoints?: number | null;
+  // NOVO: campos opcionais que o backend pode enviar
+  ev?: number | null;
+  expectedValue?: number | null;
+  expected_value?: number | null;
+  prob?: number | null;
+  vwapOk?: boolean | null;
 };
 
 type Visible = {
@@ -71,6 +77,19 @@ export default function ProjectedSignalsTable({ items = [], visibleCols }: Props
         const date = s?.date ?? null;
         const n = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : null);
 
+        // prob cai para probCalibrated -> probHit -> prob
+        const prob = n(s?.probCalibrated ?? s?.probHit ?? (s as any)?.prob);
+        // EV cai para expectedValuePoints -> ev -> expectedValue -> expected_value
+        const ev = n(
+          s?.expectedValuePoints ??
+          (s as any)?.ev ??
+          (s as any)?.expectedValue ??
+          (s as any)?.expected_value
+        );
+
+        const vwapOk =
+          typeof (s as any)?.vwapOk === "boolean" ? ((s as any).vwapOk as boolean) : null;
+
         return {
           time,
           date,
@@ -80,8 +99,9 @@ export default function ProjectedSignalsTable({ items = [], visibleCols }: Props
           takeProfitSuggestion: n(s?.takeProfitSuggestion),
           conditionText: s?.conditionText ?? null,
           score: n(s?.score),
-          prob: n(s?.probCalibrated ?? s?.probHit),
-          ev: n(s?.expectedValuePoints),
+          prob,
+          ev,
+          vwapOk,
         };
       })
       // filtro por side
@@ -136,42 +156,68 @@ export default function ProjectedSignalsTable({ items = [], visibleCols }: Props
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => (
-            <tr key={i}>
-              {v.date && (
-                <td>{r.date ?? (r.time ? new Date(r.time).toLocaleDateString() : "-")}</td>
-              )}
-              {v.time && (
-                <td>{r.time ? new Date(r.time).toLocaleTimeString().slice(0, 5) : "-"}</td>
-              )}
-              {v.side && (
-                <td>
-                  <SideBadge side={r.side} />
-                </td>
-              )}
-              {v.entry && <td>{r.suggestedEntry ?? "-"}</td>}
-              {v.stop && <td>{r.stopSuggestion ?? "-"}</td>}
-              {v.take && <td>{r.takeProfitSuggestion ?? "-"}</td>}
-              {v.cond && (
-                <td
-                  title={r.conditionText ?? ""}
-                  style={{
-                    maxWidth: 360,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {r.conditionText ?? "-"}
-                </td>
-              )}
-              {v.score && <td>{typeof r.score === "number" ? r.score.toFixed(2) : "-"}</td>}
-              {v.prob && (
-                <td>{typeof r.prob === "number" ? `${(r.prob * 100).toFixed(1)}%` : "-"}</td>
-              )}
-              {v.ev && <td>{typeof r.ev === "number" ? r.ev.toFixed(2) : "-"}</td>}
-            </tr>
-          ))}
+          {rows.map((r, i) => {
+            const evClass =
+              typeof r.ev === "number"
+                ? r.ev > 0
+                  ? "text-success"
+                  : r.ev < 0
+                    ? "text-danger"
+                    : ""
+                : "";
+            return (
+              <tr key={i}>
+                {v.date && (
+                  <td>{r.date ?? (r.time ? new Date(r.time).toLocaleDateString() : "-")}</td>
+                )}
+                {v.time && (
+                  <td>{r.time ? new Date(r.time).toLocaleTimeString().slice(0, 5) : "-"}</td>
+                )}
+                {v.side && (
+                  <td>
+                    <div className="d-flex align-items-center" style={{ gap: 6 }}>
+                      <SideBadge side={r.side} />
+                      {r.vwapOk === true && (
+                        <Badge bg="success" pill title="Preço alinhado à VWAP para o lado do sinal">
+                          VWAP+
+                        </Badge>
+                      )}
+                      {r.vwapOk === false && (
+                        <Badge bg="danger" pill title="Preço contra a VWAP para o lado do sinal">
+                          VWAP-
+                        </Badge>
+                      )}
+                    </div>
+                  </td>
+                )}
+                {v.entry && <td>{r.suggestedEntry ?? "-"}</td>}
+                {v.stop && <td>{r.stopSuggestion ?? "-"}</td>}
+                {v.take && <td>{r.takeProfitSuggestion ?? "-"}</td>}
+                {v.cond && (
+                  <td
+                    title={r.conditionText ?? ""}
+                    style={{
+                      maxWidth: 360,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {r.conditionText ?? "-"}
+                  </td>
+                )}
+                {v.score && <td>{typeof r.score === "number" ? r.score.toFixed(2) : "-"}</td>}
+                {v.prob && (
+                  <td>{typeof r.prob === "number" ? `${(r.prob * 100).toFixed(1)}%` : "-"}</td>
+                )}
+                {v.ev && (
+                  <td className={evClass}>
+                    {typeof r.ev === "number" ? r.ev.toFixed(2) : "-"}
+                  </td>
+                )}
+              </tr>
+            );
+          })}
         </tbody>
       </Table>
     </div>
