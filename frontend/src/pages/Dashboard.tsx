@@ -95,7 +95,7 @@ function emaSeries(values: number[], period: number): (number | null)[] {
   return out;
 }
 
-/* ====== NOVO: range com offset local (para alinhar com backend) ====== */
+/* ====== range com offset local (para alinhar com backend) ====== */
 function localOffsetStr() {
   const offMin = new Date().getTimezoneOffset(); // minutos atrás do UTC
   const sign = offMin > 0 ? "-" : "+";
@@ -173,6 +173,12 @@ export default function Dashboard() {
   const [minEV, setMinEV] = useState<number>(0);
   const [dailyLossCap, setDailyLossCap] = useState<number>(0);
 
+  // ===== Política de saída (Break-even / Trailing / Time-stop)
+  const [breakEvenAtR, setBreakEvenAtR] = useState<number>(1.0);
+  const [beOffsetR, setBeOffsetR] = useState<number>(0.1);
+  const [kTrail, setKTrail] = useState<number>(1.2);
+  const [timeStopBars, setTimeStopBars] = useState<number>(horizon);
+
   // Carrega valores do localStorage ao montar
   useEffect(() => {
     try {
@@ -201,6 +207,12 @@ export default function Dashboard() {
       if (typeof s.hourEnd === "number") setHourEnd(s.hourEnd);
       if (typeof s.vwapFilter === "boolean") setVwapFilter(s.vwapFilter);
 
+      // novos (política de saída)
+      if (typeof s.breakEvenAtR === "number") setBreakEvenAtR(s.breakEvenAtR);
+      if (typeof s.beOffsetR === "number") setBeOffsetR(s.beOffsetR);
+      if (typeof s.kTrail === "number") setKTrail(s.kTrail);
+      if (typeof s.timeStopBars === "number") setTimeStopBars(s.timeStopBars);
+
       // limpa datas antigas do storage
       if ("dateFrom" in s || "dateTo" in s) {
         const { dateFrom: _df, dateTo: _dt, ...rest } = s;
@@ -208,6 +220,12 @@ export default function Dashboard() {
       }
     } catch { }
   }, []);
+
+  // se horizon mudar e timeStopBars estiver 0/negativo, herda horizon
+  useEffect(() => {
+    if (!timeStopBars || timeStopBars <= 0) setTimeStopBars(horizon);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [horizon]);
 
   // Garantia extra: se alguma data estiver vazia, seta HOJE
   useEffect(() => {
@@ -241,6 +259,11 @@ export default function Dashboard() {
       hourStart,
       hourEnd,
       vwapFilter,
+      // novos:
+      breakEvenAtR,
+      beOffsetR,
+      kTrail,
+      timeStopBars,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
@@ -266,6 +289,10 @@ export default function Dashboard() {
     hourStart,
     hourEnd,
     vwapFilter,
+    breakEvenAtR,
+    beOffsetR,
+    kTrail,
+    timeStopBars,
   ]);
 
   // Tema
@@ -353,18 +380,33 @@ export default function Dashboard() {
             : [];
       setProjected(proj);
 
-      // Backtest (trades) — agora também recebe os mesmos gates para “casar” com Projetados
+      // Backtest (trades) — **alinhado** com projeções + política de saída
       const bt = await api.post("/backtest", {
         symbol,
         timeframe,
         from: fromZ,
         to: toZ,
         lossCap: Number(dailyLossCap) || 0,
-        // se o backend não usar, ele ignora:
+
+        // alinhamento com /signals/projected:
+        horizon,
+        rr,
+        evalWindow,
+        regime: gateRegime ? 1 : 0,
+        tod: gateToD ? 1 : 0,
+        conformal: calibrate ? 1 : 0,
         minProb: Number(minProb) || 0,
         minEV: Number(minEV) || 0,
         useMicroModel: useMicroModel ? 1 : 0,
         vwapFilter: vwapFilter ? 1 : 0,
+
+        // <<< NOVO: política de saída
+        policy: {
+          breakEvenAtR,
+          beOffsetR,
+          kTrail,
+          timeStopBars,
+        },
       });
       setPnL(bt.data ?? { pnlPoints: 0, pnlMoney: 0 });
     } catch (e: any) {
@@ -392,6 +434,10 @@ export default function Dashboard() {
     minEV,
     dailyLossCap,
     vwapFilter,
+    breakEvenAtR,
+    beOffsetR,
+    kTrail,
+    timeStopBars,
     params,
   ]);
 
@@ -1086,6 +1132,57 @@ export default function Dashboard() {
                 </Row>
               </Card.Body>
             </Card>
+
+            {/* Política de Saída */}
+            <Card className="shadow-sm elevated-card mt-3">
+              <Card.Header className="fw-semibold">Política de Saída</Card.Header>
+              <Card.Body>
+                <Row className="gy-2">
+                  <Col sm={6}>
+                    <Form.Label>Break-even @ R</Form.Label>
+                    <Form.Control
+                      type="number"
+                      min={0.1}
+                      step={0.1}
+                      value={breakEvenAtR}
+                      onChange={(e) => setBreakEvenAtR(Number(e.target.value) || 0)}
+                    />
+                  </Col>
+                  <Col sm={6}>
+                    <Form.Label>Offset BE (R)</Form.Label>
+                    <Form.Control
+                      type="number"
+                      min={0}
+                      step={0.05}
+                      value={beOffsetR}
+                      onChange={(e) => setBeOffsetR(Number(e.target.value) || 0)}
+                    />
+                  </Col>
+                  <Col sm={6}>
+                    <Form.Label>Trailing ATR (k)</Form.Label>
+                    <Form.Control
+                      type="number"
+                      min={0.5}
+                      step={0.1}
+                      value={kTrail}
+                      onChange={(e) => setKTrail(Number(e.target.value) || 0)}
+                    />
+                  </Col>
+                  <Col sm={6}>
+                    <Form.Label>Time-stop (barras)</Form.Label>
+                    <Form.Control
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={timeStopBars}
+                      onChange={(e) => setTimeStopBars(Number(e.target.value) || 0)}
+                    />
+                    <div className="form-text">0 = usa o mesmo valor de “Horizonte”.</div>
+                  </Col>
+                </Row>
+              </Card.Body>
+            </Card>
+
           </Col>
         </Row>
       </Container>

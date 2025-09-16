@@ -2,24 +2,24 @@ import React from "react";
 
 /**
  * Painel para listar execuções de backtest (mais recentes primeiro)
- * - Lista com filtros client-side por símbolo/TF
+ * - Filtros client-side por símbolo/TF
  * - Botão "Ver" carrega o snapshot e mostra resumo + trades
- * - Atualização manual e auto-refresh
- * - Usa fetch() direto nas rotas do backend:
+ * - Auto-refresh opcional
+ * - Endpoints:
  *    GET /api/backtest/runs?limit=100
  *    GET /api/backtest/run/:id
  */
 
 type RunIndexItem = {
     id: string;
-    ts: string; // ISO
+    ts: string;           // ISO
     symbol: string;
     timeframe: string;
-    from: string; // ISO
-    to: string;   // ISO
+    from: string;         // ISO
+    to: string;           // ISO
     trades: number;
     pnlPoints: number;
-    winRate: number; // 0..1
+    winRate: number;      // 0..1
 };
 
 type BacktestSummary = {
@@ -27,7 +27,7 @@ type BacktestSummary = {
     wins: number;
     losses: number;
     ties: number;
-    winRate: number; // 0..1
+    winRate: number;      // 0..1
     pnlPoints: number;
     avgPnL: number;
     profitFactor: number | "Infinity";
@@ -47,17 +47,29 @@ type Trade = {
     pnl: number;
     note?: string;
 
-    // --- campos opcionais (Pacote #1) ---
+    // --- campos opcionais (flags/telemetria de saída) ---
     movedToBE?: boolean;
     trailEvents?: number;
     partials?: PartialFill[];
 };
 
+//
+// NOVO: política de saída com compatibilidade de nomes
+//
 type ExitPolicy = {
-    kSL?: number;
-    rr?: number;
-    kTrail?: number;
+    // nomes novos (recomendados)
+    beAtR?: number;
+    beOffset?: number;
+    trailAtrK?: number;
+    trailStepAtr?: number;
     timeStopBars?: number;
+    emaExit?: boolean;
+    vwapExit?: boolean;
+    rr?: number;
+
+    // nomes legados (se o backend ainda mandar)
+    kSL?: number;
+    kTrail?: number;
     breakEvenAtR?: number;
     beOffsetR?: number;
     partial1R?: number;
@@ -85,13 +97,12 @@ type BacktestRunSnapshot = {
     lossCapApplied?: number;
     maxConsecLossesApplied?: number;
 
-    // --- campos opcionais adicionados para exibir configuração/saídas ---
+    // configuração aplicada pelo motor (opcional)
     config?: {
         vwapFilter?: boolean;
         minProb?: number;
         minEV?: number;
         metaMinProb?: number;
-        // outros campos que o backend possa enviar
         [k: string]: any;
     };
     policy?: ExitPolicy;
@@ -106,7 +117,7 @@ function formatDateTime(iso?: string) {
         return iso;
     }
 }
-function pct(x: number, digits = 1) {
+function pct(x: any, digits = 1) {
     const v = Number(x);
     if (!Number.isFinite(v)) return "-";
     return `${(v * 100).toFixed(digits)}%`;
@@ -116,8 +127,13 @@ function n2(x: any, digits = 2) {
     const v = Number(x);
     return Number.isFinite(v) ? v.toFixed(digits) : String(x ?? "-");
 }
+
 function hasExtraTradeInfo(t: Trade) {
-    return !!(t?.movedToBE || (t?.trailEvents && t.trailEvents > 0) || (t?.partials && t.partials.length > 0));
+    return !!(
+        t?.movedToBE ||
+        (t?.trailEvents && t.trailEvents > 0) ||
+        (t?.partials && t.partials.length > 0)
+    );
 }
 function flagsForTrade(t: Trade) {
     const bits: string[] = [];
@@ -125,6 +141,26 @@ function flagsForTrade(t: Trade) {
     if (t.trailEvents && t.trailEvents > 0) bits.push(`TR${t.trailEvents}`);
     if (t.partials && t.partials.length > 0) bits.push(`P${t.partials.length}`);
     return bits.join(" · ");
+}
+
+// util local para CSV
+function toCSV(rows: Record<string, any>[], headers: string[]) {
+    const esc = (v: any) => {
+        if (v == null) return "";
+        const s = String(v);
+        if (/[",;\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+    };
+    const head = headers.join(",");
+    const body = rows.map((r) => headers.map((h) => esc(r[h])).join(",")).join("\n");
+    return `${head}\n${body}`;
+}
+function downloadText(filename: string, text: string) {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
 }
 
 export default function BacktestRunsPanel() {
@@ -178,23 +214,21 @@ export default function BacktestRunsPanel() {
         }
     }, []);
 
-    // Auto-refresh que respeita o switch
+    // Auto-refresh que respeita o switch (só agenda quando ON)
     React.useEffect(() => {
         let alive = true;
         let timer: any = null;
 
-        async function tick() {
+        const tick = async () => {
             if (!alive) return;
             await loadRuns();
             if (!alive) return;
             if (autoRefresh) {
                 timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
             }
-        }
+        };
 
-        // carrega imediatamente
-        tick();
-
+        tick(); // carga imediata
         return () => {
             alive = false;
             if (timer) clearTimeout(timer);
@@ -208,14 +242,53 @@ export default function BacktestRunsPanel() {
     });
 
     // helpers para cartões do resumo
-    const pfLabel = selected?.summary?.profitFactor === "Infinity"
-        ? "Infinity"
-        : n2(selected?.summary?.profitFactor, 3);
+    const pfLabel =
+        selected?.summary?.profitFactor === "Infinity"
+            ? "Infinity"
+            : n2(selected?.summary?.profitFactor, 3);
 
     const hasAnyFlags = React.useMemo(
         () => !!(selected?.trades || []).some((t) => hasExtraTradeInfo(t)),
         [selected]
     );
+
+    // Exportar CSV de trades da execução selecionada
+    const exportSelectedTradesCSV = React.useCallback(() => {
+        if (!selected) return;
+        const rows = (selected.trades || []).map((t) => ({
+            entryTime: formatDateTime(t.entryTime),
+            exitTime: formatDateTime(t.exitTime),
+            side: t.side,
+            entryPrice: n2(t.entryPrice, 1),
+            exitPrice: n2(t.exitPrice, 1),
+            pnl: n2(t.pnl, 2),
+            flags: flagsForTrade(t),
+            note: t.note || "",
+        }));
+        const csv = toCSV(rows, [
+            "entryTime",
+            "exitTime",
+            "side",
+            "entryPrice",
+            "exitPrice",
+            "pnl",
+            "flags",
+            "note",
+        ]);
+        const base = `${selected.symbol}_${selected.timeframe}_${(selected.id || "run").slice(0, 8)}`;
+        downloadText(`trades_${base}.csv`, csv);
+    }, [selected]);
+
+    // normaliza política (aceita nomes novos ou legados)
+    const policy = selected?.policy || {};
+    const beAtR = (policy.beAtR ?? policy.breakEvenAtR) as number | undefined;
+    const beOffset = (policy.beOffset ?? policy.beOffsetR) as number | undefined;
+    const trailAtrK = (policy.trailAtrK ?? policy.kTrail) as number | undefined;
+    const trailStepAtr = policy.trailStepAtr as number | undefined;
+    const timeStopBars = policy.timeStopBars as number | undefined;
+    const emaExit = policy.emaExit as boolean | undefined;
+    const vwapExit = policy.vwapExit as boolean | undefined;
+    const rr = policy.rr as number | undefined;
 
     return (
         <div className="container my-3">
@@ -338,51 +411,106 @@ export default function BacktestRunsPanel() {
                                     <div>
                                         <h6 className="mb-1">Execução</h6>
                                         <div className="small text-muted">
-                                            ID: <code>{selected.id || selectedId}</code> · Rodado em:{" "}
-                                            {formatDateTime(selected.ts)}
+                                            ID: <code>{selected.id || selectedId}</code> · Rodado em: {formatDateTime(selected.ts)}
                                         </div>
                                     </div>
                                     <div className="text-end">
-                                        <div><strong>{selected.symbol}</strong> · <span className="text-muted">{selected.timeframe}</span></div>
-                                        <div className="small">{formatDateTime(selected.from)} — {formatDateTime(selected.to)}</div>
+                                        <div>
+                                            <strong>{selected.symbol}</strong> ·{" "}
+                                            <span className="text-muted">{selected.timeframe}</span>
+                                        </div>
+                                        <div className="small">
+                                            {formatDateTime(selected.from)} — {formatDateTime(selected.to)}
+                                        </div>
                                     </div>
                                 </div>
 
                                 {/* Chips de configurações aplicadas (se presentes) */}
-                                {(selected.lossCapApplied || selected.maxConsecLossesApplied || selected.config || selected.policy) && (
-                                    <div className="d-flex flex-wrap gap-2 mt-2">
-                                        {typeof selected.lossCapApplied === "number" && selected.lossCapApplied > 0 && (
-                                            <span className="badge bg-warning text-dark">LossCap: {n2(selected.lossCapApplied, 0)} pts</span>
-                                        )}
-                                        {typeof selected.maxConsecLossesApplied === "number" && selected.maxConsecLossesApplied > 0 && (
-                                            <span className="badge bg-warning text-dark">Max Losses: {selected.maxConsecLossesApplied}</span>
-                                        )}
-                                        {selected.config && typeof selected.config === "object" && (
-                                            <>
-                                                {"minProb" in selected.config && <span className="badge bg-info">minProb: {n2(selected.config.minProb, 2)}</span>}
-                                                {"minEV" in selected.config && <span className="badge bg-info">minEV: {n2(selected.config.minEV, 2)}</span>}
-                                                {"metaMinProb" in selected.config && <span className="badge bg-secondary">metaMinProb: {n2(selected.config.metaMinProb, 2)}</span>}
-                                                {"vwapFilter" in selected.config && <span className="badge bg-secondary">VWAP: {selected.config.vwapFilter ? "ON" : "OFF"}</span>}
-                                            </>
-                                        )}
-                                        {selected.policy && (
-                                            <>
-                                                {"kSL" in selected.policy && <span className="badge bg-light text-dark">SL: {n2(selected.policy.kSL, 2)} ATR</span>}
-                                                {"rr" in selected.policy && <span className="badge bg-light text-dark">R:R {n2(selected.policy.rr, 2)}</span>}
-                                                {"kTrail" in selected.policy && <span className="badge bg-light text-dark">Trail: {n2(selected.policy.kTrail, 2)} ATR</span>}
-                                                {"breakEvenAtR" in selected.policy && <span className="badge bg-light text-dark">BE @ {n2(selected.policy.breakEvenAtR, 2)}R</span>}
-                                                {"partial1R" in selected.policy && <span className="badge bg-light text-dark">P1: {n2(selected.policy.partial1R, 2)}R</span>}
-                                                {"partial2R" in selected.policy && <span className="badge bg-light text-dark">P2: {n2(selected.policy.partial2R, 2)}R</span>}
-                                                {"slippagePts" in selected.policy && Number(selected.policy.slippagePts) > 0 && (
-                                                    <span className="badge bg-danger">Slippage: {n2(selected.policy.slippagePts, 1)} pts</span>
+                                {(selected.lossCapApplied ||
+                                    selected.maxConsecLossesApplied ||
+                                    selected.config ||
+                                    selected.policy) && (
+                                        <div className="d-flex flex-wrap gap-2 mt-2">
+                                            {typeof selected.lossCapApplied === "number" && selected.lossCapApplied > 0 && (
+                                                <span className="badge bg-warning text-dark">
+                                                    LossCap: {n2(selected.lossCapApplied, 0)} pts
+                                                </span>
+                                            )}
+                                            {typeof selected.maxConsecLossesApplied === "number" &&
+                                                selected.maxConsecLossesApplied > 0 && (
+                                                    <span className="badge bg-warning text-dark">
+                                                        Max Losses: {selected.maxConsecLossesApplied}
+                                                    </span>
                                                 )}
-                                                {"costPts" in selected.policy && Number(selected.policy.costPts) > 0 && (
-                                                    <span className="badge bg-danger">Custo: {n2(selected.policy.costPts, 1)} pts</span>
-                                                )}
-                                            </>
-                                        )}
-                                    </div>
-                                )}
+
+                                            {selected.config && typeof selected.config === "object" && (
+                                                <>
+                                                    {"minProb" in selected.config && (
+                                                        <span className="badge bg-info">minProb: {n2(selected.config.minProb, 2)}</span>
+                                                    )}
+                                                    {"minEV" in selected.config && (
+                                                        <span className="badge bg-info">minEV: {n2(selected.config.minEV, 2)}</span>
+                                                    )}
+                                                    {"metaMinProb" in selected.config && (
+                                                        <span className="badge bg-secondary">
+                                                            metaMinProb: {n2(selected.config.metaMinProb, 2)}
+                                                        </span>
+                                                    )}
+                                                    {"vwapFilter" in selected.config && (
+                                                        <span className="badge bg-secondary">
+                                                            VWAP: {selected.config.vwapFilter ? "ON" : "OFF"}
+                                                        </span>
+                                                    )}
+                                                </>
+                                            )}
+
+                                            {/* Política de saída (nomes novos + legados) */}
+                                            {(selected.policy) && (
+                                                <>
+                                                    {typeof rr === "number" && (
+                                                        <span className="badge bg-light text-dark">R:R {n2(rr, 2)}</span>
+                                                    )}
+                                                    {typeof beAtR === "number" && (
+                                                        <span className="badge bg-light text-dark">BE @ {n2(beAtR, 2)}R</span>
+                                                    )}
+                                                    {typeof beOffset === "number" && (
+                                                        <span className="badge bg-light text-dark">BE Offset {n2(beOffset, 0)} pts</span>
+                                                    )}
+                                                    {typeof trailAtrK === "number" && (
+                                                        <span className="badge bg-light text-dark">Trail {n2(trailAtrK, 2)} ATR</span>
+                                                    )}
+                                                    {typeof trailStepAtr === "number" && trailStepAtr > 0 && (
+                                                        <span className="badge bg-light text-dark">Step {n2(trailStepAtr, 2)} ATR</span>
+                                                    )}
+                                                    {typeof timeStopBars === "number" && timeStopBars > 0 && (
+                                                        <span className="badge bg-light text-dark">TimeStop {timeStopBars} bars</span>
+                                                    )}
+                                                    {emaExit != null && (
+                                                        <span className={`badge ${emaExit ? "bg-success" : "bg-secondary"}`}>
+                                                            EMA Exit {emaExit ? "ON" : "OFF"}
+                                                        </span>
+                                                    )}
+                                                    {vwapExit != null && (
+                                                        <span className={`badge ${vwapExit ? "bg-success" : "bg-secondary"}`}>
+                                                            VWAP Exit {vwapExit ? "ON" : "OFF"}
+                                                        </span>
+                                                    )}
+
+                                                    {/* legados extras informativos */}
+                                                    {"slippagePts" in selected.policy && Number(selected.policy.slippagePts) > 0 && (
+                                                        <span className="badge bg-danger">
+                                                            Slippage: {n2(selected.policy.slippagePts, 1)} pts
+                                                        </span>
+                                                    )}
+                                                    {"costPts" in selected.policy && Number(selected.policy.costPts) > 0 && (
+                                                        <span className="badge bg-danger">
+                                                            Custo: {n2(selected.policy.costPts, 1)} pts
+                                                        </span>
+                                                    )}
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
 
                                 <div className="row row-cols-2 row-cols-md-6 g-2 my-2">
                                     <div className="col">
@@ -423,8 +551,18 @@ export default function BacktestRunsPanel() {
                                     </div>
                                 </div>
 
-                                <div className="table-responsive mt-3">
-                                    <table className="table table-sm table-striped">
+                                <div className="d-flex justify-content-end mb-2">
+                                    <button
+                                        className="btn btn-sm btn-outline-secondary"
+                                        onClick={exportSelectedTradesCSV}
+                                        disabled={!selected?.trades?.length}
+                                    >
+                                        Exportar CSV (trades)
+                                    </button>
+                                </div>
+
+                                <div className="table-responsive">
+                                    <table className="table table-sm table-striped align-middle">
                                         <thead>
                                             <tr>
                                                 <th>Entrada</th>
@@ -438,18 +576,31 @@ export default function BacktestRunsPanel() {
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {(selected.trades || []).slice(-200).map((t, i) => (
-                                                <tr key={i}>
-                                                    <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.entryTime)}</td>
-                                                    <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.exitTime)}</td>
-                                                    <td>{t.side}</td>
-                                                    <td style={{ textAlign: "right" }}>{n2(t.entryPrice, 1)}</td>
-                                                    <td style={{ textAlign: "right" }}>{n2(t.exitPrice, 1)}</td>
-                                                    <td style={{ textAlign: "right" }}>{n2(t.pnl, 2)}</td>
-                                                    {hasAnyFlags && <td style={{ whiteSpace: "nowrap" }}>{flagsForTrade(t) || "-"}</td>}
-                                                    <td>{t.note || "-"}</td>
-                                                </tr>
-                                            ))}
+                                            {(selected.trades || []).slice(-200).map((t, i) => {
+                                                const pnl = Number(t.pnl);
+                                                const pnlClass =
+                                                    Number.isFinite(pnl) && pnl !== 0
+                                                        ? pnl > 0
+                                                            ? "text-success fw-semibold"
+                                                            : "text-danger fw-semibold"
+                                                        : "";
+                                                return (
+                                                    <tr key={i}>
+                                                        <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.entryTime)}</td>
+                                                        <td style={{ whiteSpace: "nowrap" }}>{formatDateTime(t.exitTime)}</td>
+                                                        <td>{t.side}</td>
+                                                        <td style={{ textAlign: "right" }}>{n2(t.entryPrice, 1)}</td>
+                                                        <td style={{ textAlign: "right" }}>{n2(t.exitPrice, 1)}</td>
+                                                        <td style={{ textAlign: "right" }} className={pnlClass}>
+                                                            {n2(t.pnl, 2)}
+                                                        </td>
+                                                        {hasAnyFlags && (
+                                                            <td style={{ whiteSpace: "nowrap" }}>{flagsForTrade(t) || "-"}</td>
+                                                        )}
+                                                        <td>{t.note || "-"}</td>
+                                                    </tr>
+                                                );
+                                            })}
                                             {!selected.trades?.length && (
                                                 <tr>
                                                     <td colSpan={hasAnyFlags ? 8 : 7} className="text-center text-muted">
