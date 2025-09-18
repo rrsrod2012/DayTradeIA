@@ -6,6 +6,7 @@ import {
 } from "../services/api";
 import { useAIStore } from "../store/ai";
 import BacktestRunsPanel from "./BacktestRunsPanel";
+import { mt5Enqueue, mt5SetEnabled } from "../services/mt5"; // <<< NOVO
 
 /* ============================
    Helpers de data (YYYY-MM-DD)
@@ -22,6 +23,7 @@ function fmtDate(d: Date) {
    ============================ */
 const LS_FILTERS_KEY = "ai/controls/filters/v2";
 const LS_PARAMS_KEY = "ai/controls/params/v2";
+const LS_MT5_KEY = "ai/controls/mt5/v1"; // <<< NOVO
 
 function lsGet<T>(key: string, fallback: T): T {
   try {
@@ -160,6 +162,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
   const [refreshSec, setRefreshSec] = React.useState<number>(refreshSec0);
 
+  // -------- Execução MT5 (toggle persistente) --------
+  const { execMT5: execMt5Initial } = lsGet(LS_MT5_KEY, { execMT5: false });
+  const [execMT5, setExecMT5] = React.useState<boolean>(!!execMt5Initial);
+
   // -------- Estado geral --------
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
@@ -201,6 +207,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     refreshSec,
   ]);
 
+  // Persiste toggle MT5 + informa servidor MT5
+  React.useEffect(() => {
+    lsSet(LS_MT5_KEY, { execMT5 });
+    mt5SetEnabled(execMT5).catch(() => { });
+  }, [execMT5]);
+
   const baseParams = React.useCallback(
     () => ({
       symbol: String(symbol || "").trim().toUpperCase(),
@@ -210,6 +222,60 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     }),
     [symbol, timeframe, from, to]
   );
+
+  // --- dedupe local para não reenfileirar o mesmo sinal a cada refresh ---
+  function getSeenSet(): Set<string> {
+    const w = window as any;
+    if (!w.__mt5Seen) w.__mt5Seen = new Set<string>();
+    return w.__mt5Seen;
+  }
+
+  async function maybeEnqueueForMT5(
+    conf: any[],
+    params: { symbol: string; timeframe: string }
+  ) {
+    if (!execMT5) return;
+    const seen = getSeenSet();
+
+    const tasks = (conf || [])
+      .filter((s) => s && (s.side === "BUY" || s.side === "SELL") && s.time)
+      .map((s) => {
+        const iso = new Date(s.time).toISOString();
+        const id = `${params.symbol}|${params.timeframe}|${iso}|${s.side}`;
+        return {
+          id,
+          symbol: params.symbol,
+          timeframe: params.timeframe,
+          side: s.side,
+          time: iso,
+          price: s.price ?? null,
+          volume: null, // define default do EA
+          slPoints: null,
+          tpPoints: null,
+          beAtPoints: breakEvenAtPts || null,
+          beOffsetPoints: beOffsetPts || null,
+          comment: s.note ?? null,
+        };
+      })
+      .filter((t) => !seen.has(t.id));
+
+    if (tasks.length === 0) return;
+
+    try {
+      await mt5Enqueue(tasks);
+      tasks.forEach((t) => seen.add(t.id));
+      if (process.env.NODE_ENV !== "production") {
+        // eslint-disable-next-line no-console
+        console.log("[AIControlsBar] mt5 enqueued", {
+          count: tasks.length,
+          example: tasks[0],
+        });
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn("[AIControlsBar] mt5 enqueue failed:", e);
+    }
+  }
 
   /** Busca PROJETADOS + CONFIRMADOS + PnL + Trades */
   async function fetchAllOnce() {
@@ -282,6 +348,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       const confRaw = await fetchConfirmedSignals({ ...params, limit: 2000 });
       (window as any).__dbgConfirmedRaw = confRaw;
       setConfirmed(confRaw || [], params);
+
+      // 2b) Envia para MT5 se habilitado
+      await maybeEnqueueForMT5(confRaw || [], {
+        symbol: params.symbol,
+        timeframe: params.timeframe,
+      });
 
       // 3) Backtest (PnL + Trades) com BE por pontos + fallback de rota (implementado em api.ts)
       const bt = await runBacktest({
@@ -366,6 +438,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
+    execMT5, // <<< se mudar, realinha enable e enqueue
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -392,6 +465,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
+    execMT5,
   ]);
 
   return (
@@ -565,6 +639,22 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     value={beOffsetPts}
                     onChange={(e) => setBeOffsetPts(Number(e.target.value) || 0)}
                   />
+                </div>
+
+                <div className="vr mx-1" />
+
+                {/* Execução MT5 (opcional) */}
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="exec-mt5-toggle"
+                    checked={execMT5}
+                    onChange={(e) => setExecMT5(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="exec-mt5-toggle">
+                    Executar no MT5
+                  </label>
                 </div>
 
                 <div className="vr mx-1" />
