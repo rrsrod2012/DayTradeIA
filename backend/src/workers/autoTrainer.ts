@@ -2,11 +2,14 @@
 import { prisma } from "../prisma";
 import logger from "../logger";
 import { loadCandlesAnyTF } from "../lib/aggregation";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 type TrainExample = {
   features: Record<string, number>;
-  label: 0 | 1;                // TP antes de SL (binário)
-  evPoints: number;            // PnL em pontos (regressão)
+  label: 0 | 1;
+  evPoints: number;
   meta?: Record<string, any>;
 };
 
@@ -114,14 +117,11 @@ function ADX(high: number[], low: number[], close: number[], period = 14) {
   const trN = smooth(tr);
   const pDMN = smooth(plusDM);
   const mDMN = smooth(minusDM);
-
-  const pDI: number[] = [], mDI: number[] = [], dx: number[] = [];
+  const dx: number[] = [];
   for (let i = 0; i < len; i++) {
     const trv = trN[i] || 1e-9;
     const p = 100 * (pDMN[i] || 0) / trv;
     const m = 100 * (mDMN[i] || 0) / trv;
-    pDI.push(p);
-    mDI.push(m);
     dx.push(100 * Math.abs(p - m) / Math.max(p + m, 1e-9));
   }
   return EMA(dx, period).map((v) => (v ?? 0));
@@ -142,7 +142,7 @@ function slope(arr: (number | null)[], lookback = 5) {
   return den === 0 ? 0 : num / den;
 }
 
-/* ================== ATR “rápido” (uso no label) ================== */
+/* ================== ATR rápido ================== */
 function atr14Quick(values: { high: number; low: number; close: number }[]) {
   if (!values?.length) return null;
   let prevClose = values[0].close;
@@ -163,20 +163,13 @@ function atr14Quick(values: { high: number; low: number; close: number }[]) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-/* ================== Avaliação do sinal: label & EV ================== */
+/* ================== Avaliação ================== */
 async function evaluateSignalOutcome(args: {
   id: number;
   side: "BUY" | "SELL";
   candle: {
-    id: number;
-    time: Date;
-    instrumentId: number;
-    timeframe: string | null;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number | null;
+    id: number; time: Date; instrumentId: number; timeframe: string | null;
+    open: number; high: number; low: number; close: number; volume: number | null;
   };
 }) {
   const H = Math.max(1, Number(process.env.AUTO_TRAINER_HORIZON) || 12);
@@ -187,20 +180,14 @@ async function evaluateSignalOutcome(args: {
   const entry = args.candle.close;
 
   const atrCands = await prisma.candle.findMany({
-    where: {
-      instrumentId: args.candle.instrumentId,
-      time: { lte: args.candle.time },
-      timeframe: args.candle.timeframe || undefined,
-    },
+    where: { instrumentId: args.candle.instrumentId, time: { lte: args.candle.time }, timeframe: args.candle.timeframe || undefined },
     orderBy: { time: "asc" },
     take: 100,
     select: { high: true, low: true, close: true },
   });
 
   const atr = atr14Quick(atrCands);
-  if (!Number.isFinite(atr) || !atr) {
-    return { label: 0 as 0 | 1, evPoints: 0 };
-  }
+  if (!Number.isFinite(atr) || !atr) return { label: 0 as 0 | 1, evPoints: 0 };
 
   const slPts = K_SL * atr;
   const tpPts = RR * slPts;
@@ -223,37 +210,27 @@ async function evaluateSignalOutcome(args: {
       if (w.low <= entry - slPts) return { label: 0, evPoints: -slPts };
       if (w.high >= entry + tpPts) return { label: 1, evPoints: +tpPts };
     }
-    // sem toque em SL/TP no horizonte
-    const hold = (win[win.length - 1].close - entry);
+    const hold = win[win.length - 1].close - entry;
     return { label: 0, evPoints: USE_HOLD_PNL ? hold : 0 };
   } else {
     for (const w of win) {
       if (w.high >= entry + slPts) return { label: 0, evPoints: -slPts };
       if (w.low <= entry - tpPts) return { label: 1, evPoints: +tpPts };
     }
-    const hold = (entry - win[win.length - 1].close);
+    const hold = entry - win[win.length - 1].close;
     return { label: 0, evPoints: USE_HOLD_PNL ? hold : 0 };
   }
 }
 
-/* ================== Feature set (enriquecido) ================== */
-function baseCandleFeatures(c: {
-  open: number; high: number; low: number; close: number; volume: number | null;
-}, side: "BUY" | "SELL") {
+/* ================== Features ================== */
+function baseCandleFeatures(c: { open: number; high: number; low: number; close: number; volume: number | null; }, side: "BUY" | "SELL") {
   const body = Math.abs(c.close - c.open);
   const range = c.high - c.low;
   const upperShadow = c.high - Math.max(c.open, c.close);
   const lowerShadow = Math.min(c.open, c.close) - c.low;
   const dir = c.close >= c.open ? 1 : -1;
-  return {
-    body, range, upperShadow, lowerShadow, dir,
-    close: c.close,
-    open: c.open,
-    volume: c.volume ?? 0,
-    sideBuy: side === "BUY" ? 1 : 0,
-  } as Record<string, number>;
+  return { body, range, upperShadow, lowerShadow, dir, close: c.close, open: c.open, volume: c.volume ?? 0, sideBuy: side === "BUY" ? 1 : 0 } as Record<string, number>;
 }
-
 function techFeaturesAtIndex(i: number, series: {
   high: number[]; low: number[]; close: number[]; vol: number[];
   e9: (number | null)[]; e21: (number | null)[]; atr: (number | null)[];
@@ -272,15 +249,15 @@ function techFeaturesAtIndex(i: number, series: {
   };
 }
 
-/* ================== Filtros do engine (alinhados) ================== */
+/* ================== Filtros engine ================== */
 function passesEngineFilters(i: number, side: "BUY" | "SELL", series: {
   high: number[]; low: number[]; close: number[]; vol: number[];
   e9: (number | null)[]; e21: (number | null)[]; atr: (number | null)[];
   vwap: number[]; adx: number[];
 }) {
   const MIN_ADX = envNumber("ENGINE_MIN_ADX", 20)!;
-  const MIN_SLOPE = envNumber("ENGINE_MIN_SLOPE", 0.02)!; // em ATR
-  const MAX_DIST_VWAP_ATR = envNumber("ENGINE_MAX_DIST_VWAP_ATR", 0.15)!; // 0 desliga
+  const MIN_SLOPE = envNumber("ENGINE_MIN_SLOPE", 0.02)!;
+  const MAX_DIST_VWAP_ATR = envNumber("ENGINE_MAX_DIST_VWAP_ATR", 0.15)!;
   const REQUIRE_BREAKOUT = envBool("ENGINE_REQUIRE_BREAKOUT", true);
   const N = 10;
 
@@ -289,8 +266,6 @@ function passesEngineFilters(i: number, side: "BUY" | "SELL", series: {
   const c = series.close[i];
   const ema9 = (series.e9[i] ?? c) as number;
   const ema21 = (series.e21[i] ?? c) as number;
-  const prevDiff = (series.e9[i - 1] ?? series.close[i - 1])! - (series.e21[i - 1] ?? series.close[i - 1])!;
-  const diff = ema9 - ema21;
 
   const winStart = Math.max(0, i - N);
   const winHigh = Math.max(...series.high.slice(winStart, i));
@@ -313,26 +288,19 @@ function passesEngineFilters(i: number, side: "BUY" | "SELL", series: {
   const breakoutUp = REQUIRE_BREAKOUT ? c > winHigh : true;
   const breakoutDn = REQUIRE_BREAKOUT ? c < winLow : true;
 
-  if (side === "BUY") {
-    return crossedUp && breakoutUp && adxOk && slopeOkBuy && distOk;
-  } else {
-    return crossedDn && breakoutDn && adxOk && slopeOkSell && distOk;
-  }
+  if (side === "BUY") return crossedUp && breakoutUp && adxOk && slopeOkBuy && distOk;
+  return crossedDn && breakoutDn && adxOk && slopeOkSell && distOk;
 }
 
-/* ================== Construção do batch alinhado ================== */
+/* ================== Batch ================== */
 async function buildTrainBatchAligned(signals: any[]) {
   const out: TrainExample[] = [];
-
   for (const s of signals) {
     if (!s.candle) continue;
     const symbol = (s.candle.instrument?.symbol || "WIN").toString().toUpperCase();
     const timeframe = (s.candle.timeframe as string | null) ?? "M5";
 
-    const rows = await loadCandlesAnyTF(symbol, String(timeframe).toUpperCase(), {
-      lte: s.candle.time,
-      limit: 600,
-    });
+    const rows = await loadCandlesAnyTF(symbol, String(timeframe).toUpperCase(), { lte: s.candle.time, limit: 600 });
     if (!Array.isArray(rows) || rows.length < 50) continue;
 
     const timesISO = rows.map((r: any) => (r.time instanceof Date ? r.time : new Date(r.time)).toISOString());
@@ -352,36 +320,19 @@ async function buildTrainBatchAligned(signals: any[]) {
     const series = { high: highs, low: lows, close: closes, vol: vols, e9, e21, atr, vwap, adx };
 
     const side = (s.side as "BUY" | "SELL") || "BUY";
-
-    // Só treina exemplos que passariam pelos filtros do engine
     if (!passesEngineFilters(idx, side, series)) continue;
 
-    // Avalia label e EV
     const outcome = await evaluateSignalOutcome({
-      id: s.id,
-      side,
+      id: s.id, side,
       candle: {
-        id: s.candle.id,
-        time: s.candle.time as any,
-        instrumentId: s.candle.instrumentId as any,
-        timeframe: timeframe,
-        open: Number(s.candle.open),
-        high: Number(s.candle.high),
-        low: Number(s.candle.low),
-        close: Number(s.candle.close),
+        id: s.candle.id, time: s.candle.time as any, instrumentId: s.candle.instrumentId as any, timeframe,
+        open: Number(s.candle.open), high: Number(s.candle.high), low: Number(s.candle.low), close: Number(s.candle.close),
         volume: s.candle.volume == null ? null : Number(s.candle.volume),
       },
     });
 
-    // Features base + técnicas
     const base = baseCandleFeatures(
-      {
-        open: Number(s.candle.open),
-        high: Number(s.candle.high),
-        low: Number(s.candle.low),
-        close: Number(s.candle.close),
-        volume: s.candle.volume == null ? 0 : Number(s.candle.volume),
-      },
+      { open: Number(s.candle.open), high: Number(s.candle.high), low: Number(s.candle.low), close: Number(s.candle.close), volume: s.candle.volume == null ? 0 : Number(s.candle.volume) },
       side
     );
     const tech = techFeaturesAtIndex(idx, series);
@@ -390,49 +341,26 @@ async function buildTrainBatchAligned(signals: any[]) {
       features: { ...base, ...tech },
       label: outcome.label,
       evPoints: Number.isFinite(outcome.evPoints) ? outcome.evPoints : 0,
-      meta: {
-        signalId: s.id,
-        candleId: s.candle.id,
-        symbol,
-        timeframe,
-        timeISO: targetISO,
-      },
+      meta: { signalId: s.id, candleId: s.candle.id, symbol, timeframe, timeISO: targetISO },
     });
-
-    _trainedSignals.add(s.id);
   }
   return out;
 }
 
-/* ================== Coleta de exemplos ================== */
+/* ================== Coleta ================== */
 async function collectExamples(limit: number): Promise<TrainExample[]> {
   const notInIds = Array.from(_trainedSignals.values());
-  const baseWhere: any = {
-    signalType: "EMA_CROSS",
-    candle: { isNot: null },
-  };
-  if (notInIds.length > 0) {
-    baseWhere.id = { notIn: notInIds };
-  }
+  const where: any = { signalType: "EMA_CROSS", candleId: { gt: 0 } };
+  if (notInIds.length) where.id = { notIn: notInIds };
 
   const signals = await prisma.signal.findMany({
-    where: baseWhere,
-    orderBy: { id: "desc" },
-    take: Math.max(1, Math.min(300, Number(limit) || 100)),
+    where, orderBy: { id: "desc" }, take: Math.max(1, Math.min(300, Number(limit) || 100)),
     select: {
-      id: true,
-      side: true,
+      id: true, side: true,
       candle: {
         select: {
-          id: true,
-          time: true,
-          instrumentId: true,
-          timeframe: true,
-          open: true,
-          high: true,
-          low: true,
-          close: true,
-          volume: true,
+          id: true, time: true, instrumentId: true, timeframe: true,
+          open: true, high: true, low: true, close: true, volume: true,
           instrument: { select: { symbol: true } },
         },
       },
@@ -440,49 +368,92 @@ async function collectExamples(limit: number): Promise<TrainExample[]> {
   });
 
   if (!signals?.length) return [];
-  return await buildTrainBatchAligned(signals);
+  return buildTrainBatchAligned(signals);
 }
 
-/* ================== HTTP / Scheduler ================== */
-function ms(n: number, def: number) {
-  const v = Number(n);
-  return Number.isFinite(v) && v > 0 ? v : def;
+/* ================== STORE helpers ================== */
+function sanitizeFileUrl(input?: string | null) {
+  if (!input) return "";
+  let s = input.trim();
+  if (/^[a-zA-Z]:[\\/]/.test(s)) s = "file:///" + s.replace(/\\/g, "/");
+  if (/^file:\/\//i.test(s)) {
+    s = s.replace(/\\/g, "/");
+    if (!/^file:\/\/\//i.test(s)) s = s.replace(/^file:\/\//i, "file:///");
+  }
+  return s.replace(/^file:\/{2,}/i, "file:///");
 }
-function okURL() {
-  return !!(process.env.MICRO_MODEL_URL || "").trim();
+function fileUrlToLocalPathOrNull(urlStr: string): string | null {
+  try {
+    if (!/^file:\/\//i.test(urlStr)) return null;
+    const p = fileURLToPath(urlStr);
+    return path.normalize(p);
+  } catch { return null; }
+}
+function ensureDirExists(dir: string) {
+  try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
+  catch (e) { logger.error(JSON.stringify({ msg: "[AutoTrainer] falha ao criar diretório do store", dir, error: String(e) })); }
 }
 
-async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 15000): Promise<T> {
+/* ================== HTTP ================== */
+function ms(n: number, def: number) { const v = Number(n); return Number.isFinite(v) && v > 0 ? v : def; }
+function okURL() { return !!(process.env.MICRO_MODEL_URL || "").trim(); }
+
+async function httpPostJSONRaw(
+  url: string,
+  body: any,
+  timeoutMs = 15000,
+  extraHeaders?: Record<string, string>
+): Promise<{ ok: boolean; json: any; status: number; text: string }> {
   let f: typeof fetch = (global as any).fetch;
   if (!f) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      f = require("node-fetch");
-    } catch {
-      throw new Error("fetch indisponível e node-fetch não encontrado");
-    }
+    try { f = require("node-fetch"); }
+    catch { throw new Error("fetch indisponível e node-fetch não encontrado"); }
   }
-  // @ts-expect-error AbortController global pode não existir em versões antigas
+  // @ts-expect-error
   const ctl = new (global as any).AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const r = await f(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Accept": "application/json", ...(extraHeaders || {}) },
       body: JSON.stringify(body ?? {}),
       signal: ctl.signal,
     });
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      throw new Error(`POST ${url} -> HTTP ${r.status} ${r.statusText} ${txt ? "- " + txt : ""}`);
-    }
-    return (await r.json()) as T;
-  } finally {
-    clearTimeout(t);
-  }
+    const text = await r.text().catch(() => "");
+    let json: any = null;
+    try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+    return { ok: r.ok, json, status: r.status, text };
+  } finally { clearTimeout(t); }
 }
 
-/** Agora exportado e com EV */
+/* ================== Payloads ================== */
+type VariantName = "rows" | "data_rows" | "flat";
+function buildPayload(name: VariantName, examples: TrainExample[], epochs: number) {
+  const rows = examples.map((e) => ({ features: e.features, label: e.label, ev: e.evPoints, meta: e.meta || null }));
+  if (name === "rows") return { rows, epochs };
+  if (name === "data_rows") return { data: { rows }, epochs };
+  return {
+    inputs: examples.map(e => e.features),
+    labels: examples.map(e => e.label),
+    targetEV: examples.map(e => e.evPoints),
+    meta: examples.map(e => e.meta || null),
+    epochs
+  };
+}
+function variantOrder(): VariantName[] {
+  const pref = (process.env.AUTO_TRAINER_PAYLOAD || "rows_only").toLowerCase();
+  if (pref === "rows_only") return ["rows"];
+  if (pref === "rows") return ["rows", "data_rows", "flat"];
+  if (pref === "data_rows") return ["data_rows", "rows", "flat"];
+  if (pref === "flat") return ["flat", "rows", "data_rows"];
+  return ["rows"];
+}
+function isSaveHandlerError(obj: any): boolean {
+  const s = typeof obj === "string" ? obj : JSON.stringify(obj || "");
+  return /save handlers/i.test(s) || /Cannot find any save handlers/i.test(s);
+}
+
+/* ================== Run ================== */
 export async function runOnce() {
   _lastRunAt = new Date();
   _lastError = null;
@@ -499,53 +470,112 @@ export async function runOnce() {
       return;
     }
 
-    const payload: any = {
-      inputs: examples.map((e) => e.features),
-      labels: examples.map((e) => e.label),             // classificação
-      targetEV: examples.map((e) => e.evPoints),        // regressão (EV em pontos)
-      meta: examples.map((e) => e.meta || null),
-      epochs: EPOCHS,
-    };
+    // store (pode ser desativado via env)
+    const disableStore = envBool("AUTO_TRAINER_DISABLE_STORE", false);
+    const rawStore = disableStore ? "" : (process.env.AUTO_TRAINER_STORE_URL || process.env.MODEL_STORE_URL || process.env.MODEL_DIR || "").trim();
+    const storeUrl = sanitizeFileUrl(rawStore);
+    let storeFsPath: string | null = null;
+    if (storeUrl) {
+      storeFsPath = fileUrlToLocalPathOrNull(storeUrl);
+      if (storeFsPath) ensureDirExists(storeFsPath);
+      logger.info(JSON.stringify({ msg: "[AutoTrainer] store configurado", storeUrl, storeFsPath: storeFsPath || null }));
+    } else {
+      logger.info("[AutoTrainer] store não informado (seguindo sem indicar local de salvamento)");
+    }
 
     const base = (process.env.MICRO_MODEL_URL || "").trim().replace(/\/+$/, "");
     const url = `${base}/train`;
-    const res = await httpPostJSON<{ ok: boolean; trained: number }>(
-      url,
-      payload,
-      ms(Number(process.env.AUTO_TRAINER_HTTP_TIMEOUT_MS) || 0, 20000)
-    );
+    const urlNoStore = `${url}${url.includes("?") ? "&" : "?"}noStore=1&save=0`;
+    const timeout = ms(Number(process.env.AUTO_TRAINER_HTTP_TIMEOUT_MS) || 0, 20000);
 
-    if (!res?.ok) throw new Error("Treino retornou ok=false");
+    const order = variantOrder();
+    let ok = false;
+    let trainedCount = 0;
+    const errors: Array<{ variant: VariantName; status: number; body: any; text: string }> = [];
 
-    _stats.sent += res.trained || examples.length;
+    // 1) tenta COM store (se houver)
+    for (const name of order) {
+      const payload = buildPayload(name, examples, EPOCHS);
+      if (storeUrl) {
+        (payload as any).store = storeUrl;
+        (payload as any).storeUrl = storeUrl;
+        (payload as any).modelStore = storeUrl;
+      }
+      const modelId = (process.env.AUTO_TRAINER_MODEL_ID || "").trim();
+      if (modelId) (payload as any).modelId = modelId;
+
+      const res = await httpPostJSONRaw(url, payload, timeout);
+
+      if (res.ok && res.json?.ok) {
+        ok = true;
+        trainedCount = Number(res.json.trained ?? examples.length) || examples.length;
+        for (const e of examples) {
+          const sid = e.meta?.signalId;
+          if (typeof sid === "number" && Number.isFinite(sid)) _trainedSignals.add(sid);
+        }
+        logger.info(JSON.stringify({ msg: "[AutoTrainer] treino concluído", variant: name, trained: trainedCount, batch: examples.length, features: Object.keys(examples[0].features || {}) }));
+        break;
+      } else {
+        errors.push({ variant: name, status: res.status, body: res.json, text: res.text });
+        logger.error(JSON.stringify({ msg: "[AutoTrainer] variante falhou", variant: name, status: res.status, body: res.json || res.text || null }));
+      }
+    }
+
+    // 2) fallback SEM store (força por URL, header e flags no body)
+    if (!ok && errors.some(e => isSaveHandlerError(e.body || e.text))) {
+      logger.info("[AutoTrainer] fallback: refazendo POST sem store (save handlers indisponíveis no micro)");
+      for (const name of order) {
+        const payload = buildPayload(name, examples, EPOCHS);
+        (payload as any).save = false;
+        (payload as any).noStore = true;
+        // sem store no body
+
+        const res = await httpPostJSONRaw(
+          urlNoStore,
+          payload,
+          timeout,
+          { "X-No-Store": "1" }
+        );
+
+        if (res.ok && res.json?.ok) {
+          ok = true;
+          trainedCount = Number(res.json.trained ?? examples.length) || examples.length;
+          for (const e of examples) {
+            const sid = e.meta?.signalId;
+            if (typeof sid === "number" && Number.isFinite(sid)) _trainedSignals.add(sid);
+          }
+          logger.info(JSON.stringify({ msg: "[AutoTrainer] treino concluído (sem store)", variant: name, trained: trainedCount, batch: examples.length }));
+          break;
+        } else {
+          logger.error(JSON.stringify({ msg: "[AutoTrainer] fallback sem store falhou", variant: name, status: res.status, body: res.json || res.text || null }));
+        }
+      }
+    }
+
+    if (!ok) {
+      const last = errors[errors.length - 1];
+      throw new Error(`Falha em todas variantes (${order.join(" -> ")}). Último erro: HTTP ${last?.status} ${typeof last?.body === "object" ? JSON.stringify(last?.body) : last?.text}`);
+    }
+
+    _stats.sent += trainedCount;
     _stats.batches += 1;
-
-    logger.info(
-      JSON.stringify({
-        msg: "[AutoTrainer] treino concluído",
-        trained: res.trained ?? examples.length,
-        batch: examples.length,
-        features: Object.keys(examples[0].features || {}),
-      })
-    );
   } catch (err: any) {
     _lastError = String(err?.message || err);
     logger.error(JSON.stringify({ msg: "[AutoTrainer] erro", error: _lastError }));
   }
 }
 
+/* ================== Scheduler / API ================== */
 function scheduleNext() {
   const delay = Math.max(1000, Number(process.env.AUTO_TRAINER_POLL_MS) || 10000);
   if (_timer) clearTimeout(_timer);
   _timer = setTimeout(tick, delay);
 }
-
 async function tick() {
   if (!_running) return;
   await runOnce();
   scheduleNext();
 }
-
 export function startAutoTrainer() {
   if (_running) return { ok: true, running: true };
   _running = true;
@@ -553,16 +583,11 @@ export function startAutoTrainer() {
   scheduleNext();
   return { ok: true, running: true };
 }
-
 export function stopAutoTrainer() {
   _running = false;
-  if (_timer) {
-    clearTimeout(_timer);
-    _timer = null;
-  }
+  if (_timer) { clearTimeout(_timer); _timer = null; }
   return { ok: true, running: false };
 }
-
 export async function statusAutoTrainer() {
   return {
     ok: true,
@@ -574,8 +599,8 @@ export async function statusAutoTrainer() {
     microModelUrl: (process.env.MICRO_MODEL_URL || "").trim() || null,
   };
 }
-
-/** Alias opcional */
-export async function pokeAutoTrainer() {
-  return runOnce();
+export function resetAutoTrainerMemory() {
+  _trainedSignals.clear();
+  return { ok: true, trainedSignals: 0 };
 }
+export async function pokeAutoTrainer() { return runOnce(); }

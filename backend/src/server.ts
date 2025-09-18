@@ -413,7 +413,7 @@ app.use(backtestRouter);
         if (prob < Number(minProb)) continue;
         if (evPts < Number(minEV)) continue;
 
-        out.push({
+        const row: Row = {
           side: isBuy ? "BUY" : "SELL",
           suggestedEntry: entry,
           stopSuggestion: sl,
@@ -424,7 +424,8 @@ app.use(backtestRouter);
           expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
           time: candles[i].time.toISOString(),
           date: DateTime.fromJSDate(candles[i].time).setZone(ZONE).toISODate()!,
-        });
+        };
+        out.push(row);
       }
 
       out.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
@@ -635,6 +636,7 @@ app.get("/api/trades", async (req, res) => {
         exitSignalId: tr.exitSignalId,
         entryPrice: tr.entryPrice,
         exitPrice: tr.exitPrice,
+        // ⬇ sua UI às vezes lê pnlMoney; aqui exponho os dois
         pnlPoints: tr.pnlPoints,
         pnlMoney: tr.pnlMoney,
         entryTime,
@@ -752,6 +754,104 @@ app.post("/admin/auto-trainer/start", async (_req, res) => {
 app.post("/admin/auto-trainer/stop", async (_req, res) => {
   const r = await stopAutoTrainer();
   res.json(r);
+});
+
+/* =========================
+   Admin: Diagnóstico — EFETIVO de config do .env
+   ========================= */
+function envBool(v: any, def: boolean) {
+  const s = String(v ?? "").trim();
+  if (s === "1" || /^true$/i.test(s)) return true;
+  if (s === "0" || /^false$/i.test(s)) return false;
+  return def;
+}
+function envNum(v: any, def: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+app.get("/admin/config/effective", (_req, res) => {
+  const eff = {
+    PORT: process.env.PORT || null,
+    AUTO_TRAINER_BE_ENABLED: envBool(process.env.AUTO_TRAINER_BE_ENABLED, true),
+    AUTO_TRAINER_BE_TRIGGER_ATR: envNum(process.env.AUTO_TRAINER_BE_TRIGGER_ATR, 1.0),
+    AUTO_TRAINER_BE_TRIGGER_POINTS: envNum(process.env.AUTO_TRAINER_BE_TRIGGER_POINTS, 200),
+    AUTO_TRAINER_BE_OFFSET_POINTS: envNum(process.env.AUTO_TRAINER_BE_OFFSET_POINTS, 0),
+    AUTO_TRAINER_TRAIL_ENABLED: envBool(process.env.AUTO_TRAINER_TRAIL_ENABLED, true),
+    AUTO_TRAINER_TRAIL_AFTER_BE_ONLY: envBool(process.env.AUTO_TRAINER_TRAIL_AFTER_BE_ONLY, false),
+    AUTO_TRAINER_TRAIL_ATR: envNum(process.env.AUTO_TRAINER_TRAIL_ATR, 0.75),
+    AUTO_TRAINER_PARTIAL_ENABLED: envBool(process.env.AUTO_TRAINER_PARTIAL_ENABLED, true),
+    AUTO_TRAINER_PARTIAL_RATIO: envNum(process.env.AUTO_TRAINER_PARTIAL_RATIO, 0.5),
+    AUTO_TRAINER_PARTIAL_ATR: envNum(process.env.AUTO_TRAINER_PARTIAL_ATR, 0.5),
+    AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER: envBool(process.env.AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER, true),
+    AUTO_TRAINER_PRIORITY: String(process.env.AUTO_TRAINER_PRIORITY || "TP_FIRST_AFTER_BE"),
+    AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE: envBool(process.env.AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE, true),
+    AUTO_TRAINER_FORCE_MFE_POINTS: envNum(process.env.AUTO_TRAINER_FORCE_MFE_POINTS, 200),
+    AUTO_TRAINER_FORCE_OFFSET_POINTS: envNum(process.env.AUTO_TRAINER_FORCE_OFFSET_POINTS, envNum(process.env.AUTO_TRAINER_BE_OFFSET_POINTS, 0)),
+    AUTO_TRAINER_HORIZON: envNum(process.env.AUTO_TRAINER_HORIZON, 12),
+    AUTO_TRAINER_LOOKBACK: envNum(process.env.AUTO_TRAINER_LOOKBACK, 120),
+    AUTO_TRAINER_RR: envNum(process.env.AUTO_TRAINER_RR, 2.0),
+    AUTO_TRAINER_SL_ATR: envNum(process.env.AUTO_TRAINER_SL_ATR, 1.0),
+  };
+  return res.json({ ok: true, effective: eff });
+});
+
+/* =========================
+   Admin: Diagnóstico — Inspect de trades
+   ========================= */
+app.get("/admin/trades/inspect", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "").trim().toUpperCase() || undefined;
+    const timeframe = String(req.query.timeframe || "").trim().toUpperCase() || undefined;
+    const limit = req.query.limit ? Math.max(1, Number(req.query.limit)) : 50;
+
+    const where: any = {};
+    if (timeframe) where.timeframe = timeframe;
+
+    const trades = await prisma.trade.findMany({
+      where,
+      orderBy: { id: "desc" },
+      take: limit,
+      include: {
+        instrument: { select: { symbol: true } },
+        entrySignal: {
+          select: {
+            id: true,
+            side: true,
+            candle: { select: { time: true } },
+          },
+        },
+        exitSignal: {
+          select: {
+            id: true,
+            signalType: true,
+            reason: true, // <- aqui vem o diag={...} se o pipeline novo rodou
+            candle: { select: { time: true } },
+          },
+        },
+      },
+    });
+
+    const out = trades
+      .filter((tr) => !symbol || tr.instrument.symbol.toUpperCase() === symbol)
+      .map((tr) => ({
+        id: tr.id,
+        symbol: tr.instrument.symbol,
+        timeframe: tr.timeframe,
+        side: tr.entrySignal?.side || null,
+        entryPrice: tr.entryPrice,
+        exitPrice: tr.exitPrice,
+        pnlPoints: tr.pnlPoints,
+        entryTime: tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time).toISOString() : null,
+        exitTime: tr.exitSignal?.candle?.time ? new Date(tr.exitSignal.candle.time).toISOString() : null,
+        exitSignalType: tr.exitSignal?.signalType || null,
+        exitReason: tr.exitSignal?.reason || null,
+      }));
+
+    return res.json({ ok: true, data: out });
+  } catch (e: any) {
+    console.error("[/admin/trades/inspect] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 // ====== ROTAS LEGADAS ======

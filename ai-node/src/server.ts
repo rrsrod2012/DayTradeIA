@@ -3,6 +3,7 @@ import express from "express";
 import { z } from "zod";
 import { OnlineBinaryClassifier } from "./model";
 
+
 const PORT = Number(process.env.PORT || 5050);
 
 // modelo global (processo único)
