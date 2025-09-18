@@ -8,6 +8,7 @@ import logger from "./logger";
 import router from "./routes";
 import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
 import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
+import '@tensorflow/tfjs-node';
 
 dotenv.config();
 

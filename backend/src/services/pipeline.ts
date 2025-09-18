@@ -1,5 +1,4 @@
 /* eslint-disable no-console */
-import "dotenv/config";
 import { DateTime } from "luxon";
 import { prisma } from "../prisma";
 import { loadCandlesAnyTF } from "../lib/aggregation";
@@ -7,643 +6,361 @@ import { loadCandlesAnyTF } from "../lib/aggregation";
 /**
  * Pipeline para:
  *  - Consolidar sinais confirmados (EMA_CROSS) em Trades
- *  - Usado pelo endpoint /admin/trades/backfill
+ *  - Usado por reprocessamentos e pelo watcher pós-importação
  *
- * Não renomeie este arquivo ou seus exports: { bootPipeline, processImportedRange }
+ * Exports: { bootPipeline, processImportedRange, reprocessSignal }
  */
 
 // =========================
 // Configurações (via .env)
 // =========================
-function boolFromEnv(v: any, def: boolean) {
-  const s = String(v ?? "").trim();
-  if (s === "1" || /^true$/i.test(s)) return true;
-  if (s === "0" || /^false$/i.test(s)) return false;
-  return def;
-}
 function numFromEnv(v: any, def: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
-function strFromEnv(v: any, def: string) {
-  const s = String(v ?? "").trim();
-  return s ? s : def;
-}
 
 const CFG = {
-  LOOKBACK: numFromEnv(process.env.AUTO_TRAINER_LOOKBACK, 120), // barras p/ trás p/ ATR
-  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12),   // barras p/ frente
-  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0),
-  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0),
+  LOOKBACK: numFromEnv(process.env.AUTO_TRAINER_LOOKBACK, 120), // barras para trás (ATR/EMAs)
+  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12),  // barras à frente para procurar saída
+  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0),  // k do SL em ATRs
+  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0),      // TP = RR * ATR
   DEFAULT_QTY: 1,
 
-  // Proteções
-  BE_ENABLED: boolFromEnv(process.env.AUTO_TRAINER_BE_ENABLED, true),
-  BE_TRIGGER_ATR: numFromEnv(process.env.AUTO_TRAINER_BE_TRIGGER_ATR, 1.0),
-  BE_TRIGGER_POINTS: numFromEnv(process.env.AUTO_TRAINER_BE_TRIGGER_POINTS, 200),
-  BE_OFFSET_POINTS: numFromEnv(process.env.AUTO_TRAINER_BE_OFFSET_POINTS, 0),
+  // Breakeven por pontos: quando MFE (a favor) atingir X pontos, mover SL para preço de entrada (+ offset)
+  BE_AT_PTS: numFromEnv(process.env.AUTO_TRAINER_BE_AT_PTS, 0), // 0 = off
+  BE_OFFSET_PTS: numFromEnv(process.env.AUTO_TRAINER_BE_OFFSET_PTS, 0),
 
-  TRAIL_ENABLED: boolFromEnv(process.env.AUTO_TRAINER_TRAIL_ENABLED, true),
-  TRAIL_AFTER_BE_ONLY: boolFromEnv(process.env.AUTO_TRAINER_TRAIL_AFTER_BE_ONLY, false),
-  TRAIL_ATR: numFromEnv(process.env.AUTO_TRAINER_TRAIL_ATR, 0.75),
-
-  PARTIAL_ENABLED: boolFromEnv(process.env.AUTO_TRAINER_PARTIAL_ENABLED, true),
-  PARTIAL_RATIO: Math.min(0.99, Math.max(0.01, numFromEnv(process.env.AUTO_TRAINER_PARTIAL_RATIO, 0.5))),
-  PARTIAL_ATR: numFromEnv(process.env.AUTO_TRAINER_PARTIAL_ATR, 0.5),
-  PARTIAL_BREAKEVEN_AFTER: boolFromEnv(process.env.AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER, true),
-
-  PRIORITY: strFromEnv(process.env.AUTO_TRAINER_PRIORITY, "TP_FIRST_AFTER_BE") as
-    | "SL_FIRST"
-    | "TP_FIRST_AFTER_BE",
-
-  FORCE_NO_LOSS_AFTER_MFE: boolFromEnv(process.env.AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE, true),
-  FORCE_MFE_POINTS: numFromEnv(process.env.AUTO_TRAINER_FORCE_MFE_POINTS, 200),
-  FORCE_OFFSET_POINTS: numFromEnv(
-    process.env.AUTO_TRAINER_FORCE_OFFSET_POINTS,
-    Number.isFinite(Number(process.env.AUTO_TRAINER_BE_OFFSET_POINTS))
-      ? Number(process.env.AUTO_TRAINER_BE_OFFSET_POINTS)
-      : 0
-  ),
+  // Debug
+  DEBUG: !!Number(process.env.AUTO_TRAINER_DEBUG || "0"),
 };
 
-// logs didáticos
-const DEBUG_BE = String(process.env.PIPELINE_DEBUG_BE || "").trim() === "1";
-
-// TF em minutos
 const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60 };
 
-// =========================
-// Utils
-// =========================
-function tfToMinutes(tf: string): number | null {
-  const s = String(tf || "").trim().toUpperCase();
-  if (TF_MINUTES[s]) return TF_MINUTES[s];
-  if (/^\d+$/.test(s)) return Number(s);           // "5" -> 5
-  const m = /^H(\d{1,2})$/.exec(s);                // "H2" -> 120
-  if (m) return Number(m[1]) * 60;
-  return null;
+function tfToMinutes(tf: string | null): number {
+  if (!tf) return 5;
+  const u = tf.toUpperCase();
+  return TF_MINUTES[u] ?? 5;
 }
 
-function atrEMA(
-  candles: { high: number; low: number; close: number }[],
-  period = 14
-): (number | null)[] {
-  const tr: number[] = [];
-  for (let i = 0; i < candles.length; i++) {
-    const c = candles[i];
-    const prevClose = i > 0 ? candles[i - 1].close : c.close;
-    tr.push(Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose)));
-  }
-  const out: (number | null)[] = [];
-  let ema: number | null = null;
+type Candle = { time: Date; open: number; high: number; low: number; close: number };
+
+// =========================
+// Indicadores
+// =========================
+function ema(values: number[], period: number) {
   const k = 2 / (period + 1);
-  for (let i = 0; i < tr.length; i++) {
-    const v = tr[i];
-    ema = ema == null ? v : v * k + (ema as number) * (1 - k);
-    out.push(ema);
+  const out: (number | null)[] = [];
+  let cur: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) { out.push(cur); continue; }
+    cur = cur == null ? v : v * k + (cur as number) * (1 - k);
+    out.push(cur);
   }
   return out;
 }
 
-// =========================
-// Carregamento via agregador M1→TF (com tolerância de tempo)
-// =========================
+function trueRange(curr: Candle, prevClose: number) {
+  const a = Number(curr.high) - Number(curr.low);
+  const b = Math.abs(Number(curr.high) - prevClose);
+  const c = Math.abs(Number(curr.low) - prevClose);
+  return Math.max(a, b, c);
+}
 
-/**
- * Carrega candles usando o agregador central para o mesmo instrumento/TF do sinal
- * numa janela ao redor do tempo do sinal e tenta **resolver o candleId com tolerância**
- * p/ evitar mismatch (fechamento vs abertura, arredondamentos, TZ, etc).
- */
+function atr14(rows: Candle[]) {
+  if (!rows.length) return [];
+  const out: (number | null)[] = rows.map(() => null);
+  let prevClose = Number(rows[0].close);
+  for (let i = 1; i < rows.length; i++) {
+    const tr = trueRange(rows[i], prevClose);
+    const upto = Math.min(i, 14);
+    let sum = 0;
+    for (let k = 0; k < upto; k++) {
+      const j = i - k;
+      const trk = trueRange(rows[j], Number(rows[j - 1]?.close ?? rows[j].close));
+      sum += trk;
+    }
+    out[i] = sum / upto;
+    prevClose = Number(rows[i].close);
+  }
+  return out;
+}
+
+function crossedUp(aPrev: number | null, aNow: number | null, bPrev: number | null, bNow: number | null) {
+  return aPrev != null && bPrev != null && aNow != null && bNow != null && aPrev <= bPrev && aNow > bNow;
+}
+function crossedDown(aPrev: number | null, aNow: number | null, bPrev: number | null, bNow: number | null) {
+  return aPrev != null && bPrev != null && aNow != null && bNow != null && aPrev >= bPrev && aNow < bNow;
+}
+
+// =========================
+// Janela via agregador (M1->TF)
+// =========================
 async function loadCandlesWindow(params: {
   instrumentId: number;
   timeframe: string | null;
-  signalTime: Date; // candle do sinal (entry é a próxima barra)
+  signalTime: Date; // candle do sinal (entry = próxima barra)
   lookback: number;
   horizon: number;
 }) {
   const { instrumentId, timeframe, signalTime, lookback, horizon } = params;
 
-  // Resolve símbolo
-  const inst = await prisma.instrument.findUnique({
+  const inst = await prisma.instrument.findFirst({
     where: { id: instrumentId },
-    select: { symbol: true },
+    select: { id: true, symbol: true },
   });
-  if (!inst?.symbol) return [];
+  if (!inst) return { win: [] as Candle[], candleIds: [] as (number | null)[], tf: (timeframe || "M5").toUpperCase(), symbol: "?" };
 
-  const tfStrRaw = (timeframe ? String(timeframe) : "M5").toUpperCase();
-  const tfStr = /^\d+$/.test(tfStrRaw) ? `M${tfStrRaw}` : tfStrRaw; // "5" -> "M5"
-  const tfMin = tfToMinutes(tfStr) ?? 5;
-  const tolMs = Math.max(60_000, Math.round(tfMin * 60_000 * 0.75)); // tolerância ~0.75×TF
+  const tf = (timeframe || "M5").toUpperCase();
+  const tfMin = tfToMinutes(tf);
 
-  // Janela temporal aproximada (em minutos)
-  const from = DateTime.fromJSDate(signalTime).minus({ minutes: lookback * tfMin }).toUTC().toJSDate();
-  const to = DateTime.fromJSDate(signalTime).plus({ minutes: (horizon + 2) * tfMin }).toUTC().toJSDate();
+  const backMin = lookback * tfMin;
+  const fwdMin = (horizon + 2) * tfMin; // +2 por segurança
+  const t0 = DateTime.fromJSDate(signalTime).minus({ minutes: backMin });
+  const t1 = DateTime.fromJSDate(signalTime).plus({ minutes: fwdMin });
 
-  // 1) Série agregada coerente com Projected/Confirmed
-  const series = await loadCandlesAnyTF(String(inst.symbol).toUpperCase(), tfStr, { gte: from, lte: to });
-  if (!series?.length) return [];
+  const rows = await loadCandlesAnyTF(inst.symbol, tf as any, {
+    gte: t0.toJSDate(),
+    lte: t1.toJSDate(),
+    limit: null,
+  });
 
-  // 2) Mapa (time -> id) dos candles persistidos na janela (sem restringir timeframe)
+  const times = rows.map((r) => r.time);
   const persisted = await prisma.candle.findMany({
-    where: { instrumentId, time: { gte: from, lte: to } },
+    where: { instrumentId: inst.id, timeframe: tf, time: { in: times } },
     select: { id: true, time: true },
   });
+  const byTime = new Map(persisted.map((c) => [c.time.getTime(), c.id]));
+  const candleIds = rows.map((r) => byTime.get(r.time.getTime()) ?? null);
 
-  // indexa por timestamp (ms)
-  const idByTime = new Map<number, number>();
-  const times: number[] = [];
-  for (const r of persisted) {
-    const ms = new Date(r.time).getTime();
-    idByTime.set(ms, r.id);
-    times.push(ms);
-  }
-  times.sort((a, b) => a - b);
+  const win: Candle[] = rows.map((r: any) => ({
+    time: r.time instanceof Date ? r.time : new Date(r.time),
+    open: Number(r.open), high: Number(r.high), low: Number(r.low), close: Number(r.close),
+  }));
 
-  function findNearestId(ts: number): number | undefined {
-    // busca linear (janela pequena). Se preferir, troque por busca binária.
-    let best: { id?: number; diff: number } = { diff: Infinity };
-    for (const t of times) {
-      const d = Math.abs(t - ts);
-      if (d < best.diff) best = { id: idByTime.get(t), diff: d };
-      if (d > tolMs && t > ts) break; // pequena otimização
-    }
-    return best.diff <= tolMs ? best.id : undefined;
-  }
-
-  // 3) Normaliza shape + injeta id quando existir (exato OU vizinho dentro da tolerância)
-  const rows = series.map((r: any) => {
-    const t = r.time instanceof Date ? r.time : new Date(r.time);
-    let id = idByTime.get(t.getTime());
-    if (id == null) id = findNearestId(t.getTime());
-    return {
-      id: id ?? undefined,
-      time: t,
-      instrumentId,
-      timeframe: tfStr,
-      open: Number(r.open),
-      high: Number(r.high),
-      low: Number(r.low),
-      close: Number(r.close),
-      volume: r.volume == null ? null : Number(r.volume),
-    };
-  });
-
-  return rows;
-}
-
-/** Resolve instrumentId a partir do símbolo (se fornecido). */
-async function resolveInstrumentId(symbol?: string): Promise<number | undefined> {
-  if (!symbol) return undefined;
-  const inst = await prisma.instrument.findFirst({
-    where: { symbol: String(symbol).toUpperCase() },
-    select: { id: true },
-  });
-  return inst?.id;
+  return { win, candleIds, tf, symbol: inst.symbol };
 }
 
 // =========================
-// Núcleo: processar sinais -> Trades
+// Casamento robusto do índice do sinal
 // =========================
+function resolveSignalIndex(win: Candle[], signalTime: Date, tf: string) {
+  if (!win.length) return -1;
+  const tfMs = tfToMinutes(tf) * 60 * 1000;
+  const target = signalTime.getTime();
 
-type ProcessArgs = {
-  symbol?: string;
-  timeframe?: string;
-  from?: Date;
-  to?: Date;
-};
+  // 1) igualdade exata
+  let idx = win.findIndex(c => c.time.getTime() === target);
+  if (idx >= 0) return idx;
 
-export async function processImportedRange(args: ProcessArgs) {
-  const t0 = Date.now();
-
-  const instrumentIdFilter = await resolveInstrumentId(args.symbol);
-  const timeframeFilter = args.timeframe ? String(args.timeframe).toUpperCase() : undefined;
-
-  // Monta filtro por timeframe para a relação candle (aceita "M5" e "5")
-  const tfCands: string[] = [];
-  if (timeframeFilter) {
-    tfCands.push(timeframeFilter);
-    const tfm = tfToMinutes(timeframeFilter);
-    if (tfm != null) tfCands.push(String(tfm));
+  // 2) última barra <= signalTime
+  let lastLE = -1;
+  for (let i = 0; i < win.length; i++) {
+    const t = win[i].time.getTime();
+    if (t <= target) lastLE = i;
+    else break;
   }
+  if (lastLE >= 0) return lastLE;
 
-  const candleWhere: any = {};
-  if (args.from || args.to) {
-    candleWhere.time = {
-      ...(args.from ? { gte: args.from } : {}),
-      ...(args.to ? { lte: args.to } : {}),
-    };
+  // 3) barra mais próxima dentro de 1×TF
+  let best = -1, bestDiff = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < win.length; i++) {
+    const d = Math.abs(win[i].time.getTime() - target);
+    if (d < bestDiff) { best = i; bestDiff = d; }
   }
-  if (instrumentIdFilter != null) candleWhere.instrumentId = instrumentIdFilter;
-  if (tfCands.length) candleWhere.timeframe = { in: tfCands };
+  if (best >= 0 && bestDiff <= tfMs) return best;
 
-  // Busca sinais (aceita confirmado)
-  const signals = await prisma.signal.findMany({
-    where: {
-      signalType: { in: ["EMA_CROSS", "EMA_CROSS_CONFIRMED"] },
-      candle: candleWhere,
-    },
-    orderBy: { id: "asc" },
+  return -1;
+}
+
+// =========================
+// Consolidação: Sinal confirmado -> Trade
+// =========================
+async function consolidateSignalToTrade(signalId: number) {
+  const sig = await prisma.signal.findFirst({
+    where: { id: signalId },
     select: {
       id: true,
+      signalType: true,
       side: true,
       candleId: true,
-      candle: {
-        select: {
-          id: true,
-          time: true,
-          instrumentId: true,
-          timeframe: true,
-          open: true,
-          high: true,
-          low: true,
-          close: true,
-        },
-      },
+      candle: { select: { instrumentId: true, timeframe: true, time: true } },
     },
   });
+  if (!sig || !sig.candle) return;
 
-  if (!signals.length) {
-    return { ok: true, processedSignals: 0, tradesTouched: 0, tp: 0, sl: 0, none: 0, ms: Date.now() - t0 };
+  const { instrumentId, timeframe, time: signalTime } = sig.candle;
+  const side = (sig.side || "BUY") as "BUY" | "SELL";
+  const isBuy = side === "BUY";
+
+  const { win, candleIds, tf, symbol } = await loadCandlesWindow({
+    instrumentId,
+    timeframe: (timeframe || "M5").toUpperCase(),
+    signalTime,
+    lookback: CFG.LOOKBACK,
+    horizon: CFG.HORIZON,
+  });
+  if (!win.length) return;
+
+  const iSignal = resolveSignalIndex(win, signalTime, tf);
+  if (iSignal < 0) return;
+
+  const iEntry = Math.min(win.length - 1, iSignal + 1);
+  const entryBar = win[iEntry];
+  const entryPrice = Number(entryBar.open);
+
+  const atrSeries = atr14(win);
+  const closes = win.map(c => Number(c.close));
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+
+  const atr = Number(atrSeries[iEntry] ?? atrSeries[Math.max(0, iEntry - 1)] ?? 0);
+  const slPts = atr > 0 ? atr * CFG.SL_ATR : 0;
+  const tpPts = atr > 0 ? atr * CFG.RR : 0;
+
+  const slInit = slPts > 0 ? (isBuy ? entryPrice - slPts : entryPrice + slPts) : null;
+  const tpLevel = tpPts > 0 ? (isBuy ? entryPrice + tpPts : entryPrice - tpPts) : null;
+
+  let dynSL: number | null = slInit;
+  let movedToBE = false;
+
+  let exitPrice: number | null = null;
+  let outcome: "TP" | "SL" | "REVERSAL" | "NONE" = "NONE";
+  let iExit: number | null = null;
+
+  if (CFG.DEBUG) {
+    console.log(`[DBG] symbol=${symbol} tf=${tf} signal=${signalTime.toISOString()} iSignal=${iSignal} iEntry=${iEntry}`);
+    console.log(`[DBG] entry=${entryPrice} SLinit=${slInit ?? "-"} TP=${tpLevel ?? "-"} BE_AT=${CFG.BE_AT_PTS} BE_OFF=${CFG.BE_OFFSET_PTS}`);
   }
 
-  // estatísticas de diagnóstico
-  const diag = {
-    noSeries: 0,
-    noIndex: 0,
-    noNextBar: 0,
-    noExitInHorizon: 0,
-    exitNoCandleId: 0,
-    beFromPartial: 0,
-    beByATR: 0,
-    beByPOINTS: 0,
-  };
+  for (let k = iEntry; k < Math.min(win.length, iEntry + CFG.HORIZON + 1); k++) {
+    const bar = win[k];
+    const high = Number(bar.high);
+    const low = Number(bar.low);
 
-  let tradesTouched = 0;
-  let tp = 0, sl = 0, none = 0;
+    // 1) BE por pontos (usa MFE intrabar)
+    if (!movedToBE && CFG.BE_AT_PTS > 0) {
+      const mfePts = isBuy ? (high - entryPrice) : (entryPrice - low);
+      if (mfePts >= CFG.BE_AT_PTS) {
+        const bePx = isBuy
+          ? (entryPrice + CFG.BE_OFFSET_PTS)
+          : (entryPrice - CFG.BE_OFFSET_PTS);
+        dynSL = dynSL == null
+          ? bePx
+          : (isBuy ? Math.max(dynSL, bePx) : Math.min(dynSL, bePx));
+        movedToBE = true;
+        if (CFG.DEBUG) console.log(`[DBG] k=${k} MOVE->BE dynSL=${dynSL} (mfe=${mfePts.toFixed(1)})`);
+      }
+    }
 
-  for (const sig of signals) {
-    const c = sig.candle;
-    if (!c) continue;
+    // Prioridade: SL/BE
+    if (dynSL != null) {
+      if (isBuy && low <= dynSL) {
+        exitPrice = dynSL; outcome = "SL"; iExit = k;
+        if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT SL/BE at ${dynSL}`);
+        break;
+      }
+      if (!isBuy && high >= dynSL) {
+        exitPrice = dynSL; outcome = "SL"; iExit = k;
+        if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT SL/BE at ${dynSL}`);
+        break;
+      }
+    }
 
-    // Janela de candles (via agregador)
-    const win = await loadCandlesWindow({
-      instrumentId: c.instrumentId,
-      timeframe: c.timeframe,
-      signalTime: c.time,
-      lookback: CFG.LOOKBACK,
-      horizon: CFG.HORIZON + 2,
+    // TP
+    if (tpLevel != null) {
+      if (isBuy && high >= tpLevel) {
+        exitPrice = tpLevel; outcome = "TP"; iExit = k;
+        if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT TP at ${tpLevel}`);
+        break;
+      }
+      if (!isBuy && low <= tpLevel) {
+        exitPrice = tpLevel; outcome = "TP"; iExit = k;
+        if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT TP at ${tpLevel}`);
+        break;
+      }
+    }
+
+    // Reversão por EMA
+    const e9Prev = ema9[k - 1] ?? null;
+    const e21Prev = ema21[k - 1] ?? null;
+    const e9Now = ema9[k] ?? null;
+    const e21Now = ema21[k] ?? null;
+    const revUp = crossedUp(e9Prev, e9Now, e21Prev, e21Now);
+    const revDown = crossedDown(e9Prev, e9Now, e21Prev, e21Now);
+    const reversalAgainst = (isBuy && revDown) || (!isBuy && revUp);
+    if (reversalAgainst) {
+      exitPrice = Number(bar.close); outcome = "REVERSAL"; iExit = k;
+      if (CFG.DEBUG) console.log(`[DBG] k=${k} REVERSAL close=${exitPrice}`);
+      break;
+    }
+
+    if (CFG.DEBUG) {
+      const tStr = DateTime.fromJSDate(bar.time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss");
+      const mfePts = isBuy ? (high - entryPrice) : (entryPrice - low);
+      console.log(`[DBG] k=${k} ${tStr} H=${high} L=${low} dynSL=${dynSL ?? "-"} mfe=${mfePts.toFixed(1)}`);
+    }
+  }
+
+  const pnlPoints = (exitPrice != null)
+    ? (isBuy ? (exitPrice - entryPrice) : (entryPrice - exitPrice))
+    : null;
+
+  let exitSignalId: number | null = null;
+  if (iExit != null) {
+    const exitCandle = await prisma.candle.findFirst({
+      where: { instrumentId, timeframe: tf, time: win[iExit].time },
+      select: { id: true },
     });
-    if (!win?.length) {
-      diag.noSeries++;
-      none++;
-      await upsertTradeEmpty(sig, c);
-      tradesTouched++;
-      continue;
-    }
+    const exitType =
+      outcome === "TP" ? "EXIT_TP" :
+        outcome === "SL" ? "EXIT_SL" :
+          outcome === "REVERSAL" ? "EXIT_REV" :
+            "EXIT_NONE";
 
-    // Índice do candle do sinal (exato; se não houver, usa o último <= time)
-    const idx = win.findIndex((row) => row.time.getTime() === c.time.getTime());
-    let iSignal = idx >= 0 ? idx : -1;
-    if (iSignal < 0) {
-      let j = -1;
-      for (let i = 0; i < win.length; i++) {
-        if (win[i].time.getTime() <= c.time.getTime()) j = i;
-        else break;
-      }
-      if (j < 0) {
-        diag.noIndex++;
-        none++;
-        await upsertTradeEmpty(sig, c);
-        tradesTouched++;
-        continue;
-      }
-      iSignal = j;
-    }
-
-    // Entrada = open da próxima barra
-    const iEntry = iSignal + 1;
-    if (iEntry >= win.length) {
-      diag.noNextBar++;
-      none++;
-      await upsertTradeEmpty(sig, c);
-      tradesTouched++;
-      continue;
-    }
-    const entryBar = win[iEntry];
-    const entryPrice = Number.isFinite(entryBar.open) ? Number(entryBar.open) : Number(entryBar.close);
-    const side = String(sig.side || "").toUpperCase() as "BUY" | "SELL";
-
-    // ATR no candle do sinal
-    const atrArr = atrEMA(
-      win.slice(0, iSignal + 1).map((r) => ({ high: r.high, low: r.low, close: r.close })),
-      14
-    );
-    const atrNow = atrArr[atrArr.length - 1] ?? 0;
-    const atr = Math.max(0, Number(atrNow) || 0);
-
-    const slPts = atr * CFG.SL_ATR;
-    const tpPts = atr * CFG.RR;
-
-    const isBuy = side === "BUY";
-    const slLevel = slPts > 0 ? (isBuy ? entryPrice - slPts : entryPrice + slPts) : null;
-    const tpLevel = tpPts > 0 ? (isBuy ? entryPrice + tpPts : entryPrice - tpPts) : null;
-
-    // Loop adiante com BE/Trailing/Parcial
-    let exitPrice: number | null = null;
-    let outcome: "TP" | "SL" | "NONE" = "NONE";
-    let iExit: number | null = null;
-
-    let dynSL: number | null = slLevel;
-    const entrySide = isBuy ? 1 : -1;
-
-    // BE: OR(ATR, PONTOS)
-    const beTriggerPtsATR = atr * Math.max(0, CFG.BE_TRIGGER_ATR || 0);
-    const beTriggerPtsABS = Math.max(0, CFG.BE_TRIGGER_POINTS || 0);
-    const beUseATR = beTriggerPtsATR > 0;
-    const beUsePOINT = beTriggerPtsABS > 0;
-    const beMinTrigger = Math.min(beUseATR ? beTriggerPtsATR : Infinity, beUsePOINT ? beTriggerPtsABS : Infinity);
-
-    const partialTargetPts = atr * CFG.PARTIAL_ATR;
-    const trailATR = CFG.TRAIL_ATR;
-
-    let beArmed = CFG.BE_ENABLED === true;
-    let beTriggered = false;
-    let iBeTrigger: number | null = null;
-    let beLevelCache: number | null = null;
-
-    let trailArmed = CFG.TRAIL_ENABLED === true && !CFG.TRAIL_AFTER_BE_ONLY;
-    let trailActive = trailArmed;
-
-    // trava de no-loss após BE
-    let noLossFloor: number | null = null;
-
-    let partialArmed = CFG.PARTIAL_ENABLED === true;
-    let partialDone = false;
-    let partialPnLPoints = 0;
-
-    // MFE para failsafe
-    let mfePts = 0;
-
-    const atrSeries = atrEMA(win.map((r) => ({ high: r.high, low: r.low, close: r.close })), 14)
-      .map((x) => Number(x || 0));
-
-    const checkOrderAfterBE = CFG.PRIORITY === "TP_FIRST_AFTER_BE";
-
-    for (let k = iEntry; k < Math.min(win.length, iEntry + CFG.HORIZON + 1); k++) {
-      const bar = win[k];
-      const high = Number(bar.high);
-      const low = Number(bar.low);
-      const mid = Number(bar.close);
-
-      // MFE acumulado
-      const incMfe = entrySide > 0 ? Math.max(0, high - entryPrice) : Math.max(0, entryPrice - low);
-      if (incMfe > mfePts) mfePts = incMfe;
-
-      // Melhor caso da barra (p/ gatilhos)
-      const unrealizedPts = entrySide > 0 ? high - entryPrice : entryPrice - low;
-
-      // Parcial
-      if (partialArmed && !partialDone && partialTargetPts > 0) {
-        const hitPartial = entrySide > 0
-          ? high >= entryPrice + partialTargetPts
-          : low <= entryPrice - partialTargetPts;
-
-        if (hitPartial) {
-          const partialExit = entrySide > 0 ? entryPrice + partialTargetPts : entryPrice - partialTargetPts;
-          const ratio = CFG.PARTIAL_RATIO;
-          partialPnLPoints += ratio * (entrySide > 0 ? partialExit - entryPrice : entryPrice - partialExit);
-          partialDone = true;
-
-          // move para BE imediatamente (±offset) se configurado
-          if (CFG.PARTIAL_BREAKEVEN_AFTER) {
-            const beLevel = isBuy
-              ? entryPrice + Math.max(0, CFG.BE_OFFSET_POINTS)
-              : entryPrice - Math.max(0, CFG.BE_OFFSET_POINTS);
-
-            dynSL = beLevel;
-            noLossFloor = beLevel;
-            beLevelCache = beLevel;
-            beTriggered = true;
-            iBeTrigger = k;
-            diag.beFromPartial++;
-
-            if (CFG.TRAIL_ENABLED && CFG.TRAIL_AFTER_BE_ONLY) {
-              trailArmed = true;
-              trailActive = true;
-            }
-
-            if (DEBUG_BE) {
-              console.log(`[pipeline/BE<-partial] ${side} @${bar.time.toISOString()} entry=${entryPrice} be=${beLevel}`);
-            }
-          } else {
-            beArmed = true;
-          }
-        }
-      }
-
-      // Gatilhos de BE (ATR OU Pontos)
-      if (beArmed && !beTriggered && (beUseATR || beUsePOINT)) {
-        const hitByATR = beUseATR && unrealizedPts >= beTriggerPtsATR;
-        const hitByPOINT = beUsePOINT && unrealizedPts >= beTriggerPtsABS;
-
-        if (hitByATR || hitByPOINT) {
-          const beLevel = isBuy
-            ? entryPrice + Math.max(0, CFG.BE_OFFSET_POINTS)
-            : entryPrice - Math.max(0, CFG.BE_OFFSET_POINTS);
-
-          dynSL = beLevel;
-          noLossFloor = beLevel;
-          beLevelCache = beLevel;
-          beTriggered = true;
-          iBeTrigger = k;
-          if (hitByATR) diag.beByATR++;
-          if (hitByPOINT) diag.beByPOINTS++;
-
-          if (DEBUG_BE) {
-            console.log(`[pipeline/BE] ${side} @${bar.time.toISOString()} entry=${entryPrice} be=${beLevel} (trgMin=${isFinite(beMinTrigger) ? beMinTrigger.toFixed(2) : "-"})`);
-          }
-
-          if (CFG.TRAIL_ENABLED && CFG.TRAIL_AFTER_BE_ONLY) {
-            trailArmed = true;
-            trailActive = true;
-          }
-        }
-      }
-
-      // Trailing por ATR
-      if (trailArmed) {
-        const atrK = Math.max(0, Number(atrSeries[k] ?? atrSeries[Math.max(0, k - 1)] ?? atr)) || 0;
-        const trailDist = trailATR * atrK;
-        if (isBuy) {
-          const candidate = mid - trailDist;
-          dynSL = dynSL == null ? candidate : Math.max(dynSL, candidate);
-        } else {
-          const candidate = mid + trailDist;
-          dynSL = dynSL == null ? candidate : Math.min(dynSL, candidate);
-        }
-        // trava para não desfazer BE
-        if (noLossFloor != null) {
-          dynSL = isBuy ? Math.max(dynSL!, noLossFloor) : Math.min(dynSL!, noLossFloor);
-        }
-      }
-
-      // Saídas
-      const hitTP = () => (tpLevel == null ? false : (isBuy ? high >= tpLevel : low <= tpLevel));
-      const hitSL = () => (dynSL == null ? false : (isBuy ? low <= dynSL : high >= dynSL));
-
-      if (beTriggered && checkOrderAfterBE) {
-        if (hitTP()) { exitPrice = tpLevel!; outcome = "TP"; iExit = k; break; }
-        if (hitSL()) { exitPrice = dynSL!; outcome = "SL"; iExit = k; break; }
-      } else {
-        if (hitSL()) { exitPrice = dynSL!; outcome = "SL"; iExit = k; break; }
-        if (hitTP()) { exitPrice = tpLevel!; outcome = "TP"; iExit = k; break; }
-      }
-    }
-
-    // FAILSAFE MFE
-    let forcedBE = false;
-    let forcedReason: string | null = null;
-    const basePnL = exitPrice != null ? (isBuy ? exitPrice - entryPrice : entryPrice - exitPrice) : null;
-
-    const autoMfeThreshold = Math.min(beUseATR ? beTriggerPtsATR : Infinity, beUsePOINT ? beTriggerPtsABS : Infinity);
-    const configured = Math.max(0, CFG.FORCE_MFE_POINTS || 0);
-    const forceThreshold = configured > 0 ? configured : (isFinite(autoMfeThreshold) ? autoMfeThreshold : 0);
-
-    if (CFG.FORCE_NO_LOSS_AFTER_MFE && forceThreshold > 0) {
-      const hitMfeForce = mfePts >= forceThreshold;
-      const isLoss = basePnL != null ? basePnL < 0 && Math.abs(basePnL) > 1e-9 : false;
-
-      if (hitMfeForce && isLoss) {
-        const beFail = isBuy
-          ? entryPrice + Math.max(0, CFG.FORCE_OFFSET_POINTS)
-          : entryPrice - Math.max(0, CFG.FORCE_OFFSET_POINTS);
-
-        let kExitBE: number | null = null;
-        const kStart = (iBeTrigger ?? (iSignal + 1));
-        for (let k = kStart; k < Math.min(win.length, iSignal + 1 + CFG.HORIZON + 1); k++) {
-          const bar = win[k];
-          if (isBuy) { if (Number(bar.low) <= beFail) { kExitBE = k; break; } }
-          else { if (Number(bar.high) >= beFail) { kExitBE = k; break; } }
-        }
-
-        iExit = kExitBE != null ? kExitBE : (iExit ?? (iSignal + 1));
-        exitPrice = beFail;
-        forcedBE = true;
-        outcome = "SL"; // semanticamente stop, porém no BE
-        forcedReason = "FORCED_BE_BY_MFE";
-      }
-    }
-
-    // PnL final (considerando parcial)
-    let pnlPoints: number | null = null;
-    if (exitPrice != null) {
-      if (partialDone) {
-        const ratio = CFG.PARTIAL_RATIO;
-        const restRatio = 1 - ratio;
-        const restPnL = isBuy ? exitPrice - entryPrice : entryPrice - exitPrice;
-        pnlPoints = partialPnLPoints + restRatio * restPnL;
-      } else {
-        pnlPoints = isBuy ? exitPrice - entryPrice : entryPrice - exitPrice;
-      }
-    } else {
-      diag.noExitInHorizon++;
-    }
-
-    if (outcome === "TP") tp++;
-    else if (outcome === "SL") sl++;
-    else none++;
-
-    // sinal de saída (se acharmos candleId)
-    let exitSignalId: number | null = null;
-    let exitType: "EXIT_TP" | "EXIT_SL" | "EXIT_NONE" = "EXIT_NONE";
-    if (outcome === "TP") exitType = "EXIT_TP";
-    else if (outcome === "SL") exitType = "EXIT_SL";
-
-    if (iExit != null && iExit >= 0 && iExit < win.length && exitPrice != null) {
-      const exitBar = win[iExit];
-      const exitCandleId = exitBar.id;
-
-      const reasonObj = {
-        side, entryPrice, exitPrice, tpLevel, slLevel,
-        dynSLFinal: typeof exitPrice === "number" ? exitPrice : null,
-        beTriggered,
-        beTriggers: {
-          atr: beUseATR ? beTriggerPtsATR : null,
-          points: beUsePOINT ? beTriggerPtsABS : null,
-          min: isFinite(beMinTrigger) ? beMinTrigger : null,
-        },
-        beLevel: beLevelCache,
-        noLossFloor,
-        mfePts: Number(mfePts.toFixed(2)),
-        forcedBE, forcedReason,
-        partialDone, priority: CFG.PRIORITY,
-      };
-
-      if (exitCandleId != null) {
-        const existingExit = await prisma.signal.findFirst({
-          where: { candleId: exitCandleId, signalType: exitType },
+    if (exitCandle?.id) {
+      const existingExit = await prisma.signal.findFirst({
+        where: { candleId: exitCandle.id, signalType: exitType },
+        select: { id: true },
+      });
+      if (existingExit) exitSignalId = existingExit.id;
+      else {
+        const created = await prisma.signal.create({
+          data: {
+            candleId: exitCandle.id,
+            signalType: exitType,
+            side,
+            score: 1.0,
+            reason: outcome,
+            createdAt: new Date(),
+          },
           select: { id: true },
         });
-
-        if (existingExit) {
-          exitSignalId = existingExit.id;
-        } else {
-          const createdExit = await prisma.signal.create({
-            data: {
-              candleId: exitCandleId,
-              signalType: exitType,
-              side,
-              score: 1.0,
-              reason:
-                exitType === "EXIT_TP"
-                  ? `Take Profit atingido | diag=${JSON.stringify(reasonObj)}`
-                  : exitType === "EXIT_SL"
-                    ? `Stop Loss atingido | diag=${JSON.stringify(reasonObj)}`
-                    : `Saída neutra | diag=${JSON.stringify(reasonObj)}`,
-            },
-            select: { id: true },
-          });
-          exitSignalId = createdExit.id;
-        }
-      } else {
-        diag.exitNoCandleId++;
-        console.log("[pipeline] exit without candleId", { exitType, diag: reasonObj, signalId: sig.id });
+        exitSignalId = created?.id ?? null;
       }
     }
-
-    await upsertTrade(sig, {
-      instrumentId: c.instrumentId,
-      timeframe: c.timeframe || inferTfStringFromRow(win[iEntry]) || "M5",
-      qty: CFG.DEFAULT_QTY,
-      entryPrice,
-      exitPrice: exitPrice ?? null,
-      pnlPoints,
-      exitSignalId: exitSignalId ?? null,
-    });
-
-    tradesTouched++;
   }
 
-  const ms = Date.now() - t0;
-  console.log("[pipeline] backfill", {
-    signals: signals.length,
-    tradesTouched,
-    TP: tp,
-    SL: sl,
-    NONE: none,
-    ms,
-    diag,
+  await upsertTrade(sig, {
+    instrumentId,
+    timeframe: tf,
+    qty: CFG.DEFAULT_QTY,
+    entryPrice,
+    exitPrice,
+    pnlPoints,
+    exitSignalId,
   });
 
-  return { ok: true, processedSignals: signals.length, tradesTouched, tp, sl, none, ms, diag };
+  if (CFG.DEBUG) {
+    const entStr = DateTime.fromJSDate(win[iEntry].time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss");
+    const exStr = (iExit != null) ? DateTime.fromJSDate(win[iExit].time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss") : "-";
+    console.log(`[DBG] DONE entry@${entStr} exit@${exStr} outcome=${outcome} pnlPts=${pnlPoints ?? "-"}`);
+  }
 }
 
-// =========================
-// Upserts
-// =========================
 async function upsertTrade(
   signal: { id: number },
-  data: {
+  trade: {
     instrumentId: number;
     timeframe: string;
     qty: number;
@@ -662,62 +379,94 @@ async function upsertTrade(
     await prisma.trade.update({
       where: { id: existing.id },
       data: {
-        instrument: { connect: { id: data.instrumentId } },
-        timeframe: data.timeframe,
-        qty: data.qty,
-        entryPrice: data.entryPrice,
-        exitPrice: data.exitPrice ?? undefined,
-        pnlPoints: data.pnlPoints ?? undefined,
-        ...(data.exitSignalId ? { exitSignal: { connect: { id: data.exitSignalId } } } : {}),
+        instrumentId: trade.instrumentId,
+        timeframe: trade.timeframe,
+        qty: trade.qty,
+        entryPrice: trade.entryPrice,
+        exitPrice: trade.exitPrice,
+        pnlPoints: trade.pnlPoints,
+        exitSignalId: trade.exitSignalId,
+        updatedAt: new Date(),
       },
     });
   } else {
     await prisma.trade.create({
       data: {
-        instrument: { connect: { id: data.instrumentId } },
-        timeframe: data.timeframe,
-        entrySignal: { connect: { id: signal.id } },
-        ...(data.exitSignalId ? { exitSignal: { connect: { id: data.exitSignalId } } } : {}),
-        qty: data.qty,
-        entryPrice: data.entryPrice,
-        exitPrice: data.exitPrice,
-        pnlPoints: data.pnlPoints,
+        instrumentId: trade.instrumentId,
+        timeframe: trade.timeframe,
+        qty: trade.qty,
+        entryPrice: trade.entryPrice,
+        exitPrice: trade.exitPrice,
+        pnlPoints: trade.pnlPoints,
+        entrySignalId: signal.id,
+        exitSignalId: trade.exitSignalId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       },
     });
   }
 }
 
-/** Cria/atualiza trade “sem saída” quando não há próxima barra */
-async function upsertTradeEmpty(
-  signal: { id: number },
-  candle: { instrumentId: number; timeframe: string | null; close: number }
-) {
-  return upsertTrade(signal, {
-    instrumentId: candle.instrumentId,
-    timeframe: candle.timeframe || "M5",
-    qty: CFG.DEFAULT_QTY,
-    entryPrice: Number(candle.close),
-    exitPrice: null,
-    pnlPoints: null,
-    exitSignalId: null,
+// =========================
+// Entrada pública
+// =========================
+
+/**
+ * Se timeframe:
+ *   - string (ex.: "M1", "M5"): reprocessa só esse TF
+ *   - "*" ou omitida: reprocessa TODOS os TFs do símbolo no dia
+ */
+export async function processImportedRange(opts: {
+  instrumentId?: number;
+  symbol?: string;
+  timeframe?: string | null | undefined;
+  day: Date;
+}) {
+  const { instrumentId, symbol } = opts;
+
+  let instId = instrumentId ?? null;
+  if (!instId && symbol) {
+    const inst = await prisma.instrument.findFirst({ where: { symbol: String(symbol).trim() }, select: { id: true } });
+    instId = inst?.id ?? null;
+  }
+  if (!instId) return;
+
+  const start = DateTime.fromJSDate(opts.day).startOf("day").toJSDate();
+  const end = DateTime.fromJSDate(opts.day).endOf("day").toJSDate();
+
+  const tfRaw = (opts.timeframe ?? "").toString().trim().toUpperCase();
+  const allTF = !tfRaw || tfRaw === "*";
+
+  const candleWhere: any = {
+    instrumentId: instId,
+    time: { gte: start, lte: end },
+    ...(allTF ? {} : { timeframe: tfRaw }),
+  };
+
+  const signals = await prisma.signal.findMany({
+    where: { signalType: "EMA_CROSS", candle: candleWhere },
+    select: { id: true },
+    orderBy: { id: "asc" },
   });
+
+  for (const s of signals) {
+    try {
+      await consolidateSignalToTrade(s.id);
+    } catch (e) {
+      console.error("consolidateSignalToTrade error", e);
+    }
+  }
 }
 
-// =========================
-// Helpers
-// =========================
-function inferTfStringFromRow(r: { timeframe: string | null } | undefined): string | null {
-  if (!r) return null;
-  const sRaw = r.timeframe ? String(r.timeframe) : "";
-  const s = sRaw.toUpperCase();
-  if (s.startsWith("M") || s.startsWith("H")) return s;
-  if (/^\d+$/.test(s)) return `M${s}`;
-  return null;
+/** Reprocessa um único sinal especificado (debug pontual). */
+export async function reprocessSignal(signalId: number) {
+  try {
+    await consolidateSignalToTrade(signalId);
+  } catch (e) {
+    console.error("reprocessSignal error", e);
+  }
 }
 
-// =========================
-// Boot (no-op seguro)
-// =========================
-export function bootPipeline() {
-  return;
+export async function bootPipeline() {
+  // no-op
 }

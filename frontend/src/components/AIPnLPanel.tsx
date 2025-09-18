@@ -83,13 +83,16 @@ function parseQS() {
     typeof window !== "undefined"
       ? new URLSearchParams(window.location.search)
       : new URLSearchParams();
+  // Mantém compat: ativo por padrão, mas agora só reconstrói se não houver backtest, a menos que force=1
   const nextOpenEntry = (sp.get("nextOpenEntry") ?? "1").trim() !== "0";
+  const forceNextOpen =
+    (sp.get("forceNextOpen") ?? sp.get("force") ?? "0").trim() === "1";
   const reStr = sp.get("reEntryBars");
   const reEntryBars =
     reStr != null && reStr !== "" && Number.isFinite(Number(reStr))
       ? Number(reStr)
       : NaN;
-  return { nextOpenEntry, reEntryBars };
+  return { nextOpenEntry, forceNextOpen, reEntryBars };
 }
 function pickSigName(s: any) {
   return (
@@ -103,14 +106,14 @@ function pickSigName(s: any) {
 /** ======= Painel ======= */
 export default function AIPnLPanel() {
   const pnl = useAIStore((s) => s.pnl);
-  const tradesStore = useAIStore((s) => s.trades);
+  const tradesStore = useAIStore((s) => s.trades); // backtest
   const confirmed = useAIStore((s) => s.confirmed);
   const params = useAIStore((s) => s.lastParams);
 
   const symbol = String(params?.symbol || "").toUpperCase();
   const timeframe = String(params?.timeframe || "").toUpperCase();
   const tfMin = tfToMinutes(timeframe);
-  const { nextOpenEntry, reEntryBars } = parseQS();
+  const { nextOpenEntry, forceNextOpen, reEntryBars } = parseQS();
 
   const { value: pointValue, source: pvSource } = getPointValue(symbol);
   const { value: defaultRiskPoints, source: rrSource } = getDefaultRiskPoints();
@@ -121,7 +124,7 @@ export default function AIPnLPanel() {
       ? 4
       : 3;
 
-  /** ======= Carrega candles quando for aplicar a Política A ======= */
+  /** ======= Carrega candles (para reconstrução quando necessário) ======= */
   const [candles, setCandles] = React.useState<
     { time: string; open: number; high: number; low: number; close: number }[]
   >([]);
@@ -129,7 +132,10 @@ export default function AIPnLPanel() {
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      if (!params || !nextOpenEntry) {
+      // Só baixa candles se for usar reconstrução (quando não houver backtest ou houver força explícita)
+      const hasBacktest = Array.isArray(tradesStore) && tradesStore.length > 0;
+      const willReconstruct = nextOpenEntry && (!hasBacktest || forceNextOpen);
+      if (!params || !willReconstruct) {
         setCandles([]);
         return;
       }
@@ -142,7 +148,6 @@ export default function AIPnLPanel() {
           limit: 5000,
         });
         if (!alive) return;
-        // garante ASC por tempo
         const asc = [...rows].sort((a, b) => {
           const ta = toTs(a.time) ?? 0;
           const tb = toTs(b.time) ?? 0;
@@ -157,46 +162,10 @@ export default function AIPnLPanel() {
     return () => {
       alive = false;
     };
-  }, [symbol, timeframe, params?.from, params?.to, nextOpenEntry]);
+  }, [symbol, timeframe, params?.from, params?.to, nextOpenEntry, forceNextOpen, tradesStore]);
 
-  /** ======= Reconstrói trades com “entrada no próximo open após o sinal” e NOTA detalhada ======= */
-  const tradesView = React.useMemo(() => {
-    if (!nextOpenEntry) {
-      // Política A desativada => usa exatamente o store
-      return Array.isArray(tradesStore) ? tradesStore : [];
-    }
-
-    const confAsc = (Array.isArray(confirmed) ? confirmed : [])
-      .filter((r: any) => r && r.time && (r.side === "BUY" || r.side === "SELL"))
-      .sort((a: any, b: any) => (toTs(a.time) ?? 0) - (toTs(b.time) ?? 0));
-
-    // sem sinais ou sem candles => recai p/ store
-    if (confAsc.length === 0 || candles.length === 0) {
-      return Array.isArray(tradesStore) ? tradesStore : [];
-    }
-
-    // Índice de candle por timestamp (exato). Se não achar exato, usaremos busca por vizinho.
-    const times = candles.map((c) => toTs(c.time) as number);
-    const idxByTs = new Map<number, number>();
-    for (let i = 0; i < times.length; i++) idxByTs.set(times[i], i);
-
-    function findIndexForTs(ts: number): number | null {
-      if (!Number.isFinite(ts) || times.length === 0) return null;
-      let lo = 0,
-        hi = times.length - 1;
-      if (ts <= times[lo]) return lo;
-      if (ts >= times[hi]) return hi;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const v = times[mid];
-        if (v === ts) return mid;
-        if (v < ts) lo = mid + 1;
-        else hi = mid - 1;
-      }
-      // lo é o primeiro > ts; hi é o último < ts
-      return hi >= 0 ? hi : lo;
-    }
-
+  /** ======= tradesView: prioriza BACKTEST; reconstrói só se preciso/forçado ======= */
+  const { tradesView, policyUsed } = React.useMemo(() => {
     type T = {
       side: "BUY" | "SELL";
       entryTime: string;
@@ -209,38 +178,114 @@ export default function AIPnLPanel() {
       note?: string;
     };
 
-    const out: T[] = [];
-    let position:
-      | null
-      | {
-        side: "BUY" | "SELL";
-        entryIdx: number; // índice do candle da ENTRADA (N+1 do sinal)
-        entryTime: string;
-        entryPrice: number;
-        entrySigName: string; // novo: nome/nota do sinal de ENTRADA
-        entrySigTimeISO: string; // para exibir opcionalmente
-      } = null;
+    const hasBacktest = Array.isArray(tradesStore) && tradesStore.length > 0;
+    const preferBacktest = hasBacktest && !forceNextOpen;
 
+    if (preferBacktest) {
+      // Mapeia trades do backtest para a mesma forma da visão, preservando BE
+      const rows: T[] = (tradesStore as any[]).map((r: any) => {
+        const pnlPts = Number(r.pnl ?? (r.exitPrice - r.entryPrice) * (r.side === "BUY" ? 1 : -1)) || 0;
+        const note =
+          r.movedToBE
+            ? (r.note ? String(r.note) + " (BE)" : "be/stop")
+            : (r.note ?? undefined);
+        return {
+          side: r.side,
+          entryTime: r.entryTime,
+          exitTime: r.exitTime,
+          entryPrice: Number(r.entryPrice),
+          exitPrice: Number(r.exitPrice),
+          pnlPoints: pnlPts,
+          pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : pnlPts * Number(pointValue),
+          rr: defaultRiskPoints !== 0 ? pnlPts / Number(defaultRiskPoints) : undefined,
+          note,
+        };
+      });
+      // ordena por entrada
+      rows.sort((a, b) => (toTs(a.entryTime)! - toTs(b.entryTime)!));
+      return { tradesView: rows, policyUsed: "backtest" as const };
+    }
+
+    // Se não há backtest (ou forceNextOpen=1), reconstrói via “próximo open”
+    if (!nextOpenEntry) {
+      // Sem reconstrução e sem backtest => devolve store “como está”
+      const rows: T[] = Array.isArray(tradesStore) ? (tradesStore as any[]).map((r: any) => ({
+        side: r.side,
+        entryTime: r.entryTime,
+        exitTime: r.exitTime,
+        entryPrice: Number(r.entryPrice),
+        exitPrice: Number(r.exitPrice),
+        pnlPoints: Number(r.pnl ?? 0),
+        pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : Number(r.pnl ?? 0) * Number(pointValue),
+        rr: defaultRiskPoints !== 0 ? Number(r.pnl ?? 0) / Number(defaultRiskPoints) : undefined,
+        note: r.note ?? undefined,
+      })) : [];
+      rows.sort((a, b) => (toTs(a.entryTime)! - toTs(b.entryTime)!));
+      return { tradesView: rows, policyUsed: "store" as const };
+    }
+
+    const confAsc = (Array.isArray(confirmed) ? confirmed : [])
+      .filter((r: any) => r && r.time && (r.side === "BUY" || r.side === "SELL"))
+      .sort((a: any, b: any) => (toTs(a.time) ?? 0) - (toTs(b.time) ?? 0));
+
+    if (confAsc.length === 0 || candles.length === 0) {
+      // nada para reconstruir
+      const rows: T[] = Array.isArray(tradesStore) ? (tradesStore as any[]).map((r: any) => ({
+        side: r.side,
+        entryTime: r.entryTime,
+        exitTime: r.exitTime,
+        entryPrice: Number(r.entryPrice),
+        exitPrice: Number(r.exitPrice),
+        pnlPoints: Number(r.pnl ?? 0),
+        pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : Number(r.pnl ?? 0) * Number(pointValue),
+        rr: defaultRiskPoints !== 0 ? Number(r.pnl ?? 0) / Number(defaultRiskPoints) : undefined,
+        note: r.note ?? undefined,
+      })) : [];
+      rows.sort((a, b) => (toTs(a.entryTime)! - toTs(b.entryTime)!));
+      return { tradesView: rows, policyUsed: "store" as const };
+    }
+
+    // Índices auxiliares
+    const times = candles.map((c) => toTs(c.time) as number);
+    const idxByTs = new Map<number, number>();
+    for (let i = 0; i < times.length; i++) idxByTs.set(times[i], i);
+    function findIndexForTs(ts: number): number | null {
+      if (!Number.isFinite(ts) || times.length === 0) return null;
+      let lo = 0, hi = times.length - 1;
+      if (ts <= times[lo]) return lo;
+      if (ts >= times[hi]) return hi;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const v = times[mid];
+        if (v === ts) return mid;
+        if (v < ts) lo = mid + 1; else hi = mid - 1;
+      }
+      return hi >= 0 ? hi : lo;
+    }
+
+    const out: T[] = [];
+    let position: null | {
+      side: "BUY" | "SELL";
+      entryIdx: number;
+      entryTime: string;
+      entryPrice: number;
+      entrySigName: string;
+      entrySigTimeISO: string;
+    } = null;
     let lastCloseIdx: number | null = null;
 
     for (const s of confAsc) {
       const st = toTs(s.time);
       if (st == null) continue;
-
-      // índice do candle do SINAL (N). Queremos ENTRAR no N+1.
       let idx = idxByTs.get(st) ?? findIndexForTs(st);
       if (idx == null) continue;
 
       const nextIdx = idx + 1;
-      if (nextIdx >= candles.length) {
-        // sem próximo candle -> não dá para aplicar política A nessa borda
-        continue;
-      }
+      if (nextIdx >= candles.length) continue;
 
       const openBar = candles[nextIdx];
       const openIdx = nextIdx;
 
-      // cooldown (em barras) após fechamento lógico
       if (position === null && lastCloseIdx != null) {
         if (openIdx - lastCloseIdx < reEntryBarsEff) {
           continue;
@@ -251,7 +296,6 @@ export default function AIPnLPanel() {
       const sigName = pickSigName(s);
 
       if (position === null) {
-        // ABRE posição no próximo open
         position = {
           side,
           entryIdx: openIdx,
@@ -260,63 +304,52 @@ export default function AIPnLPanel() {
           entrySigName: sigName,
           entrySigTimeISO: String(s.time),
         };
-      } else {
-        // Já estamos posicionados. Se vier sinal OPOSTO, FECHA no próximo open
-        if (side !== position.side) {
-          const exitBar = openBar; // fechamento também no N+1 do sinal oposto
-          const exitIdx = openIdx;
-          const exitPrice = Number(exitBar.open);
-          const pnlPts =
-            position.side === "BUY"
-              ? exitPrice - position.entryPrice
-              : position.entryPrice - exitPrice;
+      } else if (side !== position.side) {
+        const exitBar = openBar;
+        const exitIdx = openIdx;
+        const exitPrice = Number(exitBar.open);
+        const pnlPts =
+          position.side === "BUY"
+            ? exitPrice - position.entryPrice
+            : position.entryPrice - exitPrice;
 
-          // nota rica (PT-BR)
-          const holdBars = Math.max(1, exitIdx - position.entryIdx);
-          const holdMin = holdBars * tfMin;
-          const exitSigName = sigName; // do sinal que gerou a reversão
+        const holdBars = Math.max(1, exitIdx - position.entryIdx);
+        const holdMin = holdBars * tfMin;
+        const exitSigName = sigName;
 
-          const noteRich =
-            `entrada: ${position.entrySigName || "sinal"} • ` +
-            `saída: reversão${exitSigName ? ` (${exitSigName})` : ""} — próx. abertura • ` +
-            `hold: ${holdBars} barra${holdBars === 1 ? "" : "s"} (${holdMin}min)`;
+        const noteRich =
+          `entrada: ${position.entrySigName || "sinal"} • ` +
+          `saída: reversão${exitSigName ? ` (${exitSigName})` : ""} — próx. abertura • ` +
+          `hold: ${holdBars} barra${holdBars === 1 ? "" : "s"} (${holdMin}min)`;
 
-          out.push({
-            side: position.side,
-            entryTime: position.entryTime,
-            exitTime: exitBar.time,
-            entryPrice: position.entryPrice,
-            exitPrice,
-            pnlPoints: pnlPts,
-            pnlMoney: pnlPts * Number(pointValue),
-            rr:
-              defaultRiskPoints !== 0
-                ? pnlPts / Number(defaultRiskPoints)
-                : undefined,
-            note: noteRich,
-          });
+        out.push({
+          side: position.side,
+          entryTime: position.entryTime,
+          exitTime: exitBar.time,
+          entryPrice: position.entryPrice,
+          exitPrice,
+          pnlPoints: pnlPts,
+          pnlMoney: pnlPts * Number(pointValue),
+          rr: defaultRiskPoints !== 0 ? pnlPts / Number(defaultRiskPoints) : undefined,
+          note: noteRich,
+        });
 
-          lastCloseIdx = exitIdx;
-          position = null;
-
-          // Após fechar, NÃO abrimos imediatamente com o mesmo sinal (respeita cooldown)
-        } else {
-          // Mesmo lado enquanto posicionado -> ignora
-        }
+        lastCloseIdx = exitIdx;
+        position = null;
       }
     }
 
-    // Se terminar com posição aberta e não houver sinal oposto, não fechamos
-    return out;
+    return { tradesView: out, policyUsed: "next-open" as const };
   }, [
-    nextOpenEntry,
+    tradesStore,
     confirmed,
     candles,
-    tradesStore,
-    pointValue,
-    defaultRiskPoints,
+    nextOpenEntry,
+    forceNextOpen,
     reEntryBarsEff,
     tfMin,
+    pointValue,
+    defaultRiskPoints,
   ]);
 
   const totals = React.useMemo(() => {
@@ -335,13 +368,11 @@ export default function AIPnLPanel() {
       money += pnl$;
     }
 
-    // estatísticas básicas (wins/losses etc.)
     const wins = tradesView.filter((t) => (Number(t.pnlPoints) || 0) > 0).length;
     const losses = tradesView.filter((t) => (Number(t.pnlPoints) || 0) < 0).length;
     const ties = count - wins - losses;
     const winRate = count > 0 ? wins / count : 0;
 
-    // Profit Factor e Max Drawdown simples (baseado em pontos)
     let grossProfit = 0;
     let grossLoss = 0;
     let equity = 0;
@@ -379,15 +410,14 @@ export default function AIPnLPanel() {
       // eslint-disable-next-line no-console
       console.log("[AIPnLPanel] pnl & trades", {
         pnl,
-        tradesCountStore: tradesStore?.length ?? 0,
+        tradesCountStore: Array.isArray(tradesStore) ? tradesStore.length : 0,
         tradesCountView: tradesView.length,
         example: tradesView[0] || null,
         pointValue,
         defaultRiskPoints,
         pvSource,
         rrSource,
-        nextOpenEntry,
-        reEntryBarsEff,
+        policyUsed,
       });
     }
   }, [
@@ -398,8 +428,7 @@ export default function AIPnLPanel() {
     defaultRiskPoints,
     pvSource,
     rrSource,
-    nextOpenEntry,
-    reEntryBarsEff,
+    policyUsed,
   ]);
 
   return (
@@ -412,44 +441,28 @@ export default function AIPnLPanel() {
               {params ? (
                 <>
                   <code>{params.symbol}</code> · <code>{params.timeframe}</code>
-                  {params.from ? (
-                    <>
-                      {" "}
-                      · de <code>{params.from}</code>
-                    </>
-                  ) : null}
-                  {params.to ? (
-                    <>
-                      {" "}
-                      até <code>{params.to}</code>
-                    </>
-                  ) : null}
+                  {params.from ? <> · de <code>{params.from}</code></> : null}
+                  {params.to ? <> até <code>{params.to}</code></> : null}
+                  {" · "}
+                  <em>fonte: {policyUsed === "backtest" ? "/backtest (com BE)" : policyUsed}</em>
                 </>
-              ) : (
-                "—"
-              )}
+              ) : "—"}
             </div>
           </div>
 
-          {/* Resumo PnL (derivado quando nextOpenEntry=1) */}
+          {/* Resumo PnL */}
           <div className="row g-2 mb-3">
             <div className="col-auto">
-              <span className="badge bg-secondary">
-                Trades: {totals.count}
-              </span>
+              <span className="badge bg-secondary">Trades: {totals.count}</span>
             </div>
             <div className="col-auto">
               <span className="badge bg-success">Wins: {totals.wins}</span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-danger">
-                Losses: {totals.losses}
-              </span>
+              <span className="badge bg-danger">Losses: {totals.losses}</span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-warning text-dark">
-                Ties: {totals.ties}
-              </span>
+              <span className="badge bg-warning text-dark">Ties: {totals.ties}</span>
             </div>
             <div className="col-auto">
               <span className="badge bg-info text-dark">
@@ -457,42 +470,26 @@ export default function AIPnLPanel() {
               </span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-dark">
-                PnL pts: {fmtNum(totals.pts, 2)}
-              </span>
+              <span className="badge bg-dark">PnL pts: {fmtNum(totals.pts, 2)}</span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-dark">
-                PnL $: {fmtNum(totals.money, 2)}
-              </span>
+              <span className="badge bg-dark">PnL $: {fmtNum(totals.money, 2)}</span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-dark">
-                PF: {fmtNum(totals.profitFactor, 2)}
-              </span>
+              <span className="badge bg-dark">PF: {fmtNum(totals.profitFactor, 2)}</span>
             </div>
             <div className="col-auto">
-              <span className="badge bg-dark">
-                MaxDD: {fmtNum(totals.maxDrawdown, 2)}
-              </span>
+              <span className="badge bg-dark">MaxDD: {fmtNum(totals.maxDrawdown, 2)}</span>
             </div>
           </div>
 
-          {/* Info de fonte usada (apenas se for fallback/env) */}
+          {/* Info de fonte usada */}
           {(pvSource !== "window" || rrSource !== "window") && (
             <div className="text-muted small mb-2">
               <em>
-                PnL($) calculado com pointValue=<code>{pointValue}</code> (
-                {pvSource}); R/R com defaultRiskPoints=
-                <code>{defaultRiskPoints}</code> ({rrSource}). Política:{" "}
-                <code>{nextOpenEntry ? "next-open" : "store"}</code>
-                {nextOpenEntry ? (
-                  <>
-                    {" "}
-                    (reEntryBars=<code>{reEntryBarsEff}</code>)
-                  </>
-                ) : null}
-                .
+                PnL($) calculado com pointValue=<code>{pointValue}</code> ({pvSource});
+                R/R com defaultRiskPoints=<code>{defaultRiskPoints}</code> ({rrSource}).
+                Política efetiva: <code>{policyUsed}</code>.
               </em>
             </div>
           )}
@@ -529,17 +526,12 @@ export default function AIPnLPanel() {
                 ) : (
                   tradesView.map((t: any, idx: number) => {
                     const sideBg = t.side === "BUY" ? "#16a34a" : "#dc2626";
-
-                    const pnlPts = Number.isFinite(Number(t.pnlPoints))
-                      ? Number(t.pnlPoints)
-                      : NaN;
-
+                    const pnlPts = Number.isFinite(Number(t.pnlPoints)) ? Number(t.pnlPoints) : NaN;
                     const pnlMoney = Number.isFinite(Number(t.pnlMoney))
                       ? Number(t.pnlMoney)
                       : Number.isFinite(pnlPts)
                         ? pnlPts * pointValue
                         : NaN;
-
                     const rr = Number.isFinite(Number(t.rr))
                       ? Number(t.rr)
                       : Number.isFinite(pnlPts) && defaultRiskPoints !== 0
@@ -551,21 +543,13 @@ export default function AIPnLPanel() {
                         <td>
                           <span
                             className="badge"
-                            style={{
-                              backgroundColor: sideBg,
-                              color: "#fff",
-                              fontWeight: 600,
-                            }}
+                            style={{ backgroundColor: sideBg, color: "#fff", fontWeight: 600 }}
                           >
                             {t.side}
                           </span>
                         </td>
-                        <td>
-                          <code>{fmtTime(t.entryTime)}</code>
-                        </td>
-                        <td>
-                          <code>{fmtTime(t.exitTime)}</code>
-                        </td>
+                        <td><code>{fmtTime(t.entryTime)}</code></td>
+                        <td><code>{fmtTime(t.exitTime)}</code></td>
                         <td>{fmtNum(t.entryPrice, 2)}</td>
                         <td>{fmtNum(t.exitPrice, 2)}</td>
                         <td>{fmtNum(pnlPts, 2)}</td>
@@ -583,9 +567,8 @@ export default function AIPnLPanel() {
           </div>
 
           <div className="text-muted small mt-2">
-            Exibindo trades com política{" "}
-            <code>{nextOpenEntry ? "entrada no próximo open" : "store"}</code>.
-            PnL($) e R/R são recalculados quando necessário.
+            Exibindo trades com política <code>{policyUsed}</code>.
+            Quando “<code>backtest</code>”, os resultados incluem Break-even/Trailing calculados no servidor.
           </div>
         </div>
       </div>

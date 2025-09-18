@@ -14,84 +14,13 @@ const VERSION = "backtest:v4.3-ATR-RR-BE-TRAIL-HORIZON+runs+dual";
 
 /* ===== Helpers de timeframe/bucket ===== */
 function normalizeTf(tfRaw: string): { tfU: TF; tfMin: number } {
-  const s = String(tfRaw || "").trim().toUpperCase() as TF;
-  if (!s || !TF_MIN[s]) return { tfU: "M5", tfMin: 5 };
-  return { tfU: s, tfMin: TF_MIN[s] };
-}
-function floorTo(d: Date, tfMin: number): Date {
-  const dt = DateTime.fromJSDate(d).toUTC();
-  const bucketMin = Math.floor(dt.minute / tfMin) * tfMin;
-  return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
-}
-function ceilToExclusive(d: Date, tfMin: number): Date {
-  const dt = DateTime.fromJSDate(d).toUTC();
-  const bucketMin = Math.floor(dt.minute / tfMin) * tfMin + tfMin;
-  return dt.set({ second: 0, millisecond: 0, minute: bucketMin }).toJSDate();
-}
-function toLocalDateStr(d: Date) {
-  return DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd");
-}
-
-/* ===== EMA ===== */
-function EMA(values: number[], period: number): (number | null)[] {
-  const out: (number | null)[] = [];
-  const k = 2 / (period + 1);
-  let ema: number | null = null;
-  for (let i = 0; i < values.length; i++) {
-    const v = values[i];
-    if (!isFinite(v)) {
-      out.push(ema);
-      continue;
-    }
-    ema = ema == null ? v : v * k + (ema as number) * (1 - k);
-    out.push(ema);
+  const s = String(tfRaw || "M5").trim().toUpperCase();
+  if (s === "M1" || s === "M5" || s === "M15" || s === "M30" || s === "H1") {
+    return { tfU: s as TF, tfMin: TF_MIN[s as TF] };
   }
-  return out;
-}
-
-/* ===== ATR (Wilder) ===== */
-type Candle = { time: Date; open: number; high: number; low: number; close: number };
-function trueRange(curr: Candle, prevClose: number) {
-  const h = Number(curr.high), l = Number(curr.low);
-  return Math.max(
-    Math.abs(h - l),
-    Math.abs(h - prevClose),
-    Math.abs(l - prevClose)
-  );
-}
-function ATR(candles: Candle[], period = 14): (number | null)[] {
-  const out: (number | null)[] = new Array(candles.length).fill(null);
-  if (candles.length < period + 1) return out;
-
-  const trs: number[] = new Array(candles.length).fill(0);
-  trs[0] = Math.abs(Number(candles[0].high) - Number(candles[0].low));
-  for (let i = 1; i < candles.length; i++) {
-    trs[i] = trueRange(candles[i], Number(candles[i - 1].close));
-  }
-
-  let atr = 0;
-  for (let i = 0; i < period; i++) atr += trs[i];
-  atr /= period;
-  out[period] = atr;
-
-  for (let i = period + 1; i < candles.length; i++) {
-    atr = (atr * (period - 1) + trs[i]) / period;
-    out[i] = atr;
-  }
-  return out;
-}
-
-/* ===== Respostas padrão ===== */
-function ok<T>(data: T, extra: Record<string, any> = {}) {
-  return { ok: true, version: VERSION, ...extra, ...data };
-}
-function bad(message: string, meta: any = {}) {
-  return { ok: false, version: VERSION, error: message, ...meta };
-}
-function diagify(e: any) {
-  const s = String(e?.stack || e?.message || e);
-  const lines = s.split("\n").slice(0, 10).join("\n");
-  return { diag: lines };
+  // números “soltos” viram minutos (ex.: “3” => M3 ~ tratamos como M5)
+  if (/^\d+$/.test(s)) return { tfU: "M5", tfMin: TF_MIN.M5 };
+  return { tfU: "M5", tfMin: TF_MIN.M5 };
 }
 
 /* ===== Parsing/normalização de datas no fuso de SP ===== */
@@ -122,103 +51,73 @@ function parseUserDate(raw: any): { ok: boolean; dt: DateTime; isDateOnly: boole
     return { ok: dt.isValid, dt, isDateOnly: false };
   }
 
-  // Epoch ms
-  if (/^\d{10,13}$/.test(s)) {
-    const n = Number(s);
-    const dt = Number.isFinite(n) ? DateTime.fromMillis(n, { zone: ZONE }) : DateTime.invalid("nan");
-    return { ok: dt.isValid, dt, isDateOnly: false };
-  }
-
-  return { ok: false, dt: DateTime.invalid("unparsed"), isDateOnly: false };
+  return { ok: false, dt: DateTime.invalid("fmt"), isDateOnly: false };
 }
-
-function normalizeDayRange(fromRaw: any, toRaw: any): { fromLocal: DateTime; toLocal: DateTime } | null {
-  const pF = parseUserDate(fromRaw);
-  const pT = parseUserDate(toRaw);
-  if (!pF.ok && !pT.ok) return null;
-
-  let fromLocal: DateTime;
-  let toLocal: DateTime;
-
-  if (pF.ok && pT.ok) {
-    const sameDay = pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
-    if (pF.isDateOnly || pT.isDateOnly || sameDay) {
-      fromLocal = pF.dt.startOf("day");
-      toLocal = pT.dt.endOf("day");
-    } else {
-      fromLocal = pF.dt;
-      toLocal = pT.dt;
-    }
-  } else if (pF.ok) {
-    fromLocal = pF.isDateOnly ? pF.dt.startOf("day") : pF.dt;
-    toLocal = pF.isDateOnly ? pF.dt.endOf("day") : pF.dt.endOf("day");
-  } else {
-    toLocal = pT.isDateOnly ? pT.dt.endOf("day") : pT.dt;
-    fromLocal = pT.isDateOnly ? pT.dt.startOf("day") : pT.dt.startOf("day");
+function normRange(fromRaw: any, toRaw: any) {
+  const a = parseUserDate(fromRaw);
+  const b = parseUserDate(toRaw);
+  if (!a.ok && !b.ok) return null;
+  if (a.ok && a.isDateOnly && b.ok && b.isDateOnly) {
+    return {
+      fromLocal: a.dt.startOf("day"),
+      toLocal: b.dt.endOf("day"),
+    };
   }
-
-  if (toLocal < fromLocal) {
-    const tmp = fromLocal;
-    fromLocal = toLocal.startOf("day");
-    toLocal = tmp.endOf("day");
-  }
+  const fromLocal = a.ok ? a.dt : (b.ok ? b.dt.minus({ days: 1 }) : DateTime.now().setZone(ZONE).minus({ days: 1 }));
+  const toLocal = b.ok ? b.dt : (a.ok ? a.dt.plus({ days: 1 }) : DateTime.now().setZone(ZONE));
   return { fromLocal, toLocal };
 }
-
-/* =========================
-   Registro de execuções (em memória)
-   ========================= */
-type BacktestSnapshot = any;
-type RunIndexItem = {
-  id: string; ts: string;
-  symbol: string; timeframe: TF;
-  from: string; to: string;
-  trades: number; pnlPoints: number; winRate: number;
-};
-const RECENT_MAX = 100;
-const RUNS_INDEX: RunIndexItem[] = [];
-const RUNS_BY_ID: Record<string, BacktestSnapshot> = {};
-
-function makeId() {
-  const ts = Date.now().toString(36);
-  const rnd = Math.random().toString(36).slice(2, 8);
-  return `${ts}${rnd}`;
+function floorTo(d: Date, tfMin: number) {
+  const t = DateTime.fromJSDate(d).setZone("UTC");
+  const m = Math.floor(t.minute / tfMin) * tfMin;
+  return t.set({ second: 0, millisecond: 0, minute: m }).toJSDate();
 }
-function indexRun(snap: BacktestSnapshot) {
-  const id = makeId();
-  const ts = new Date().toISOString();
-  const item: RunIndexItem = {
-    id, ts,
-    symbol: snap?.symbol ?? "",
-    timeframe: snap?.timeframe ?? "M5",
-    from: snap?.from ?? "",
-    to: snap?.to ?? "",
-    trades: snap?.summary?.trades ?? 0,
-    pnlPoints: snap?.pnlPoints ?? 0,
-    winRate: snap?.summary?.winRate ?? 0,
-  };
-  RUNS_BY_ID[id] = { id, ts, ...snap };
-  RUNS_INDEX.push(item);
-  if (RUNS_INDEX.length > RECENT_MAX) {
-    const overflow = RUNS_INDEX.length - RECENT_MAX;
-    const removed = RUNS_INDEX.splice(0, overflow);
-    for (const r of removed) delete RUNS_BY_ID[r.id];
+function ceilToExclusive(d: Date, tfMin: number) {
+  const t = DateTime.fromJSDate(d).setZone("UTC");
+  const m = Math.ceil((t.minute + 0.0001) / tfMin) * tfMin;
+  return t.set({ second: 0, millisecond: 0, minute: m }).toJSDate();
+}
+
+/* ===== Indicadores simples ===== */
+function EMA(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = [];
+  const k = 2 / (period + 1);
+  let e: number | null = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = Number(values[i]) || 0;
+    e = e == null ? v : (v * k + (e as number) * (1 - k));
+    out.push(e);
   }
-  return id;
+  return out;
+}
+function ATR(candles: { high: number; low: number; close: number }[], period = 14): (number | null)[] {
+  const trs: number[] = [];
+  let prevClose = candles?.[0]?.close ?? 0;
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+    trs.push(tr);
+    prevClose = c.close;
+  }
+  const out: (number | null)[] = candles.map(() => null);
+  for (let i = 1; i < candles.length; i++) {
+    const upto = Math.min(i, trs.length);
+    const win = Math.min(14, upto);
+    if (win <= 0) { out[i] = null; continue; }
+    let sum = 0;
+    for (let k = 0; k < win; k++) sum += trs[upto - 1 - k];
+    out[i] = sum / win;
+  }
+  return out;
 }
 
-/* ====== helpers de rota-espelho (com e sem /api) ====== */
-function dualGet(path: string, handler: any) {
-  router.get(path, handler);
-  router.get(`/api${path}`, handler);
-}
-function dualAll(path: string, handler: any) {
-  router.all(path, handler);
-  router.all(`/api${path}`, handler);
-}
+/* -------- infra -------- */
+function ok(data: any) { return { ok: true, ...data }; }
+function bad(msg: string, extra?: any) { return { ok: false, error: msg, ...extra ? { extra } : {} }; }
+function log(...args: any[]) { console.log(...args); }
 
-/* ====== versão log ====== */
-console.log(`[BACKTEST] Loaded ${VERSION}`);
+// debug: versão carregada
+log(`[BACKTEST] Loaded ${VERSION}`);
 
 /* -------- util: echo -------- */
 dualAll("/debug/echo", (req: any, res: any) => {
@@ -251,7 +150,7 @@ dualGet("/backtest/health", async (req: any, res: any) => {
     const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1);
     let fromD: Date, toD: Date;
 
-    const norm = normalizeDayRange(from, to);
+    const norm = normRange(from, to);
     if (norm) {
       fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
       toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
@@ -265,34 +164,12 @@ dualGet("/backtest/health", async (req: any, res: any) => {
 
     const candles = await loadCandlesAnyTF(sym, tfU, { gte: fromD, lte: toD } as any);
     return res.status(200).json(
-      ok({ symbol: sym, timeframe: tfU, samples: candles.length, from: fromD.toISOString(), to: toD.toISOString() })
+      candles.length
+        ? ok({ symbol: sym, timeframe: tfU, candles: candles.length })
+        : bad("sem candles no período/símbolo/TF")
     );
   } catch (e: any) {
-    return res.status(200).json(bad("health failed", diagify(e)));
-  }
-});
-
-/* -------- runs (lista) -------- */
-dualGet("/backtest/runs", async (_req: any, res: any) => {
-  try {
-    const sorted = RUNS_INDEX.slice().sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
-    const limit = 100;
-    return res.status(200).json(ok({ total: RUNS_INDEX.length, items: sorted.slice(0, limit) }));
-  } catch (e: any) {
-    return res.status(200).json(bad("list failed", diagify(e)));
-  }
-});
-
-/* -------- run (detalhe) -------- */
-dualGet("/backtest/run/:id", async (req: any, res: any) => {
-  try {
-    const id = String(req.params.id || "").trim();
-    if (!id) return res.status(200).json(bad("faltou 'id'"));
-    const snap = RUNS_BY_ID[id];
-    if (!snap) return res.status(200).json(bad("run não encontrada", { id }));
-    return res.status(200).json(ok({ run: snap }));
-  } catch (e: any) {
-    return res.status(200).json(bad("read failed", diagify(e)));
+    return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
   }
 });
 
@@ -316,6 +193,9 @@ dualAll("/backtest", async (req: any, res: any) => {
       kTrail = 0,              // trailing = kTrail * ATR (0 = off)
       breakEvenAtR = 1.0,      // quando atinge X R, mover stop para BE
       beOffsetR = 0.0,         // offset em R no BE (ex.: 0.1R)
+      // NOVO: BE por pontos (se > 0, tem precedência sobre R)
+      breakEvenAtPts = null,
+      beOffsetPts = null,
       timeStopBars = 0,        // fecha após N barras (0 = off)
       horizonBars = 0,         // alias
       evalWindow = 200,
@@ -325,13 +205,16 @@ dualAll("/backtest", async (req: any, res: any) => {
 
     const sym = String(symbol || "").toUpperCase().trim();
     if (!sym) return res.status(200).json(bad("Faltou 'symbol' (ex.: WIN, WDO)"));
+    // Defaults de BE por pontos (ENV override se não vier no payload)
+    const bePts = Number(breakEvenAtPts ?? (process.env.BACKTEST_BE_AT_PTS || 0)) || 0;
+    const beOffPts = Number(beOffsetPts ?? (process.env.BACKTEST_BE_OFFSET_PTS || 0)) || 0;
 
     const { tfU, tfMin } = normalizeTf(String(timeframe || "M5"));
 
     // Datas (janela do usuário)
     const fallbackDays = Number(process.env.BACKTEST_DEFAULT_DAYS || 1);
     let fromD: Date, toD: Date;
-    const norm = normalizeDayRange(from, to);
+    const norm = normRange(from, to);
     if (norm) {
       fromD = floorTo(norm.fromLocal.toUTC().toJSDate(), tfMin);
       toD = ceilToExclusive(norm.toLocal.toUTC().toJSDate(), tfMin);
@@ -349,24 +232,26 @@ dualAll("/backtest", async (req: any, res: any) => {
     const warmupMin = Math.max(150, WARMUP_MULT * tfMin);
     const fromWarm = new Date(fromD.getTime() - warmupMin * 60_000);
 
-    let candles: Candle[];
+    let candles: { time: Date; open: number; high: number; low: number; close: number }[];
     try {
       candles = await loadCandlesAnyTF(sym, tfU, { gte: fromWarm, lte: toD } as any);
     } catch (e: any) {
-      return res.status(200).json(bad("Falha ao carregar candles (loadCandlesAnyTF)", diagify(e)));
+      return res.status(200).json(bad("erro ao carregar candles", { message: e?.message || String(e) }));
     }
+
     if (!candles?.length) {
       const empty = ok({
-        symbol: sym, timeframe: tfU, candles: 0, trades: [],
+        symbol: sym, timeframe: tfU, from: fromD.toISOString(), to: toD.toISOString(),
+        candles: 0, trades: [],
         summary: { trades: 0, wins: 0, losses: 0, ties: 0, winRate: 0, pnlPoints: 0, avgPnL: 0, profitFactor: 0, maxDrawdown: 0 },
         pnlPoints: 0, pnlMoney: 0,
-        lossCapApplied: Number(lossCap) || 0, maxConsecLossesApplied: Number(maxConsecLosses) || 0,
-        policy: { rr, kSL, kTrail, breakEvenAtR, beOffsetR, timeStopBars: timeStopBars || horizonBars },
+        lossCapApplied: Number(lossCap) || 0,
+        maxConsecLossesApplied: Number(maxConsecLosses) || 0,
+        policy: { rr, kSL, kTrail, breakEvenAtR, beOffsetR, breakEvenAtPts: Number(bePts), beOffsetPts: Number(beOffPts), timeStopBars: timeStopBars || horizonBars },
         config: { vwapFilter: !!vwapFilter, minProb, minEV, useMicroModel, evalWindow, regime, tod, conformal },
         info: "sem candles no período informado (verifique ingestão/DB/símbolo/TF)",
       });
-      const id = indexRun({ ...empty, symbol: sym, timeframe: tfU, from: fromD.toISOString(), to: toD.toISOString() });
-      return res.status(200).json({ ...empty, id });
+      return res.status(200).json(empty);
     }
 
     // ===== Indicadores =====
@@ -394,71 +279,74 @@ dualAll("/backtest", async (req: any, res: any) => {
       trailEvents: number;
     } = null;
 
-    let dayPnL = 0;
-    let day = toLocalDateStr(candles[0].time);
-    let lossStreak = 0;
+    function crossUpAt(i: number): boolean {
+      const aPrev = (e9[i - 1] ?? closes[i - 1]);
+      const aNow = (e9[i] ?? closes[i]);
+      const bPrev = (e21[i - 1] ?? closes[i - 1]);
+      const bNow = (e21[i] ?? closes[i]);
+      return aPrev <= bPrev && aNow > bNow;
+    }
+    function crossDownAt(i: number): boolean {
+      const aPrev = (e9[i - 1] ?? closes[i - 1]);
+      const aNow = (e9[i] ?? closes[i]);
+      const bPrev = (e21[i - 1] ?? closes[i - 1]);
+      const bNow = (e21[i] ?? closes[i]);
+      return aPrev >= bPrev && aNow < bNow;
+    }
 
-    const applyCosts = (raw: number) => raw - Number(costPts) - Number(slippagePts);
-    const bookTrade = (entryIdx: number, exitIdx: number, side: "BUY" | "SELL", entryPrice: number, exitPrice: number, note?: string) => {
-      const gross = side === "BUY" ? (exitPrice - entryPrice) : (entryPrice - exitPrice);
-      const pnl = Number(applyCosts(gross).toFixed(2));
-      const tr: Trade = {
-        entryIdx, exitIdx, side,
-        entryTime: candles[entryIdx].time.toISOString(),
-        exitTime: candles[exitIdx].time.toISOString(),
-        entryPrice, exitPrice, pnl, note,
-      };
-      trades.push(tr);
-      if (candles[entryIdx].time >= fromD && candles[entryIdx].time <= toD) {
-        dayPnL += tr.pnl;
-        if (tr.pnl <= 0) lossStreak += 1; else lossStreak = 0;
-      }
-    };
-    const closeAtIdxPrice = (i: number, price: number, note?: string) => {
+    function closeAtIdxPrice(i: number, px: number, note?: string) {
       if (!pos) return;
-      bookTrade(pos.entryIdx, i, pos.side, pos.entryPrice, price, note);
+      trades.push({
+        entryIdx: pos.entryIdx,
+        exitIdx: i,
+        side: pos.side,
+        entryTime: candles[pos.entryIdx].time.toISOString(),
+        exitTime: candles[i].time.toISOString(),
+        entryPrice: Number(pos.entryPrice),
+        exitPrice: Number(px),
+        pnl: pos.side === "BUY" ? (Number(px) - Number(pos.entryPrice)) : (Number(pos.entryPrice) - Number(px)),
+        note,
+        movedToBE: pos.movedToBE,
+        trailEvents: pos.trailEvents,
+      });
       pos = null;
-    };
+    }
 
-    const barsLimit = Number(timeStopBars || horizonBars || 0);
+    // ===== Varredura =====
+    let lossStreak = 0;
+    let dayPnL = 0;
+    let curDay = DateTime.fromJSDate(candles[0].time).setZone(ZONE).toISODate();
 
     for (let i = 1; i < candles.length; i++) {
-      const d = toLocalDateStr(candles[i].time);
-      if (d !== day) {
-        day = d;
-        if (candles[i].time >= fromD) {
-          dayPnL = 0;
-          lossStreak = 0;
-        }
-      }
-
-      // Cruzamentos (entrada/reversão fallback)
-      const prevUp = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) <= (e21[i - 1] as number);
-      const nowUp = e9[i] != null && e21[i] != null && (e9[i] as number) > (e21[i] as number);
-      const prevDn = e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) >= (e21[i - 1] as number);
-      const nowDn = e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
-
-      const crossUp = prevUp && nowUp;
-      const crossDn = prevDn && nowDn;
-
-      const nextIdx = Math.min(i + 1, candles.length - 1);
-      const nextOpen = Number.isFinite(candles[nextIdx].open) ? Number(candles[nextIdx].open) : Number(candles[nextIdx].close) || 0;
       const c = candles[i];
+      const prev = candles[i - 1];
+      const nextIdx = i;
+      const nextOpen = Number.isFinite(prev.close) ? Number(prev.close) : Number(prev.open) || 0;
 
-      // ===== Gestão da posição (SL/TP/BE/Trail/TimeStop) =====
+      // controle diário
+      const day = DateTime.fromJSDate(c.time).setZone(ZONE).toISODate();
+      if (day !== curDay) { curDay = day; dayPnL = 0; lossStreak = 0; }
+
+      const crossUp = crossUpAt(i);
+      const crossDn = crossDownAt(i);
+
       if (pos) {
-        if (barsLimit > 0 && (i - pos.entryIdx) >= barsLimit) {
-          closeAtIdxPrice(i, Number(c.close) || nextOpen, "time-stop");
+        // time-stop
+        if (Number(timeStopBars || horizonBars) > 0 && (i - pos.entryIdx) >= Number(timeStopBars || horizonBars)) {
+          closeAtIdxPrice(i, Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0, "time-stop");
           continue;
         }
 
         const risk = pos.riskPts;
-        const beTrigger = Number(breakEvenAtR) * risk;
         const moveFromEntry = pos.side === "BUY" ? (Number(c.high) - pos.entryPrice) : (pos.entryPrice - Number(c.low));
-        if (!pos.movedToBE && beTrigger > 0 && moveFromEntry >= beTrigger) {
-          const beOffsetPts = Number(beOffsetR || 0) * risk;
-          if (pos.side === "BUY") pos.stop = Math.max(pos.stop, pos.entryPrice + beOffsetPts);
-          else pos.stop = Math.min(pos.stop, pos.entryPrice - beOffsetPts);
+        // BE por pontos tem precedência; se não definido, usa em R
+        const beTriggerPts = Number(bePts) || 0;
+        const beTriggerR = Number(breakEvenAtR) * risk;
+        const trigger = beTriggerPts > 0 ? beTriggerPts : beTriggerR;
+        if (!pos.movedToBE && trigger > 0 && moveFromEntry >= trigger) {
+          const beOff = beTriggerPts > 0 ? Number(beOffPts || 0) : (Number(beOffsetR || 0) * risk);
+          if (pos.side === "BUY") pos.stop = Math.max(pos.stop, pos.entryPrice + beOff);
+          else pos.stop = Math.min(pos.stop, pos.entryPrice - beOff);
           pos.movedToBE = true;
         }
 
@@ -489,7 +377,7 @@ dualAll("/backtest", async (req: any, res: any) => {
         }
       }
 
-      // ===== Aberturas na janela =====
+      // aberturas na janela
       const inWindow = candles[nextIdx].time >= fromD && candles[nextIdx].time <= toD;
       if (!pos && inWindow) {
         const dailyStopped =
@@ -560,6 +448,7 @@ dualAll("/backtest", async (req: any, res: any) => {
       policy: {
         rr: Number(rr), kSL: Number(kSL), kTrail: Number(kTrail),
         breakEvenAtR: Number(breakEvenAtR), beOffsetR: Number(beOffsetR),
+        breakEvenAtPts: Number(bePts), beOffsetPts: Number(beOffPts),
         timeStopBars: Number(timeStopBars || horizonBars || 0),
       },
       config: {
@@ -567,11 +456,19 @@ dualAll("/backtest", async (req: any, res: any) => {
       },
     });
 
-    const id = indexRun(payload);
-    return res.status(200).json({ ...payload, id });
+    return res.status(200).json(payload);
   } catch (e: any) {
-    return res.status(200).json(bad("unexpected", diagify(e)));
+    return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
   }
 });
+
+/* ===== Helpers dual (GET/POST) ===== */
+function dualGet(path: string, h: any) {
+  router.get(path, h);
+}
+function dualAll(path: string, h: any) {
+  router.get(path, h);
+  router.post(path, h);
+}
 
 export default router;

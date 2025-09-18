@@ -17,6 +17,28 @@ function fmtDate(d: Date) {
   return `${y}-${m}-${dd}`;
 }
 
+/* ============================
+   Helpers de persistência (LS)
+   ============================ */
+const LS_FILTERS_KEY = "ai/controls/filters/v2";
+const LS_PARAMS_KEY = "ai/controls/params/v2";
+
+function lsGet<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const val = JSON.parse(raw);
+    return (val ?? fallback) as T;
+  } catch {
+    return fallback;
+  }
+}
+function lsSet<T>(key: string, value: T) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch { }
+}
+
 type Props = {
   collapsedByDefault?: boolean;
 };
@@ -36,17 +58,24 @@ type FiltersAPI = {
   subscribe: (cb: () => void) => () => void;
 };
 
+// estado inicial de filtros com persistência
 const _today = new Date();
-const _filtersStore: {
-  state: FiltersState;
-  listeners: Set<() => void>;
-} = {
-  state: {
+const _filtersInitial: FiltersState = (() => {
+  const fallback: FiltersState = {
     symbol: "WIN",
     timeframe: "M5",
     from: fmtDate(_today),
     to: fmtDate(_today),
-  },
+  };
+  // tenta carregar do localStorage
+  return lsGet<FiltersState>(LS_FILTERS_KEY, fallback);
+})();
+
+const _filtersStore: {
+  state: FiltersState;
+  listeners: Set<() => void>;
+} = {
+  state: _filtersInitial,
   listeners: new Set(),
 };
 
@@ -54,6 +83,8 @@ const FiltersAPIImpl: FiltersAPI = {
   get: () => _filtersStore.state,
   set: (patch) => {
     _filtersStore.state = { ..._filtersStore.state, ...patch };
+    // persiste sempre que alterar
+    lsSet(LS_FILTERS_KEY, _filtersStore.state);
     _filtersStore.listeners.forEach((fn) => fn());
   },
   subscribe: (cb) => {
@@ -86,17 +117,48 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const { symbol, timeframe, from, to, setFilters } = useAIControls();
 
   // -------- Parâmetros (apenas para Projetados) --------
-  const [rr, setRr] = React.useState(2);
-  const [minProb, setMinProb] = React.useState(0.52);
-  const [minEV, setMinEV] = React.useState(0);
-  const [useMicroModel, setUseMicroModel] = React.useState(true);
-  const [vwapFilter, setVwapFilter] = React.useState(true);
-  const [requireMtf, setRequireMtf] = React.useState(true);
-  const [confirmTf, setConfirmTf] = React.useState("M15");
+  // Carrega do LS na inicialização (lazy init)
+  const {
+    rr: rr0,
+    minProb: minProb0,
+    minEV: minEV0,
+    useMicroModel: useMicroModel0,
+    vwapFilter: vwapFilter0,
+    requireMtf: requireMtf0,
+    confirmTf: confirmTf0,
+    breakEvenAtPts: breakEvenAtPts0,
+    beOffsetPts: beOffsetPts0,
+    autoRefresh: autoRefresh0,
+    refreshSec: refreshSec0,
+  } = lsGet(LS_PARAMS_KEY, {
+    rr: 2,
+    minProb: 0.52,
+    minEV: 0,
+    useMicroModel: true,
+    vwapFilter: true,
+    requireMtf: true,
+    confirmTf: "M15",
+    breakEvenAtPts: 10,
+    beOffsetPts: 0,
+    autoRefresh: true,
+    refreshSec: 20,
+  });
+
+  const [rr, setRr] = React.useState<number>(rr0);
+  const [minProb, setMinProb] = React.useState<number>(minProb0);
+  const [minEV, setMinEV] = React.useState<number>(minEV0);
+  const [useMicroModel, setUseMicroModel] = React.useState<boolean>(useMicroModel0);
+  const [vwapFilter, setVwapFilter] = React.useState<boolean>(vwapFilter0);
+  const [requireMtf, setRequireMtf] = React.useState<boolean>(requireMtf0);
+  const [confirmTf, setConfirmTf] = React.useState<string>(confirmTf0);
+
+  // >>> BE por pontos (para o backtest)
+  const [breakEvenAtPts, setBreakEvenAtPts] = React.useState<number>(breakEvenAtPts0);
+  const [beOffsetPts, setBeOffsetPts] = React.useState<number>(beOffsetPts0);
 
   // -------- Auto-refresh --------
-  const [autoRefresh, setAutoRefresh] = React.useState(true);
-  const [refreshSec, setRefreshSec] = React.useState(20);
+  const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
+  const [refreshSec, setRefreshSec] = React.useState<number>(refreshSec0);
 
   // -------- Estado geral --------
   const [loading, setLoading] = React.useState(false);
@@ -109,6 +171,35 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const setConfirmed = useAIStore((s) => s.setConfirmed);
   const setPnL = useAIStore((s) => s.setPnL);
   const setTrades = useAIStore((s) => s.setTrades);
+
+  // Persiste parâmetros no LS sempre que mudarem
+  React.useEffect(() => {
+    lsSet(LS_PARAMS_KEY, {
+      rr,
+      minProb,
+      minEV,
+      useMicroModel,
+      vwapFilter,
+      requireMtf,
+      confirmTf,
+      breakEvenAtPts,
+      beOffsetPts,
+      autoRefresh,
+      refreshSec,
+    });
+  }, [
+    rr,
+    minProb,
+    minEV,
+    useMicroModel,
+    vwapFilter,
+    requireMtf,
+    confirmTf,
+    breakEvenAtPts,
+    beOffsetPts,
+    autoRefresh,
+    refreshSec,
+  ]);
 
   const baseParams = React.useCallback(
     () => ({
@@ -128,7 +219,18 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       const params = baseParams();
 
       // Salva para debug
-      (window as any).__dbgLastParams = { ...params, rr, minProb, minEV, useMicroModel, vwapFilter, requireMtf, confirmTf };
+      (window as any).__dbgLastParams = {
+        ...params,
+        rr,
+        minProb,
+        minEV,
+        useMicroModel,
+        vwapFilter,
+        requireMtf,
+        confirmTf,
+        breakEvenAtPts,
+        beOffsetPts,
+      };
 
       // 1) Projetados — PATCH TEMPORÁRIO: desligar filtros que podem suprimir SELL
       const payload: any = {
@@ -181,8 +283,13 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       (window as any).__dbgConfirmedRaw = confRaw;
       setConfirmed(confRaw || [], params);
 
-      // 3) Backtest (PnL + Trades) + salva debug bruto
-      const bt = await runBacktest(params as any);
+      // 3) Backtest (PnL + Trades) com BE por pontos + fallback de rota (implementado em api.ts)
+      const bt = await runBacktest({
+        ...(params as any),
+        breakEvenAtPts,
+        beOffsetPts,
+      });
+
       const rawTrades =
         (Array.isArray(bt?.trades) && bt?.trades) ||
         (Array.isArray(bt?.rows) && bt?.rows) ||
@@ -211,7 +318,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       );
 
       setTrades(rawTrades, bt?.meta);
-
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
     } finally {
@@ -237,6 +343,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
     }
 
+    // dispara já com os parâmetros atuais (que estão no estado + LS)
     tick();
     return () => {
       alive = false;
@@ -257,6 +364,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     vwapFilter,
     requireMtf,
     confirmTf,
+    breakEvenAtPts,
+    beOffsetPts,
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -281,6 +390,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     vwapFilter,
     requireMtf,
     confirmTf,
+    breakEvenAtPts,
+    beOffsetPts,
   ]);
 
   return (
@@ -316,9 +427,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   <input
                     className="form-control"
                     value={symbol}
-                    onChange={(e) =>
-                      setFilters({ symbol: e.target.value })
-                    }
+                    onChange={(e) => setFilters({ symbol: e.target.value })}
                   />
                 </div>
 
@@ -327,9 +436,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   <input
                     className="form-control"
                     value={timeframe}
-                    onChange={(e) =>
-                      setFilters({ timeframe: e.target.value })
-                    }
+                    onChange={(e) => setFilters({ timeframe: e.target.value })}
                   />
                 </div>
 
@@ -339,9 +446,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     type="date"
                     className="form-control"
                     value={from ?? ""}
-                    onChange={(e) =>
-                      setFilters({ from: e.target.value || null })
-                    }
+                    onChange={(e) => setFilters({ from: e.target.value || null })}
                   />
                 </div>
 
@@ -351,13 +456,11 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     type="date"
                     className="form-control"
                     value={to ?? ""}
-                    onChange={(e) =>
-                      setFilters({ to: e.target.value || null })
-                    }
+                    onChange={(e) => setFilters({ to: e.target.value || null })}
                   />
                 </div>
 
-                {/* parâmetros — afetam apenas os Projetados */}
+                {/* parâmetros — afetam apenas os Projetados; BE afeta o backtest */}
                 <div className="input-group input-group-sm" style={{ width: 110 }}>
                   <span className="input-group-text">RR</span>
                   <input
@@ -438,6 +541,29 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     className="form-control"
                     value={confirmTf}
                     onChange={(e) => setConfirmTf(e.target.value)}
+                  />
+                </div>
+
+                {/* >>> BE por pontos */}
+                <div className="input-group input-group-sm" style={{ width: 140 }}>
+                  <span className="input-group-text">BE (pts)</span>
+                  <input
+                    type="number"
+                    step={1}
+                    className="form-control"
+                    value={breakEvenAtPts}
+                    onChange={(e) => setBreakEvenAtPts(Number(e.target.value) || 0)}
+                  />
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 150 }}>
+                  <span className="input-group-text">Offset (pts)</span>
+                  <input
+                    type="number"
+                    step={1}
+                    className="form-control"
+                    value={beOffsetPts}
+                    onChange={(e) => setBeOffsetPts(Number(e.target.value) || 0)}
                   />
                 </div>
 
