@@ -73,6 +73,7 @@ declare global {
       pointValueBySymbol?: Record<string, number>;
       defaultRiskPoints?: number;
       brokerSymbolMap?: Record<string, string>;
+      tickSizeBySymbol?: Record<string, number>; // usado para converter preços→pontos se necessário
     };
   }
 }
@@ -261,43 +262,87 @@ export async function fetchConfirmedSignals(params: {
   });
 }
 
+/** ===========================
+ * Backtest com política completa
+ * =========================== */
 export async function runBacktest(params: {
   symbol: string;
   timeframe: string;
   from?: string;
   to?: string;
+
+  // custos / limites diários
+  pointValue?: number;
+  costPts?: number;
+  slippagePts?: number;
   lossCap?: number;
   maxConsecLosses?: number;
-  breakEvenAtPts?: number;
-  beOffsetPts?: number;
+
+  // política de saída
+  rr?: number;
+  kSL?: number;
+  kTrail?: number;
+  breakEvenAtR?: number;
+  beOffsetR?: number;
+  breakEvenAtPts?: number | null;
+  beOffsetPts?: number | null;
+  timeStopBars?: number;
+  horizonBars?: number;
+
+  // filtros/IA
+  evalWindow?: number;
+  regime?: any;
+  tod?: any;
+  conformal?: any;
+  minProb?: number;
+  minEV?: number;
+  useMicroModel?: boolean;
+  vwapFilter?: boolean;
 }) {
-  // 1) POST /api/backtest (JSON)
+  const body = JSON.stringify(params);
+
+  // 1) POST /api/backtest (preferido)
   try {
-    return await jsonFetch<any>("/api/backtest", {
-      method: "POST",
-      body: JSON.stringify(params),
-    });
+    return await jsonFetch<any>("/api/backtest", { method: "POST", body });
   } catch (e: any) {
     if (process.env.NODE_ENV !== "production") {
-      console.warn(
-        "[api] POST /api/backtest falhou",
-        e?.status,
-        e?.urlTried || ""
-      );
+      console.warn("[api] POST /api/backtest falhou", e?.status, e?.urlTried || "");
     }
   }
 
-  // 2) GET /backtest?query (compatível com seu curl)
+  // 2) GET /backtest?query (fallback)
   try {
     const q = new URLSearchParams();
     q.set("symbol", params.symbol.toUpperCase());
     q.set("timeframe", params.timeframe.toUpperCase());
     if (params.from) q.set("from", params.from);
     if (params.to) q.set("to", params.to);
-    if (params.breakEvenAtPts != null)
-      q.set("breakEvenAtPts", String(params.breakEvenAtPts));
-    if (params.beOffsetPts != null)
-      q.set("beOffsetPts", String(params.beOffsetPts));
+
+    if (params.pointValue != null) q.set("pointValue", String(params.pointValue));
+    if (params.costPts != null) q.set("costPts", String(params.costPts));
+    if (params.slippagePts != null) q.set("slippagePts", String(params.slippagePts));
+    if (params.lossCap != null) q.set("lossCap", String(params.lossCap));
+    if (params.maxConsecLosses != null) q.set("maxConsecLosses", String(params.maxConsecLosses));
+
+    if (params.rr != null) q.set("rr", String(params.rr));
+    if (params.kSL != null) q.set("kSL", String(params.kSL));
+    if (params.kTrail != null) q.set("kTrail", String(params.kTrail));
+    if (params.breakEvenAtR != null) q.set("breakEvenAtR", String(params.breakEvenAtR));
+    if (params.beOffsetR != null) q.set("beOffsetR", String(params.beOffsetR));
+    if (params.breakEvenAtPts != null) q.set("breakEvenAtPts", String(params.breakEvenAtPts));
+    if (params.beOffsetPts != null) q.set("beOffsetPts", String(params.beOffsetPts));
+    if (params.timeStopBars != null) q.set("timeStopBars", String(params.timeStopBars));
+    if (params.horizonBars != null) q.set("horizonBars", String(params.horizonBars));
+
+    if (params.evalWindow != null) q.set("evalWindow", String(params.evalWindow));
+    if (params.regime != null) q.set("regime", String(params.regime));
+    if (params.tod != null) q.set("tod", String(params.tod));
+    if (params.conformal != null) q.set("conformal", String(params.conformal));
+    if (params.minProb != null) q.set("minProb", String(params.minProb));
+    if (params.minEV != null) q.set("minEV", String(params.minEV));
+    if (params.useMicroModel != null) q.set("useMicroModel", String(params.useMicroModel ? 1 : 0));
+    if (params.vwapFilter != null) q.set("vwapFilter", String(params.vwapFilter ? 1 : 0));
+
     return await jsonFetch<any>(`/backtest?${q.toString()}`, { method: "GET" });
   } catch (e: any) {
     if (process.env.NODE_ENV !== "production") {
@@ -305,13 +350,13 @@ export async function runBacktest(params: {
     }
   }
 
-  // 3) POST /backtest (JSON)
-  return jsonFetch<any>("/backtest", {
-    method: "POST",
-    body: JSON.stringify(params),
-  });
+  // 3) POST /backtest (último fallback)
+  return jsonFetch<any>("/backtest", { method: "POST", body });
 }
 
+/** ===========================
+ * Candles
+ * =========================== */
 export async function fetchCandles(params: {
   symbol: string;
   timeframe: string;
@@ -387,8 +432,6 @@ export async function execPollNoop(agentId: string, max = 10) {
 
 /* =========================
    Enfileirar ordem p/ MT5 (EA NodeBridge)
-   - Envia SEMPRE: POST {agentId, tasks:[{...}] } para /enqueue no EXEC_BASE
-   - Omitimos `symbol` por padrão (EA usa _Symbol do gráfico)
    ========================= */
 export async function enqueueMT5Order(
   input:

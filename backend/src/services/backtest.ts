@@ -462,6 +462,27 @@ dualAll("/backtest", async (req: any, res: any) => {
   }
 });
 
+/* ========= ALIASES /api/* (evita 404 do frontend) ========= */
+// versão e health (GET)
+router.get("/api/backtest/version", (_req: any, res: any) => res.redirect(307, "/backtest/version"));
+router.get("/api/backtest/health", (req: any, res: any) => {
+  // preserva querystring ao redirecionar
+  const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+  res.redirect(307, `/backtest/health${qs ? `?${qs}` : ""}`);
+});
+// rota principal (GET/POST)
+router.get("/api/backtest", (req: any, res: any) => {
+  const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+  res.redirect(307, `/backtest${qs ? `?${qs}` : ""}`);
+});
+router.post("/api/backtest", (_req: any, res: any) => res.redirect(307, "/backtest"));
+
+// runs (placeholders para não causar 404 no painel)
+router.get("/backtest/runs", (_req: any, res: any) => res.status(200).json(ok({ items: [], count: 0 })));
+router.get("/api/backtest/runs", (_req: any, res: any) => res.status(200).json(ok({ items: [], count: 0 })));
+router.get("/backtest/run/:id", (_req: any, res: any) => res.status(404).json(bad("run_not_found")));
+router.get("/api/backtest/run/:id", (_req: any, res: any) => res.status(404).json(bad("run_not_found")));
+
 /* ===== Helpers dual (GET/POST) ===== */
 function dualGet(path: string, h: any) {
   router.get(path, h);

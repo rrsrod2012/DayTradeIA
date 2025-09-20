@@ -26,6 +26,10 @@ import { api } from "../services/api";
 import { toCSV, downloadCSV } from "../utils/csv";
 import "../styles/dashboard.css";
 
+/* ==== NOVOS IMPORTS (MT5: Execução Real) ==== */
+import BrokerSummary from "../components/BrokerSummary";
+import BrokerTradesPanel from "../components/BrokerTradesPanel";
+
 type Candle = {
   time: string;
   date: string;
@@ -1025,6 +1029,22 @@ export default function Dashboard() {
                     trades={allTrades as any[]}
                     darkMode={darkMode}
                   />
+                </Card.Body>
+              </Card>
+            </div>
+
+            {/* ==== NOVO BLOCO: Execução Real (MT5) ==== */}
+            <div className="mt-3">
+              <Card className="shadow-sm elevated-card">
+                <Card.Header className="d-flex align-items-center justify-content-between">
+                  <span className="fw-semibold">Execução Real (MT5)</span>
+                </Card.Header>
+                <Card.Body className="d-flex flex-column gap-2">
+                  {/* Resumo MT5 com o mesmo filtro de símbolo e janela (com offset) */}
+                  <BrokerSummary symbol={symbol} from={fromZ} to={toZ} />
+                  <hr />
+                  {/* Trades MT5 executados (fechados) */}
+                  <BrokerTradesPanel symbol={symbol} from={fromZ} to={toZ} />
                 </Card.Body>
               </Card>
             </div>
