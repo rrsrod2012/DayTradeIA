@@ -145,6 +145,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId: execAgentId0,
     execLots: execLots0,
     execMaxAgeSec: execMaxAgeSec0,
+
+    // >>> novos: SL/TP da tela
+    sendStops: sendStops0,
+    slPts: slPts0,
+    tpPts: tpPts0,
+    tpViaRR: tpViaRR0,
   } = lsGet(LS_PARAMS_KEY, {
     rr: 2,
     minProb: 0.52,
@@ -161,6 +167,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId: "mt5-ea-1",
     execLots: 1,
     execMaxAgeSec: 20, // janela de frescor padrão (seg)
+
+    // defaults SL/TP
+    sendStops: false,
+    slPts: 0,
+    tpPts: 0,
+    tpViaRR: true,
   });
 
   const [rr, setRr] = React.useState<number>(rr0);
@@ -181,6 +193,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [execLots, setExecLots] = React.useState<number>(Number(execLots0) || 1);
   const [execMaxAgeSec, setExecMaxAgeSec] = React.useState<number>(Number(execMaxAgeSec0) || 20);
   const [execMsg, setExecMsg] = React.useState<string | null>(null);
+
+  // >>> Novos controles de SL/TP
+  const [sendStops, setSendStops] = React.useState<boolean>(!!sendStops0);
+  const [slPts, setSlPts] = React.useState<number>(Number(slPts0) || 0);
+  const [tpPts, setTpPts] = React.useState<number>(Number(tpPts0) || 0);
+  const [tpViaRR, setTpViaRR] = React.useState<boolean>(!!tpViaRR0);
 
   // -------- Auto-refresh --------
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
@@ -216,6 +234,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       execAgentId,
       execLots,
       execMaxAgeSec,
+
+      // novos
+      sendStops,
+      slPts,
+      tpPts,
+      tpViaRR,
     });
   }, [
     rr,
@@ -233,6 +257,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId,
     execLots,
     execMaxAgeSec,
+    sendStops,
+    slPts,
+    tpPts,
+    tpViaRR,
   ]);
 
   const baseParams = React.useCallback(
@@ -274,6 +302,28 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     return true;
   }
 
+  // calcula SL/TP a partir dos controles de tela
+  function computeStops() {
+    let slPtsToSend: number | null = null;
+    let tpPtsToSend: number | null = null;
+
+    if (sendStops) {
+      const sl = Math.max(0, Math.floor(Number(slPts) || 0));
+      if (sl > 0) slPtsToSend = sl;
+
+      if (tpViaRR) {
+        if (slPtsToSend && rr > 0) {
+          tpPtsToSend = Math.max(0, Math.round(slPtsToSend * Number(rr)));
+        }
+      } else {
+        const tp = Math.max(0, Math.floor(Number(tpPts) || 0));
+        if (tp > 0) tpPtsToSend = tp;
+      }
+    }
+
+    return { slPtsToSend, tpPtsToSend };
+  }
+
   async function autoExecFromConfirmed(confirms: Array<{ side: any; time: any; price?: any }>) {
     if (!execEnabled) return;
 
@@ -292,20 +342,22 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
     if (candidates.length === 0) return;
 
+    const { slPtsToSend, tpPtsToSend } = computeStops();
+
     for (const s of candidates) {
       const side = String(s.side).toUpperCase() as "BUY" | "SELL";
       const task = {
         id: `auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         side,
-        comment: `auto ${side} ${new Date().toISOString()}`,
+        comment: `auto ${side} ${new Date().toISOString()}${slPtsToSend ? ` SL=${slPtsToSend}` : ""}${tpPtsToSend ? ` TP=${tpPtsToSend}` : ""}`,
         beAtPoints: breakEvenAtPts,
         beOffsetPoints: beOffsetPts,
         timeframe: null,
         time: null,
         price: 0,
         volume: execLots,
-        slPoints: null,
-        tpPoints: null,
+        slPoints: slPtsToSend,
+        tpPoints: tpPtsToSend,
       };
 
       const body = {
@@ -334,8 +386,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   React.useEffect(() => {
     if (execEnabled) {
       const now = new Date();
-      const nowIso = now.toISOString();              // seguro para comparações
-      const nowLocal = now.toLocaleString();         // amigável para o usuário (fuso local)
+      const nowIso = now.toISOString();      // comparações (UTC)
+      const nowLocal = now.toLocaleString(); // exibição (fuso local)
       lsSet(LS_EXEC_ARMED_SINCE, nowIso);
       setExecMsg(`AUTO armado às ${nowLocal} (local)`);
     }
@@ -365,6 +417,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         execAgentId,
         execLots,
         execMaxAgeSec,
+
+        // visuais
+        sendStops,
+        slPts,
+        tpPts,
+        tpViaRR,
       };
 
       // 1) Projetados — overrides temporários
@@ -465,18 +523,19 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // --- helper: monta task no formato que o EA/NodeBridge consome ---
   function makeMt5Task(side: "BUY" | "SELL") {
+    const { slPtsToSend, tpPtsToSend } = computeStops();
     return {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       side,
-      comment: `ui-test ${side} ${new Date().toISOString()}`,
+      comment: `ui-test ${side} ${new Date().toISOString()}${slPtsToSend ? ` SL=${slPtsToSend}` : ""}${tpPtsToSend ? ` TP=${tpPtsToSend}` : ""}`,
       beAtPoints: breakEvenAtPts,
       beOffsetPoints: beOffsetPts,
       timeframe: null,
       time: null,
       price: 0,
       volume: execLots,
-      slPoints: null,
-      tpPoints: null,
+      slPoints: slPtsToSend,
+      tpPoints: tpPtsToSend,
     };
   }
 
@@ -547,6 +606,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId,
     execLots,
     execMaxAgeSec,
+    sendStops,
+    slPts,
+    tpPts,
+    tpViaRR,
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -577,6 +640,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId,
     execLots,
     execMaxAgeSec,
+    sendStops,
+    slPts,
+    tpPts,
+    tpViaRR,
   ]);
 
   return (
@@ -852,6 +919,60 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     }
                   />
                   <span className="input-group-text">s</span>
+                </div>
+
+                {/* >>> novos: SL/TP da tela */}
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="stops-toggle"
+                    checked={sendStops}
+                    onChange={(e) => setSendStops(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="stops-toggle">
+                    Enviar SL/TP
+                  </label>
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 130 }}>
+                  <span className="input-group-text">SL (pts)</span>
+                  <input
+                    type="number"
+                    step={1}
+                    min={0}
+                    className="form-control"
+                    value={slPts}
+                    onChange={(e) => setSlPts(Math.max(0, Number(e.target.value) || 0))}
+                    disabled={!sendStops}
+                  />
+                </div>
+
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="tp-rr-toggle"
+                    checked={tpViaRR}
+                    onChange={(e) => setTpViaRR(e.target.checked)}
+                    disabled={!sendStops}
+                  />
+                  <label className="form-check-label" htmlFor="tp-rr-toggle">
+                    TP via RR
+                  </label>
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 130 }}>
+                  <span className="input-group-text">TP (pts)</span>
+                  <input
+                    type="number"
+                    step={1}
+                    min={0}
+                    className="form-control"
+                    value={tpPts}
+                    onChange={(e) => setTpPts(Math.max(0, Number(e.target.value) || 0))}
+                    disabled={!sendStops || tpViaRR}
+                  />
                 </div>
 
                 <button
