@@ -1,49 +1,74 @@
-// frontend/src/services/mt5.ts
-// Cliente leve para a fila MT5 (microservidor Node na porta 3002 por padrão)
+// Cliente do microserviço MT5
+// Endereço pode ser configurado via VITE_MT5_BASE (ex.: http://localhost:8088)
+const RAW_MT5_BASE = (import.meta as any).env?.VITE_MT5_BASE ?? "";
+const MT5_BASE = String(RAW_MT5_BASE || "").replace(/\/$/, "");
 
-type EnqueueTask = {
-    id: string; // único por sinal (ex: `${symbol}|${timeframe}|${iso}|${side}`)
-    symbol: string;       // WIN/WDO (do seu backend)
-    timeframe: string;    // M1/M5...
+type EnqueueItem = {
+    id?: string; // opcional no servidor
+    symbol: string;
+    timeframe?: string;
     side: "BUY" | "SELL";
-    time: string;         // ISO do sinal confirmado
+    time?: string; // ISO
     price?: number | null;
-    volume?: number | null;      // lotes (opcional, default no EA)
-    slPoints?: number | null;    // SL em pontos (opcional)
-    tpPoints?: number | null;    // TP em pontos (opcional)
-    beAtPoints?: number | null;  // BE: quando andar X pontos
-    beOffsetPoints?: number | null; // offset no BE
+    volume?: number | null;
+    slPoints?: number | null;
+    tpPoints?: number | null;
+    beAtPoints?: number | null;
+    beOffsetPoints?: number | null;
     comment?: string | null;
 };
 
-const MT5_BASE =
-    ((import.meta as any).env?.VITE_MT5_API_BASE as string | undefined)?.replace(/\/$/, "") ||
-    "http://localhost:3002"; // default para dev
-
-async function mt5Fetch<T>(path: string, init?: RequestInit): Promise<T> {
-    const url = `${MT5_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+async function mt5JsonFetch<T>(
+    path: string,
+    init?: RequestInit
+): Promise<T> {
+    const base =
+        MT5_BASE || window.location.origin.replace(/\/$/, "");
+    const url = base + (path.startsWith("/") ? path : `/${path}`);
     const resp = await fetch(url, {
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...(init?.headers || {}) },
+        credentials: "omit",
+        mode: "cors",
+        cache: "no-cache",
         ...init,
     });
-    const txt = await resp.text();
-    let data: any = null;
-    try { data = txt ? JSON.parse(txt) : null; } catch { /* ignore */ }
+    const text = await resp.text();
+    const data = text ? JSON.parse(text) : null;
     if (!resp.ok || (data && data.ok === false)) {
-        const msg = (data && data.error) || `HTTP ${resp.status}`;
+        const msg = (data && (data.error || data.message)) || `HTTP ${resp.status} ${resp.statusText}`;
         const err: any = new Error(msg);
-        err.response = data ?? txt;
+        (err as any).response = data ?? text;
         throw err;
     }
-    return (data ?? {}) as T;
+    return data as T;
 }
 
-export async function mt5GetConfig(): Promise<{ enabled: boolean, queueSize: number }> {
-    return mt5Fetch("/config", { method: "GET" });
-}
 export async function mt5SetEnabled(enabled: boolean) {
-    return mt5Fetch("/enable", { method: "POST", body: JSON.stringify({ enabled }) });
+    try {
+        // endpoint opcional: ignore se não existir
+        await mt5JsonFetch<any>("/exec/enabled", {
+            method: "POST",
+            body: JSON.stringify({ enabled }),
+        });
+    } catch {
+        // silencioso — não é crítico
+    }
 }
-export async function mt5Enqueue(tasks: EnqueueTask[]) {
-    return mt5Fetch("/enqueue", { method: "POST", body: JSON.stringify({ tasks }) });
+
+export async function mt5Enqueue(items: EnqueueItem[]) {
+    if (!Array.isArray(items) || items.length === 0) return { ok: true, queued: 0 };
+    return mt5JsonFetch<{ ok: boolean; queued: number }>("/exec/enqueue", {
+        method: "POST",
+        body: JSON.stringify({ items }),
+    });
+}
+
+export async function mt5Ping() {
+    try {
+        return await mt5JsonFetch<{ ok: boolean; ts?: string }>("/exec/ping", {
+            method: "GET",
+        });
+    } catch (e) {
+        return { ok: false };
+    }
 }

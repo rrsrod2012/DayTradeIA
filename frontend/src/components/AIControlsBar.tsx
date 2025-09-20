@@ -3,10 +3,11 @@ import {
   projectedSignals,
   fetchConfirmedSignals,
   runBacktest,
+  enqueueMT5Order,
+  debugPeek,
 } from "../services/api";
 import { useAIStore } from "../store/ai";
 import BacktestRunsPanel from "./BacktestRunsPanel";
-import { mt5Enqueue, mt5SetEnabled } from "../services/mt5"; // <<< NOVO
 
 /* ============================
    Helpers de data (YYYY-MM-DD)
@@ -23,7 +24,6 @@ function fmtDate(d: Date) {
    ============================ */
 const LS_FILTERS_KEY = "ai/controls/filters/v2";
 const LS_PARAMS_KEY = "ai/controls/params/v2";
-const LS_MT5_KEY = "ai/controls/mt5/v1"; // <<< NOVO
 
 function lsGet<T>(key: string, fallback: T): T {
   try {
@@ -69,7 +69,6 @@ const _filtersInitial: FiltersState = (() => {
     from: fmtDate(_today),
     to: fmtDate(_today),
   };
-  // tenta carregar do localStorage
   return lsGet<FiltersState>(LS_FILTERS_KEY, fallback);
 })();
 
@@ -85,7 +84,6 @@ const FiltersAPIImpl: FiltersAPI = {
   get: () => _filtersStore.state,
   set: (patch) => {
     _filtersStore.state = { ..._filtersStore.state, ...patch };
-    // persiste sempre que alterar
     lsSet(LS_FILTERS_KEY, _filtersStore.state);
     _filtersStore.listeners.forEach((fn) => fn());
   },
@@ -115,11 +113,10 @@ export function useAIControls() {
 export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [collapsed, setCollapsed] = React.useState(!!collapsedByDefault);
 
-  // -------- Filtros globais (fonte única de verdade) --------
+  // -------- Filtros globais --------
   const { symbol, timeframe, from, to, setFilters } = useAIControls();
 
-  // -------- Parâmetros (apenas para Projetados) --------
-  // Carrega do LS na inicialização (lazy init)
+  // -------- Parâmetros (Projetados / Backtest / Exec MT5) --------
   const {
     rr: rr0,
     minProb: minProb0,
@@ -132,6 +129,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     beOffsetPts: beOffsetPts0,
     autoRefresh: autoRefresh0,
     refreshSec: refreshSec0,
+    execEnabled: execEnabled0,
+    execAgentId: execAgentId0,
+    execLots: execLots0,
   } = lsGet(LS_PARAMS_KEY, {
     rr: 2,
     minProb: 0.52,
@@ -144,6 +144,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     beOffsetPts: 0,
     autoRefresh: true,
     refreshSec: 20,
+    execEnabled: false,
+    execAgentId: "mt5-ea-1",
+    execLots: 1,
   });
 
   const [rr, setRr] = React.useState<number>(rr0);
@@ -158,13 +161,15 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [breakEvenAtPts, setBreakEvenAtPts] = React.useState<number>(breakEvenAtPts0);
   const [beOffsetPts, setBeOffsetPts] = React.useState<number>(beOffsetPts0);
 
+  // Execução MT5
+  const [execEnabled, setExecEnabled] = React.useState<boolean>(!!execEnabled0);
+  const [execAgentId, setExecAgentId] = React.useState<string>(execAgentId0 || "mt5-ea-1");
+  const [execLots, setExecLots] = React.useState<number>(Number(execLots0) || 1);
+  const [execMsg, setExecMsg] = React.useState<string | null>(null);
+
   // -------- Auto-refresh --------
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
   const [refreshSec, setRefreshSec] = React.useState<number>(refreshSec0);
-
-  // -------- Execução MT5 (toggle persistente) --------
-  const { execMT5: execMt5Initial } = lsGet(LS_MT5_KEY, { execMT5: false });
-  const [execMT5, setExecMT5] = React.useState<boolean>(!!execMt5Initial);
 
   // -------- Estado geral --------
   const [loading, setLoading] = React.useState(false);
@@ -192,6 +197,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       beOffsetPts,
       autoRefresh,
       refreshSec,
+      execEnabled,
+      execAgentId,
+      execLots,
     });
   }, [
     rr,
@@ -205,13 +213,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     beOffsetPts,
     autoRefresh,
     refreshSec,
+    execEnabled,
+    execAgentId,
+    execLots,
   ]);
-
-  // Persiste toggle MT5 + informa servidor MT5
-  React.useEffect(() => {
-    lsSet(LS_MT5_KEY, { execMT5 });
-    mt5SetEnabled(execMT5).catch(() => { });
-  }, [execMT5]);
 
   const baseParams = React.useCallback(
     () => ({
@@ -223,60 +228,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     [symbol, timeframe, from, to]
   );
 
-  // --- dedupe local para não reenfileirar o mesmo sinal a cada refresh ---
-  function getSeenSet(): Set<string> {
-    const w = window as any;
-    if (!w.__mt5Seen) w.__mt5Seen = new Set<string>();
-    return w.__mt5Seen;
-  }
-
-  async function maybeEnqueueForMT5(
-    conf: any[],
-    params: { symbol: string; timeframe: string }
-  ) {
-    if (!execMT5) return;
-    const seen = getSeenSet();
-
-    const tasks = (conf || [])
-      .filter((s) => s && (s.side === "BUY" || s.side === "SELL") && s.time)
-      .map((s) => {
-        const iso = new Date(s.time).toISOString();
-        const id = `${params.symbol}|${params.timeframe}|${iso}|${s.side}`;
-        return {
-          id,
-          symbol: params.symbol,
-          timeframe: params.timeframe,
-          side: s.side,
-          time: iso,
-          price: s.price ?? null,
-          volume: null, // define default do EA
-          slPoints: null,
-          tpPoints: null,
-          beAtPoints: breakEvenAtPts || null,
-          beOffsetPoints: beOffsetPts || null,
-          comment: s.note ?? null,
-        };
-      })
-      .filter((t) => !seen.has(t.id));
-
-    if (tasks.length === 0) return;
-
-    try {
-      await mt5Enqueue(tasks);
-      tasks.forEach((t) => seen.add(t.id));
-      if (process.env.NODE_ENV !== "production") {
-        // eslint-disable-next-line no-console
-        console.log("[AIControlsBar] mt5 enqueued", {
-          count: tasks.length,
-          example: tasks[0],
-        });
-      }
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[AIControlsBar] mt5 enqueue failed:", e);
-    }
-  }
-
   /** Busca PROJETADOS + CONFIRMADOS + PnL + Trades */
   async function fetchAllOnce() {
     setLoading(true);
@@ -284,7 +235,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     try {
       const params = baseParams();
 
-      // Salva para debug
       (window as any).__dbgLastParams = {
         ...params,
         rr,
@@ -296,9 +246,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         confirmTf,
         breakEvenAtPts,
         beOffsetPts,
+        execEnabled,
+        execAgentId,
+        execLots,
       };
 
-      // 1) Projetados — PATCH TEMPORÁRIO: desligar filtros que podem suprimir SELL
+      // 1) Projetados — overrides temporários
       const payload: any = {
         ...params,
         rr,
@@ -309,20 +262,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         requireMtf,
         confirmTf: String(confirmTf || "").trim().toUpperCase(),
       };
-
-      // --- overrides temporários ---
       if (payload.minEV === 0) delete payload.minEV;
       payload.vwapFilter = false;
       payload.requireMtf = false;
       delete payload.confirmTf;
-      // -----------------------------
 
       const proj = await projectedSignals(payload);
 
       if (process.env.NODE_ENV !== "production") {
         const buy = (proj || []).filter((r) => r.side === "BUY").length;
         const sell = (proj || []).filter((r) => r.side === "SELL").length;
-        // eslint-disable-next-line no-console
         console.log("[AIControlsBar] projected fetched (TEMP PATCH)", {
           sent: payload,
           received: (proj || []).length,
@@ -336,7 +285,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         ...params,
         rr,
         minProb,
-        // refletimos os valores do formulário (sem os overrides) para não quebrar UI
         minEV,
         useMicroModel,
         vwapFilter,
@@ -344,18 +292,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         confirmTf,
       });
 
-      // 2) Confirmados (sem patch) + salva debug bruto
+      // 2) Confirmados
       const confRaw = await fetchConfirmedSignals({ ...params, limit: 2000 });
       (window as any).__dbgConfirmedRaw = confRaw;
       setConfirmed(confRaw || [], params);
 
-      // 2b) Envia para MT5 se habilitado
-      await maybeEnqueueForMT5(confRaw || [], {
-        symbol: params.symbol,
-        timeframe: params.timeframe,
-      });
-
-      // 3) Backtest (PnL + Trades) com BE por pontos + fallback de rota (implementado em api.ts)
+      // 3) Backtest com BE por pontos
       const bt = await runBacktest({
         ...(params as any),
         breakEvenAtPts,
@@ -402,6 +344,58 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     await fetchAllOnce();
   }
 
+  // --- helper: monta task no formato que o EA/NodeBridge consome ---
+  function makeMt5Task(side: "BUY" | "SELL") {
+    const p = baseParams();
+    return {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      side,
+      comment: `ui-test ${side} ${new Date().toISOString()}`,
+      beAtPoints: breakEvenAtPts,
+      beOffsetPoints: beOffsetPts,
+      //symbol: p.symbol || undefined, // geralmente omitimos; EA usa _Symbol
+      timeframe: null,
+      time: null,
+      price: 0,
+      volume: execLots,
+      slPoints: null,
+      tpPoints: null,
+    };
+  }
+
+  // Enfileirar ordem de teste no MT5 (payload { agentId, tasks: [...] })
+  async function onExecTest(side: "BUY" | "SELL") {
+    setExecMsg(null);
+    if (!execEnabled) { setExecMsg("Execução desativada (ligue o toggle)."); return; }
+
+    const body = {
+      agentId: (execAgentId || "mt5-ea-1").trim(),
+      tasks: [makeMt5Task(side)],
+    };
+
+    try {
+      const res = await enqueueMT5Order(body);
+      setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
+      window.dispatchEvent(new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } }));
+    } catch (e: any) {
+      const msg =
+        (e?.message || "Falha no enqueue") +
+        (e?.urlTried ? ` @ ${e.urlTried}` : "") +
+        (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
+      setExecMsg(`ERRO ${side}: ${msg}`);
+    }
+  }
+
+  // Peek fila do agente atual
+  async function onPeekQueue() {
+    try {
+      const res = await debugPeek(execAgentId);
+      setExecMsg(`PEEK: agent=${res?.agentId} pending=${res?.pending}`);
+    } catch (e: any) {
+      setExecMsg(`PEEK ERRO: ${(e?.message || "falha")}`);
+    }
+  }
+
   // Loop de auto-refresh (dispara imediatamente ao ligar)
   React.useEffect(() => {
     if (!autoRefresh) return;
@@ -415,7 +409,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
     }
 
-    // dispara já com os parâmetros atuais (que estão no estado + LS)
     tick();
     return () => {
       alive = false;
@@ -438,7 +431,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
-    execMT5, // <<< se mudar, realinha enable e enqueue
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -465,7 +457,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
-    execMT5,
   ]);
 
   return (
@@ -483,7 +474,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               </button>
               <strong>IA</strong>
 
-              {/* Botão painel Backtests */}
               <button
                 className="btn btn-sm btn-outline-primary ms-2"
                 onClick={() => setShowBacktests((v) => !v)}
@@ -495,7 +485,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               <div className="vr mx-2" />
 
               <div className="d-flex flex-wrap align-items-end gap-2">
-                {/* filtros principais (ligados ao store global) */}
+                {/* filtros principais */}
                 <div className="input-group input-group-sm" style={{ width: 140 }}>
                   <span className="input-group-text">Símbolo</span>
                   <input
@@ -534,7 +524,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
-                {/* parâmetros — afetam apenas os Projetados; BE afeta o backtest */}
+                {/* parâmetros — Projetados / Backtest */}
                 <div className="input-group input-group-sm" style={{ width: 110 }}>
                   <span className="input-group-text">RR</span>
                   <input
@@ -643,22 +633,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
                 <div className="vr mx-1" />
 
-                {/* Execução MT5 (opcional) */}
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="exec-mt5-toggle"
-                    checked={execMT5}
-                    onChange={(e) => setExecMT5(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="exec-mt5-toggle">
-                    Executar no MT5
-                  </label>
-                </div>
-
-                <div className="vr mx-1" />
-
                 {/* Auto refresh */}
                 <div className="form-check form-switch">
                   <input
@@ -702,6 +676,87 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   </span>
                 )}
               </div>
+
+              {/* ===== Execução MT5 ===== */}
+              <div className="vr mx-2" />
+              <div className="d-flex flex-wrap align-items-end gap-2">
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="exec-toggle"
+                    checked={execEnabled}
+                    onChange={(e) => setExecEnabled(e.target.checked)}
+                  />
+                </div>
+                <label className="form-check-label me-2" htmlFor="exec-toggle">
+                  Executar no MT5
+                </label>
+
+                <div className="input-group input-group-sm" style={{ width: 180 }}>
+                  <span className="input-group-text">AgentId</span>
+                  <input
+                    className="form-control"
+                    value={execAgentId}
+                    onChange={(e) => setExecAgentId(e.target.value)}
+                    placeholder="mt5-ea-1"
+                  />
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 120 }}>
+                  <span className="input-group-text">Lots</span>
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0.1}
+                    className="form-control"
+                    value={execLots}
+                    onChange={(e) =>
+                      setExecLots(Math.max(0.01, Number(e.target.value) || 1))
+                    }
+                  />
+                </div>
+
+                <button
+                  className="btn btn-sm btn-success"
+                  disabled={!execEnabled}
+                  onClick={() => onExecTest("BUY")}
+                  title="Enviar ordem de teste BUY para o MT5"
+                >
+                  BUY (teste)
+                </button>
+                <button
+                  className="btn btn-sm btn-danger"
+                  disabled={!execEnabled}
+                  onClick={() => onExecTest("SELL")}
+                  title="Enviar ordem de teste SELL para o MT5"
+                >
+                  SELL (teste)
+                </button>
+
+                <button
+                  className="btn btn-sm btn-outline-secondary"
+                  onClick={onPeekQueue}
+                  title="Inspecionar fila no servidor EXEC"
+                >
+                  Peek fila
+                </button>
+
+                {execMsg && (
+                  <span
+                    className="small ms-2"
+                    style={{
+                      maxWidth: 600,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    <code>{execMsg}</code>
+                  </span>
+                )}
+              </div>
+              {/* ======================== */}
             </div>
           </div>
         </div>
