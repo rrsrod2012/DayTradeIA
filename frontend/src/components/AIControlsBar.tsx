@@ -4,10 +4,6 @@ import {
   fetchConfirmedSignals,
   runBacktest,
   enqueueMT5Order,
-  execPeek,
-  execPollNoop,
-  execStats,
-  execEnable,
 } from "../services/api";
 import { useAIStore } from "../store/ai";
 import BacktestRunsPanel from "./BacktestRunsPanel";
@@ -28,6 +24,10 @@ function fmtDate(d: Date) {
 const LS_FILTERS_KEY = "ai/controls/filters/v2";
 const LS_PARAMS_KEY = "ai/controls/params/v2";
 
+/** Auto-exec: memória de dedupe e “armado desde” */
+const LS_EXEC_SENT_KEYS = "ai/exec/sentKeys/v1";
+const LS_EXEC_ARMED_SINCE = "ai/exec/armedSince/v1";
+
 function lsGet<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -43,6 +43,15 @@ function lsSet<T>(key: string, value: T) {
     localStorage.setItem(key, JSON.stringify(value));
   } catch { }
 }
+function lsGetString(key: string, fallback: string | null = null): string | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return String(JSON.parse(raw));
+  } catch {
+    return fallback;
+  }
+}
 
 type Props = {
   collapsedByDefault?: boolean;
@@ -55,7 +64,7 @@ type FiltersState = {
   symbol: string;
   timeframe: string;
   from: string | null; // "YYYY-MM-DD" ou null
-  to: string | null; // "YYYY-MM-DD" ou null
+  to: string | null;   // "YYYY-MM-DD" ou null
 };
 type FiltersAPI = {
   get: () => FiltersState;
@@ -135,6 +144,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execEnabled: execEnabled0,
     execAgentId: execAgentId0,
     execLots: execLots0,
+    execMaxAgeSec: execMaxAgeSec0,
   } = lsGet(LS_PARAMS_KEY, {
     rr: 2,
     minProb: 0.52,
@@ -150,6 +160,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execEnabled: false,
     execAgentId: "mt5-ea-1",
     execLots: 1,
+    execMaxAgeSec: 20, // janela de frescor padrão (seg)
   });
 
   const [rr, setRr] = React.useState<number>(rr0);
@@ -166,16 +177,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // Execução MT5
   const [execEnabled, setExecEnabled] = React.useState<boolean>(!!execEnabled0);
-  const [execAgentId, setExecAgentId] = React.useState<string>(
-    execAgentId0 || "mt5-ea-1"
-  );
+  const [execAgentId, setExecAgentId] = React.useState<string>(execAgentId0 || "mt5-ea-1");
   const [execLots, setExecLots] = React.useState<number>(Number(execLots0) || 1);
+  const [execMaxAgeSec, setExecMaxAgeSec] = React.useState<number>(Number(execMaxAgeSec0) || 20);
   const [execMsg, setExecMsg] = React.useState<string | null>(null);
-
-  // Estado fila/telemetria
-  const [execPending, setExecPending] = React.useState<number>(0);
-  const [lastPeekAt, setLastPeekAt] = React.useState<number | null>(null);
-  const [serverEnabled, setServerEnabled] = React.useState<boolean | null>(null);
 
   // -------- Auto-refresh --------
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
@@ -210,6 +215,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       execEnabled,
       execAgentId,
       execLots,
+      execMaxAgeSec,
     });
   }, [
     rr,
@@ -226,6 +232,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execEnabled,
     execAgentId,
     execLots,
+    execMaxAgeSec,
   ]);
 
   const baseParams = React.useCallback(
@@ -237,6 +244,104 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     }),
     [symbol, timeframe, from, to]
   );
+
+  /** ------------- AUTO-EXEC HELPERS ------------- */
+
+  // chave de dedupe por confirmação (inclui symbol e tf ativos)
+  function execKeyForConfirm(s: { side: string; time: string | undefined; price?: number | null }) {
+    const p = baseParams();
+    const t = s.time ? new Date(s.time).toISOString() : "";
+    const pr = s.price != null ? String(Math.round(Number(s.price) * 100) / 100) : "-";
+    return `${p.symbol}|${p.timeframe}|${s.side}|${t}|${pr}`;
+  }
+
+  function clampSentKeys(keys: string[], max = 1000) {
+    if (keys.length > max) return keys.slice(keys.length - Math.floor(max / 2));
+    return keys;
+  }
+
+  function isFreshEnough(iso?: string | null, maxAgeSec = 20, armedSinceIso: string | null = null) {
+    if (!iso) return false;
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return false;
+    const now = Date.now();
+    if (maxAgeSec > 0 && now - t > maxAgeSec * 1000) return false;
+    if (t - now > 60000) return false;
+    if (armedSinceIso) {
+      const armTs = Date.parse(armedSinceIso);
+      if (Number.isFinite(armTs) && t < armTs) return false;
+    }
+    return true;
+  }
+
+  async function autoExecFromConfirmed(confirms: Array<{ side: any; time: any; price?: any }>) {
+    if (!execEnabled) return;
+
+    const armedSince = lsGetString(LS_EXEC_ARMED_SINCE, null);
+
+    const sentArr = lsGet<string[]>(LS_EXEC_SENT_KEYS, []);
+    const sent = new Set(sentArr);
+
+    const candidates = (confirms || [])
+      .filter((s) => {
+        const side = String(s.side || "").toUpperCase();
+        return side === "BUY" || side === "SELL";
+      })
+      .filter((s) => isFreshEnough(String(s.time || ""), execMaxAgeSec, armedSince))
+      .filter((s) => !sent.has(execKeyForConfirm(s)));
+
+    if (candidates.length === 0) return;
+
+    for (const s of candidates) {
+      const side = String(s.side).toUpperCase() as "BUY" | "SELL";
+      const task = {
+        id: `auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        side,
+        comment: `auto ${side} ${new Date().toISOString()}`,
+        beAtPoints: breakEvenAtPts,
+        beOffsetPoints: beOffsetPts,
+        timeframe: null,
+        time: null,
+        price: 0,
+        volume: execLots,
+        slPoints: null,
+        tpPoints: null,
+      };
+
+      const body = {
+        agentId: (execAgentId || "mt5-ea-1").trim(),
+        tasks: [task],
+      };
+
+      try {
+        const res = await enqueueMT5Order(body);
+        setExecMsg(`AUTO ${side}: ${JSON.stringify(res)}`);
+        sent.add(execKeyForConfirm(s));
+      } catch (e: any) {
+        const msg =
+          (e?.message || "Falha no enqueue") +
+          (e?.urlTried ? ` @ ${e.urlTried}` : "") +
+          (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
+        setExecMsg(`ERRO AUTO ${side}: ${msg}`);
+      }
+    }
+
+    const newArr = clampSentKeys(Array.from(sent), 1000);
+    lsSet(LS_EXEC_SENT_KEYS, newArr);
+  }
+
+  // quando liga o toggle, “arma” a referência de tempo (salva ISO/UTC, mostra local)
+  React.useEffect(() => {
+    if (execEnabled) {
+      const now = new Date();
+      const nowIso = now.toISOString();              // seguro para comparações
+      const nowLocal = now.toLocaleString();         // amigável para o usuário (fuso local)
+      lsSet(LS_EXEC_ARMED_SINCE, nowIso);
+      setExecMsg(`AUTO armado às ${nowLocal} (local)`);
+    }
+  }, [execEnabled]);
+
+  /** ----------------------------------------------------------- */
 
   /** Busca PROJETADOS + CONFIRMADOS + PnL + Trades */
   async function fetchAllOnce() {
@@ -259,9 +364,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         execEnabled,
         execAgentId,
         execLots,
+        execMaxAgeSec,
       };
 
-      // 1) Projetados — overrides temporários pra liberar SELL por enquanto
+      // 1) Projetados — overrides temporários
       const payload: any = {
         ...params,
         rr,
@@ -306,6 +412,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       const confRaw = await fetchConfirmedSignals({ ...params, limit: 2000 });
       (window as any).__dbgConfirmedRaw = confRaw;
       setConfirmed(confRaw || [], params);
+
+      // >>> 2.1) AUTO-EXEC: dispara a partir dos confirmados frescos
+      await autoExecFromConfirmed(confRaw || []);
 
       // 3) Backtest com BE por pontos
       const bt = await runBacktest({
@@ -362,7 +471,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       comment: `ui-test ${side} ${new Date().toISOString()}`,
       beAtPoints: breakEvenAtPts,
       beOffsetPoints: beOffsetPts,
-      //symbol: p.symbol || undefined,   // usar _Symbol do gráfico
       timeframe: null,
       time: null,
       price: 0,
@@ -389,16 +497,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       const res = await enqueueMT5Order(body);
       setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
       window.dispatchEvent(
-        new CustomEvent("daytrade:mt5-enqueue", {
-          detail: { when: Date.now(), body, res },
-        })
+        new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
       );
-      // após enfileirar, atualiza peek
-      try {
-        const pk = await execPeek(execAgentId || "mt5-ea-1");
-        setExecPending(pk?.pending ?? 0);
-        setLastPeekAt(Date.now());
-      } catch { }
     } catch (e: any) {
       const msg =
         (e?.message || "Falha no enqueue") +
@@ -443,6 +543,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
+    execEnabled,
+    execAgentId,
+    execLots,
+    execMaxAgeSec,
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -469,75 +573,11 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     confirmTf,
     breakEvenAtPts,
     beOffsetPts,
+    execEnabled,
+    execAgentId,
+    execLots,
+    execMaxAgeSec,
   ]);
-
-  // Ao montar, tenta detectar se o servidor está ligado e captura pending inicial
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const st = await execStats();
-        setServerEnabled(!!st?.enabled);
-      } catch {
-        setServerEnabled(null);
-      }
-      try {
-        const pk = await execPeek(execAgentId || "mt5-ea-1");
-        setExecPending(pk?.pending ?? 0);
-        setLastPeekAt(Date.now());
-      } catch { }
-    })();
-  }, [execAgentId]);
-
-  // Listener pra atualizar fila após enfileirar por outros componentes
-  React.useEffect(() => {
-    function onEnq() {
-      execPeek(execAgentId || "mt5-ea-1")
-        .then((pk) => {
-          setExecPending(pk?.pending ?? 0);
-          setLastPeekAt(Date.now());
-        })
-        .catch(() => { });
-    }
-    window.addEventListener("daytrade:mt5-enqueue" as any, onEnq);
-    return () => window.removeEventListener("daytrade:mt5-enqueue" as any, onEnq);
-  }, [execAgentId]);
-
-  async function onPeekNow() {
-    try {
-      const pk = await execPeek(execAgentId || "mt5-ea-1");
-      setExecPending(pk?.pending ?? 0);
-      setLastPeekAt(Date.now());
-      setExecMsg(`peek: pending=${pk?.pending ?? 0}`);
-    } catch (e: any) {
-      setExecMsg(`peek erro: ${e?.message || "?"}`);
-    }
-  }
-
-  async function onPollNoop() {
-    try {
-      const res = await execPollNoop(execAgentId || "mt5-ea-1", 10);
-      setExecMsg(
-        `noop served=${res?.served ?? 0} tasks=${(res?.tasks || []).length}`
-      );
-      // noop não drena; reflete o pending atual:
-      const pk = await execPeek(execAgentId || "mt5-ea-1");
-      setExecPending(pk?.pending ?? 0);
-      setLastPeekAt(Date.now());
-      console.log("[poll noop]", res);
-    } catch (e: any) {
-      setExecMsg(`noop erro: ${e?.message || "?"}`);
-    }
-  }
-
-  async function onServerEnableToggle() {
-    try {
-      const res = await execEnable(true);
-      setServerEnabled(!!res?.enabled);
-      setExecMsg(`exec server enabled=${!!res?.enabled}`);
-    } catch (e: any) {
-      setExecMsg(`enable erro: ${e?.message || "?"}`);
-    }
-  }
 
   return (
     <>
@@ -697,9 +737,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     step={1}
                     className="form-control"
                     value={breakEvenAtPts}
-                    onChange={(e) =>
-                      setBreakEvenAtPts(Number(e.target.value) || 0)
-                    }
+                    onChange={(e) => setBreakEvenAtPts(Number(e.target.value) || 0)}
                   />
                 </div>
 
@@ -773,7 +811,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
                 <label className="form-check-label me-2" htmlFor="exec-toggle">
-                  Executar no MT5
+                  Executar no MT5 (auto)
                 </label>
 
                 <div className="input-group input-group-sm" style={{ width: 180 }}>
@@ -800,6 +838,22 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
+                {/* Janela de frescor (anti-histórico) */}
+                <div className="input-group input-group-sm" style={{ width: 160 }}>
+                  <span className="input-group-text">MaxAge</span>
+                  <input
+                    type="number"
+                    min={5}
+                    step={5}
+                    className="form-control"
+                    value={execMaxAgeSec}
+                    onChange={(e) =>
+                      setExecMaxAgeSec(Math.max(5, Number(e.target.value) || 20))
+                    }
+                  />
+                  <span className="input-group-text">s</span>
+                </div>
+
                 <button
                   className="btn btn-sm btn-success"
                   disabled={!execEnabled}
@@ -816,45 +870,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                 >
                   SELL (teste)
                 </button>
-
-                {/* Controles de fila/diagnóstico */}
-                <div className="vr mx-2" />
-                <div className="d-flex align-items-center gap-2">
-                  <span className="badge text-bg-secondary">
-                    Fila MT5: {execPending}
-                  </span>
-                  <button
-                    className="btn btn-sm btn-outline-secondary"
-                    onClick={onPeekNow}
-                    title="Ler fila atual (debug/peek)"
-                  >
-                    Peek
-                  </button>
-                  <button
-                    className="btn btn-sm btn-outline-secondary"
-                    onClick={onPollNoop}
-                    title="Simular poll sem drenar (poll?noop=1)"
-                  >
-                    Poll (noop)
-                  </button>
-                  <button
-                    className="btn btn-sm btn-outline-secondary"
-                    onClick={onServerEnableToggle}
-                    title="Habilitar execução no servidor"
-                  >
-                    Ligar Exec Server
-                  </button>
-                  <small className="text-muted">
-                    {serverEnabled === null
-                      ? "srv:?"
-                      : serverEnabled
-                        ? "srv:ON"
-                        : "srv:OFF"}
-                    {lastPeekAt
-                      ? ` · peek:${new Date(lastPeekAt).toLocaleTimeString()}`
-                      : ""}
-                  </small>
-                </div>
 
                 {execMsg && (
                   <span
