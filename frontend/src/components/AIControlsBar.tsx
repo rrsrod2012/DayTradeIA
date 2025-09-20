@@ -122,6 +122,19 @@ export function useAIControls() {
 /* ============================
    Componente da barra de controles
    ============================ */
+type LastSent = {
+  at: string;
+  agentId: string;
+  side: "BUY" | "SELL";
+  volume: number;
+  slPoints: number | null;
+  tpPoints: number | null;
+  beAtPoints: number | null;
+  beOffsetPoints: number | null;
+  comment: string;
+  taskId: string;
+};
+
 export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [collapsed, setCollapsed] = React.useState(!!collapsedByDefault);
 
@@ -183,7 +196,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [requireMtf, setRequireMtf] = React.useState<boolean>(requireMtf0);
   const [confirmTf, setConfirmTf] = React.useState<string>(confirmTf0);
 
-  // >>> BE por pontos (para o backtest)
+  // >>> BE por pontos (para o backtest e envio)
   const [breakEvenAtPts, setBreakEvenAtPts] = React.useState<number>(breakEvenAtPts0);
   const [beOffsetPts, setBeOffsetPts] = React.useState<number>(beOffsetPts0);
 
@@ -210,6 +223,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // -------- Painel Backtests --------
   const [showBacktests, setShowBacktests] = React.useState(false);
+
+  // -------- Último envio efetivo ao EA (reflete o que o MT5 recebeu) --------
+  const [lastSent, setLastSent] = React.useState<LastSent | null>(null);
 
   const setProjected = useAIStore((s) => s.setProjected);
   const setConfirmed = useAIStore((s) => s.setConfirmed);
@@ -346,8 +362,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
     for (const s of candidates) {
       const side = String(s.side).toUpperCase() as "BUY" | "SELL";
+      const taskId = `auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const task = {
-        id: `auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: taskId,
         side,
         comment: `auto ${side} ${new Date().toISOString()}${slPtsToSend ? ` SL=${slPtsToSend}` : ""}${tpPtsToSend ? ` TP=${tpPtsToSend}` : ""}`,
         beAtPoints: breakEvenAtPts,
@@ -368,6 +385,23 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       try {
         const res = await enqueueMT5Order(body);
         setExecMsg(`AUTO ${side}: ${JSON.stringify(res)}`);
+        // guarda último envio (espelho do que foi para o EA)
+        setLastSent({
+          at: new Date().toISOString(),
+          agentId: body.agentId,
+          side,
+          volume: execLots,
+          slPoints: slPtsToSend ?? null,
+          tpPoints: tpPtsToSend ?? null,
+          beAtPoints: breakEvenAtPts ?? null,
+          beOffsetPoints: beOffsetPts ?? null,
+          comment: task.comment,
+          taskId,
+        });
+        // evento para quem quiser ouvir
+        window.dispatchEvent(
+          new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
+        );
         sent.add(execKeyForConfirm(s));
       } catch (e: any) {
         const msg =
@@ -474,13 +508,14 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         confirmTf,
       });
 
-      // 2) Confirmados — envia SL/TP para o backend (se suportado) e anexa meta
+      // 2) Confirmados — passamos extras como any para não brigar com o tipo do api.ts
       const confRaw = await fetchConfirmedSignals({
-        ...params,
+        ...(params as any),
         limit: 2000,
-        slPoints: slPtsToSend ?? 0, // <<< SL/TP para confirmados
+        // estes campos são ignorados pelo tipo atual do api.ts, mas úteis se seu backend suportar
+        slPoints: slPtsToSend ?? 0,
         tpPoints: tpPtsToSend ?? 0,
-      });
+      } as any);
       (window as any).__dbgConfirmedRaw = confRaw;
 
       setConfirmed(confRaw || [], {
@@ -494,16 +529,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       // >>> 2.1) AUTO-EXEC: dispara a partir dos confirmados frescos
       await autoExecFromConfirmed(confRaw || []);
 
-      // 3) Backtest — inclui SL/TP (e BE) para respeitar stops
+      // 3) Backtest — inclui BE e SL/TP (seu backend pode ignorar SL/TP caso não implemente)
       const bt = await runBacktest({
         ...(params as any),
         breakEvenAtPts,
         beOffsetPts,
-        slPoints: slPtsToSend ?? 0, // <<< SL/TP no backtest
+        slPoints: slPtsToSend ?? 0,
         tpPoints: tpPtsToSend ?? 0,
         tpViaRR,
         rr,
-      });
+      } as any);
 
       const rawTrades =
         (Array.isArray(bt?.trades) && bt?.trades) ||
@@ -580,14 +615,28 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       return;
     }
 
+    const task = makeMt5Task(side);
     const body = {
       agentId: (execAgentId || "mt5-ea-1").trim(),
-      tasks: [makeMt5Task(side)],
+      tasks: [task],
     };
 
     try {
       const res = await enqueueMT5Order(body);
       setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
+      // espelho do último envio
+      setLastSent({
+        at: new Date().toISOString(),
+        agentId: body.agentId,
+        side,
+        volume: execLots,
+        slPoints: task.slPoints ?? null,
+        tpPoints: task.tpPoints ?? null,
+        beAtPoints: task.beAtPoints ?? null,
+        beOffsetPoints: task.beOffsetPoints ?? null,
+        comment: task.comment,
+        taskId: task.id,
+      });
       window.dispatchEvent(
         new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
       );
@@ -1041,6 +1090,35 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               </div>
               {/* ======================== */}
             </div>
+
+            {/* ===== Último envio refletido na UI ===== */}
+            {lastSent && (
+              <div className="mt-2">
+                <div className="small text-muted">Último envio ao MT5 (espelho do envelope):</div>
+                <div className="p-2 rounded border bg-light-subtle">
+                  <div className="d-flex flex-wrap gap-2 align-items-center">
+                    <span className={`badge ${lastSent.side === "BUY" ? "bg-success" : "bg-danger"}`}>
+                      {lastSent.side}
+                    </span>
+                    <code className="me-1">ag:{lastSent.agentId}</code>
+                    <code className="me-1">vol:{lastSent.volume}</code>
+                    <code className="me-1">BE:{lastSent.beAtPoints ?? 0}</code>
+                    <code className="me-1">OFF:{lastSent.beOffsetPoints ?? 0}</code>
+                    <code className="me-1">SLp:{lastSent.slPoints ?? "-"}</code>
+                    <code className="me-1">TPp:{lastSent.tpPoints ?? "-"}</code>
+                    <code className="me-1">id:{lastSent.taskId}</code>
+                    <code className="me-1">at:{new Date(lastSent.at).toLocaleTimeString()}</code>
+                  </div>
+                  <div className="mt-1">
+                    <div className="small">Comentário:</div>
+                    <div className="text-break">
+                      <code>{lastSent.comment}</code>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* ======================================== */}
           </div>
         </div>
       </div>
