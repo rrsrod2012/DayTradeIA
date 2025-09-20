@@ -402,6 +402,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     try {
       const params = baseParams();
 
+      const { slPtsToSend, tpPtsToSend } = computeStops(); // <<< SL/TP para confirmados e backtest
+
       (window as any).__dbgLastParams = {
         ...params,
         rr,
@@ -423,6 +425,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         slPts,
         tpPts,
         tpViaRR,
+
+        // efetivamente aplicados neste ciclo
+        stopsApplied: {
+          slPoints: slPtsToSend ?? 0,
+          tpPoints: tpPtsToSend ?? 0,
+        },
       };
 
       // 1) Projetados — overrides temporários
@@ -466,19 +474,35 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         confirmTf,
       });
 
-      // 2) Confirmados
-      const confRaw = await fetchConfirmedSignals({ ...params, limit: 2000 });
+      // 2) Confirmados — envia SL/TP para o backend (se suportado) e anexa meta
+      const confRaw = await fetchConfirmedSignals({
+        ...params,
+        limit: 2000,
+        slPoints: slPtsToSend ?? 0, // <<< SL/TP para confirmados
+        tpPoints: tpPtsToSend ?? 0,
+      });
       (window as any).__dbgConfirmedRaw = confRaw;
-      setConfirmed(confRaw || [], params);
+
+      setConfirmed(confRaw || [], {
+        ...params,
+        slPoints: slPtsToSend ?? null,
+        tpPoints: tpPtsToSend ?? null,
+        tpViaRR,
+        rr,
+      });
 
       // >>> 2.1) AUTO-EXEC: dispara a partir dos confirmados frescos
       await autoExecFromConfirmed(confRaw || []);
 
-      // 3) Backtest com BE por pontos
+      // 3) Backtest — inclui SL/TP (e BE) para respeitar stops
       const bt = await runBacktest({
         ...(params as any),
         breakEvenAtPts,
         beOffsetPts,
+        slPoints: slPtsToSend ?? 0, // <<< SL/TP no backtest
+        tpPoints: tpPtsToSend ?? 0,
+        tpViaRR,
+        rr,
       });
 
       const rawTrades =
@@ -508,7 +532,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
           : null
       );
 
-      setTrades(rawTrades, bt?.meta);
+      // meta inclui quais stops foram aplicados para render/legenda
+      setTrades(rawTrades, {
+        ...(bt?.meta || {}),
+        slPointsApplied: slPtsToSend ?? 0,
+        tpPointsApplied: tpPtsToSend ?? 0,
+        tpViaRRApplied: tpViaRR,
+        rrApplied: rr,
+        beAtPointsApplied: breakEvenAtPts,
+        beOffsetApplied: beOffsetPts,
+      });
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
     } finally {
