@@ -44,6 +44,29 @@ export type ProjectedSignalsParams = {
   confirmTf?: string;
 };
 
+export type ExecPeekResponse = {
+  ok: boolean;
+  agentId: string;
+  pending: number;
+  tasks: any[];
+};
+
+export type ExecStatsResponse = {
+  ok: boolean;
+  enabled: boolean;
+  agents: Record<
+    string,
+    { polls: number; lastTs: number; lastServed: number; lastPending: number }
+  >;
+};
+
+export type ExecHistoryResponse = {
+  ok: boolean;
+  agentId: string;
+  count: number;
+  items: any[];
+};
+
 declare global {
   interface Window {
     DAYTRADE_CFG?: {
@@ -63,13 +86,25 @@ const EXEC_BASE = String(RAW_EXEC_BASE || "").replace(/\/$/, "");
 function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
   const s = String(val ?? "").trim().toUpperCase();
   if (
-    s === "SELL" || s === "SHORT" || s === "S" || s === "-1" || s === "DOWN" ||
-    s.includes("SELL") || s.includes("SHORT")
-  ) return "SELL";
+    s === "SELL" ||
+    s === "SHORT" ||
+    s === "S" ||
+    s === "-1" ||
+    s === "DOWN" ||
+    s.includes("SELL") ||
+    s.includes("SHORT")
+  )
+    return "SELL";
   if (
-    s === "BUY" || s === "LONG" || s === "B" || s === "1" || s === "UP" ||
-    s.includes("BUY") || s.includes("LONG")
-  ) return "BUY";
+    s === "BUY" ||
+    s === "LONG" ||
+    s === "B" ||
+    s === "1" ||
+    s === "UP" ||
+    s.includes("BUY") ||
+    s.includes("LONG")
+  )
+    return "BUY";
   if (s === "FLAT" || s === "NEUTRAL" || s === "0") return "FLAT";
   return "BUY";
 }
@@ -93,7 +128,11 @@ function ymdLocalFromISO(iso?: string): string | null {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-async function jsonFetchBase<T>(base: string, url: string, init?: RequestInit): Promise<T> {
+async function jsonFetchBase<T>(
+  base: string,
+  url: string,
+  init?: RequestInit
+): Promise<T> {
   const fullUrl =
     (base || window.location.origin.replace(/\/$/, "")) +
     (url.startsWith("/") ? url : `/${url}`);
@@ -145,7 +184,11 @@ export async function projectedSignals(
 
   const arr: any[] =
     (Array.isArray(raw) && raw) ||
-    raw?.data || raw?.rows || raw?.signals || raw?.items || [];
+    raw?.data ||
+    raw?.rows ||
+    raw?.signals ||
+    raw?.items ||
+    [];
 
   return arr.map((s) => {
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
@@ -190,16 +233,23 @@ export async function fetchConfirmedSignals(params: {
   if (params.to) q.set("to", params.to);
   if (params.limit) q.set("limit", String(params.limit));
 
-  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, { method: "GET" });
+  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, {
+    method: "GET",
+  });
 
   const arr: any[] =
     (Array.isArray(raw) && raw) ||
-    raw?.data || raw?.rows || raw?.signals || raw?.items || [];
+    raw?.data ||
+    raw?.rows ||
+    raw?.signals ||
+    raw?.items ||
+    [];
 
   return arr.map((s) => {
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
     const iso =
-      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ?? new Date().toISOString();
+      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ??
+      new Date().toISOString();
     const price = s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
     const note = s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
     return {
@@ -229,7 +279,11 @@ export async function runBacktest(params: {
     });
   } catch (e: any) {
     if (process.env.NODE_ENV !== "production") {
-      console.warn("[api] POST /api/backtest falhou", e?.status, e?.urlTried || "");
+      console.warn(
+        "[api] POST /api/backtest falhou",
+        e?.status,
+        e?.urlTried || ""
+      );
     }
   }
 
@@ -240,8 +294,10 @@ export async function runBacktest(params: {
     q.set("timeframe", params.timeframe.toUpperCase());
     if (params.from) q.set("from", params.from);
     if (params.to) q.set("to", params.to);
-    if (params.breakEvenAtPts != null) q.set("breakEvenAtPts", String(params.breakEvenAtPts));
-    if (params.beOffsetPts != null) q.set("beOffsetPts", String(params.beOffsetPts));
+    if (params.breakEvenAtPts != null)
+      q.set("breakEvenAtPts", String(params.breakEvenAtPts));
+    if (params.beOffsetPts != null)
+      q.set("beOffsetPts", String(params.beOffsetPts));
     return await jsonFetch<any>(`/backtest?${q.toString()}`, { method: "GET" });
   } catch (e: any) {
     if (process.env.NODE_ENV !== "production") {
@@ -287,51 +343,99 @@ function mapSymbolForBroker(sym: string): string {
 }
 
 /* =========================
+   Execução MT5 — client
+   ========================= */
+export async function execEnable(on?: boolean) {
+  const qs =
+    on === undefined
+      ? ""
+      : `?on=${on ? "1" : "0"}`;
+  return jsonFetchBase<any>(EXEC_BASE, `/enable${qs}`, { method: "GET" });
+}
+
+export async function execPeek(agentId: string): Promise<ExecPeekResponse> {
+  const q = new URLSearchParams();
+  q.set("agentId", agentId || "mt5-ea-1");
+  return jsonFetchBase<ExecPeekResponse>(EXEC_BASE, `/debug/peek?${q.toString()}`, {
+    method: "GET",
+  });
+}
+
+export async function execStats(): Promise<ExecStatsResponse> {
+  return jsonFetchBase<ExecStatsResponse>(EXEC_BASE, "/debug/stats", {
+    method: "GET",
+  });
+}
+
+export async function execHistory(agentId: string): Promise<ExecHistoryResponse> {
+  const q = new URLSearchParams();
+  q.set("agentId", agentId || "mt5-ea-1");
+  return jsonFetchBase<ExecHistoryResponse>(
+    EXEC_BASE,
+    `/debug/history?${q.toString()}`,
+    { method: "GET" }
+  );
+}
+
+export async function execPollNoop(agentId: string, max = 10) {
+  return jsonFetchBase<any>(EXEC_BASE, `/poll?noop=1`, {
+    method: "POST",
+    body: JSON.stringify({ agentId: agentId || "mt5-ea-1", max }),
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+  });
+}
+
+/* =========================
    Enfileirar ordem p/ MT5 (EA NodeBridge)
    - Envia SEMPRE: POST {agentId, tasks:[{...}] } para /enqueue no EXEC_BASE
    - Omitimos `symbol` por padrão (EA usa _Symbol do gráfico)
    ========================= */
-export async function enqueueMT5Order(input:
-  | {
-    agentId?: string;
-    tasks: Array<{
-      id?: string;
+export async function enqueueMT5Order(
+  input:
+    | {
+      agentId?: string;
+      tasks: Array<{
+        id?: string;
+        side: "BUY" | "SELL";
+        comment?: string;
+        beAtPoints?: number | null;
+        beOffsetPoints?: number | null;
+        symbol?: string; // opcional
+        timeframe?: any;
+        time?: any;
+        price?: number | null;
+        volume?: number;
+        slPoints?: number | null;
+        tpPoints?: number | null;
+      }>;
+    }
+    | {
+      agentId?: string;
+      symbol?: string;
       side: "BUY" | "SELL";
+      volume?: number;
+      lots?: number;
       comment?: string;
       beAtPoints?: number | null;
       beOffsetPoints?: number | null;
-      symbol?: string;
-      timeframe?: any;
-      time?: any;
       price?: number | null;
-      volume?: number;
-      slPoints?: number | null;
-      tpPoints?: number | null;
-    }>;
-  }
-  | {
-    agentId?: string;
-    symbol?: string;
-    side: "BUY" | "SELL";
-    volume?: number;
-    lots?: number;
-    comment?: string;
-    beAtPoints?: number | null;
-    beOffsetPoints?: number | null;
-    price?: number | null;
-    sl?: number | null;
-    tp?: number | null;
-  }
+      sl?: number | null;
+      tp?: number | null;
+    }
 ) {
+  // Se já veio no formato {agentId, tasks:[...]} apenas encaminha
   if ((input as any)?.tasks && Array.isArray((input as any).tasks)) {
     const envelope = {
       agentId: (input as any).agentId ?? "mt5-ea-1",
       tasks: (input as any).tasks.map((t: any) => ({
-        id: t.id ?? `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id:
+          t.id ??
+          `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         side: t.side,
         comment: t.comment ?? "",
         beAtPoints: t.beAtPoints ?? null,
         beOffsetPoints: t.beOffsetPoints ?? null,
+        // SÓ envie symbol se for o código real do MT5 (ex.: WINV25). Caso contrário, omita:
         ...(t.symbol ? { symbol: mapSymbolForBroker(t.symbol) } : {}),
         timeframe: t.timeframe ?? null,
         time: t.time ?? null,
@@ -344,14 +448,20 @@ export async function enqueueMT5Order(input:
 
     return jsonFetchBase<any>(EXEC_BASE, "/enqueue", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
       body: JSON.stringify(envelope),
     });
   }
 
+  // Caso contrário, monta uma task única no formato esperado pelo EA
   const p: any = input || {};
   const lots = p.volume ?? p.lots ?? 1;
 
+  // Por padrão, NÃO mandamos symbol (o EA usa _Symbol). Se quiser muito enviar,
+  // garanta que mapSymbolForBroker retorne o código exato do book no MT5:
   const mapped = p.symbol ? mapSymbolForBroker(String(p.symbol)) : null;
   const maybeSymbol =
     mapped && mapped !== String(p.symbol).toUpperCase() ? mapped : null;
@@ -362,7 +472,7 @@ export async function enqueueMT5Order(input:
     comment: p.comment ?? "",
     beAtPoints: p.beAtPoints ?? null,
     beOffsetPoints: p.beOffsetPoints ?? null,
-    ...(maybeSymbol ? { symbol: maybeSymbol } : {}),
+    ...(maybeSymbol ? { symbol: maybeSymbol } : {}), // OMIT se não tiver certeza
     timeframe: null,
     time: null,
     price: 0,
@@ -381,13 +491,4 @@ export async function enqueueMT5Order(input:
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(envelope),
   });
-}
-
-/* =========================
-   Debug helpers
-   ========================= */
-export async function debugPeek(agentId?: string) {
-  const q = new URLSearchParams();
-  if (agentId) q.set("agentId", agentId);
-  return jsonFetchBase<any>(EXEC_BASE, `/debug/peek?${q.toString()}`, { method: "GET" });
 }

@@ -1,5 +1,6 @@
 // backend/src/mt5-server.ts
-// Rodar: npx tsx src/mt5-server.ts
+// Rodar:  npx tsx src/mt5-server.ts
+// Node 18+
 
 import express from "express";
 import cors from "cors";
@@ -41,28 +42,21 @@ type Task = {
 };
 
 // ---------- estado ----------
-const QUEUES: Map<string, Task[]> = new Map();   // fila por agentId
-const SEEN: Set<string> = new Set();             // dedupe global por id
+const QUEUES: Map<string, Task[]> = new Map();  // fila por agentId
+const SEEN: Set<string> = new Set();            // dedupe global por id
 
-// métricas e histórico
+// métricas/telemetria (por agentId)
 type AgentStats = {
-    pollsTotal: number;
-    servedTotal: number;
-    lastTs: number;
-    lastServed: number;
-    lastPending: number;
+    polls: number;
+    lastTs: number;        // timestamp do último /poll
+    lastServed: number;    // quantas tasks servidas no último /poll
+    lastPending: number;   // quantas tasks restaram após o último /poll
 };
 const STATS: Map<string, AgentStats> = new Map();
 
-const HISTORY_LIMIT = 200;
+// histórico de tasks servidas (por agentId)
 const HISTORY: Map<string, Task[]> = new Map();
-
-function pushHistory(agentId: string, served: Task[]) {
-    if (!HISTORY.has(agentId)) HISTORY.set(agentId, []);
-    const arr = HISTORY.get(agentId)!;
-    for (const t of served) arr.push(t);
-    while (arr.length > HISTORY_LIMIT) arr.shift();
-}
+const MAX_HISTORY = 200;
 
 function truthy(v: any): boolean {
     if (typeof v === "boolean") return v;
@@ -79,10 +73,13 @@ function q(agentId: string) {
     return QUEUES.get(agentId)!;
 }
 
+function hist(agentId: string) {
+    if (!HISTORY.has(agentId)) HISTORY.set(agentId, []);
+    return HISTORY.get(agentId)!;
+}
+
 function stat(agentId: string) {
-    if (!STATS.has(agentId)) {
-        STATS.set(agentId, { pollsTotal: 0, servedTotal: 0, lastTs: 0, lastServed: 0, lastPending: 0 });
-    }
+    if (!STATS.has(agentId)) STATS.set(agentId, { polls: 0, lastTs: 0, lastServed: 0, lastPending: q(agentId).length });
     return STATS.get(agentId)!;
 }
 
@@ -118,7 +115,7 @@ function normalizeEnqueueBody(body: any): { agentId: string; tasks: Task[] } {
                 timeframe: t?.timeframe ?? null,
                 time: t?.time ?? null,
                 price: t?.price ?? null,
-                volume: t?.volume ?? null,
+                volume: t?.volume ?? 1,
                 slPoints: t?.slPoints ?? null,
                 tpPoints: t?.tpPoints ?? null,
                 beAtPoints: t?.beAtPoints ?? null,
@@ -159,12 +156,10 @@ app.get("/config", (_req, res) => {
 
 // -------- enable/disable (GET e POST; aceita on/enabled) --------
 function readEnableFlag(req: express.Request): boolean | undefined {
-    // prioridade: body.enabled / body.on
     if (req.body && typeof req.body === "object") {
         if ("enabled" in req.body) return truthy((req.body as any).enabled);
         if ("on" in req.body) return truthy((req.body as any).on);
     }
-    // fallback: query ?enabled=1 / ?on=1
     if ("enabled" in req.query) return truthy(req.query.enabled);
     if ("on" in req.query) return truthy(req.query.on);
     return undefined; // sem parâmetro -> alterna
@@ -187,11 +182,13 @@ app.get("/exec/enable", enableHandler);
 app.post("/reset", (_req, res) => {
     QUEUES.clear();
     SEEN.clear();
-    console.log("[mt5-server] RESET queues & seen");
+    STATS.clear();
+    HISTORY.clear();
+    console.log("[mt5-server] RESET queues & seen & stats & history");
     res.json({ ok: true });
 });
 
-// -------- ENQUEUE (POST padrão) --------
+// -------- ENQUEUE (POST JSON) --------
 function enqueueHandler(req: express.Request, res: express.Response) {
     if (!ENABLED) {
         console.warn("[mt5-server] ENQUEUE rejected (disabled)");
@@ -221,22 +218,24 @@ app.post("/api/mt5/enqueue", enqueueHandler);
 app.post("/exec/enqueue", enqueueHandler);
 app.post("/task/enqueue", enqueueHandler);
 
-// -------- ENQUEUE (GET de depuração) --------
+// -------- ENQUEUE (GET debug: /enqueue?side=BUY&agentId=...&beAtPoints=10&beOffsetPoints=0) --------
 app.get("/enqueue", (req, res) => {
     if (!ENABLED) return res.status(400).json({ ok: false, error: "disabled" });
 
-    const agentId = (req.query.agentId as string) || "mt5-ea-1";
+    const agentId = String(req.query.agentId || "mt5-ea-1");
     const side = String(req.query.side || "").toUpperCase();
     if (side !== "BUY" && side !== "SELL") {
-        return res.status(400).json({ ok: false, error: "invalid side" });
+        return res.status(400).json({ ok: false, error: "bad side" });
     }
+    const beAtPoints = req.query.beAtPoints != null ? Number(req.query.beAtPoints) : null;
+    const beOffsetPoints = req.query.beOffsetPoints != null ? Number(req.query.beOffsetPoints) : null;
 
-    const t: Task = {
+    const task: Task = {
         id: `debug-${Date.now()}`,
         side: side as Side,
         comment: "debug via GET",
-        beAtPoints: req.query.beAtPoints ? Number(req.query.beAtPoints) : 10,
-        beOffsetPoints: req.query.beOffsetPoints ? Number(req.query.beOffsetPoints) : 0,
+        beAtPoints,
+        beOffsetPoints,
         symbol: null,
         timeframe: null,
         time: null,
@@ -246,57 +245,51 @@ app.get("/enqueue", (req, res) => {
         tpPoints: null,
         agentId,
     };
-
     const bucket = q(agentId);
-    if (!SEEN.has(t.id)) {
-        SEEN.add(t.id);
-        bucket.push(t);
+    if (!SEEN.has(task.id)) {
+        SEEN.add(task.id);
+        bucket.push(task);
     }
-
-    return res.json({ ok: true, agentId, queued: 1, pending: bucket.length, task: t });
+    console.log(`[mt5-server] ENQUEUE (GET) agent=${agentId} side=${side} pending=${bucket.length}`);
+    res.json({ ok: true, agentId, queued: 1, pending: bucket.length, task });
 });
 
 // -------- POLL (EA -> server) --------
+// aceita query ?noop=1 para não drenar, mas retornar as próximas tasks.
 app.post("/poll", (req, res) => {
     const agentId = (req.body?.agentId as string) || "mt5-ea-1";
     const max = Math.max(1, Math.min(50, Number(req.body?.max ?? 10)));
-    const noop = truthy(req.query.noop);
-
-    if (!ENABLED) {
-        const s = stat(agentId);
-        s.pollsTotal++;
-        s.lastTs = Date.now();
-        s.lastServed = 0;
-        s.lastPending = q(agentId).length;
-        return res.json({ ok: true, agentId, noop, served: 0, pendingBefore: s.lastPending, pendingAfter: s.lastPending, servedIds: [], echo: { agentId, max }, tasks: [] });
-    }
+    const noop = truthy((req.query?.noop as any) ?? false);
 
     const bucket = q(agentId);
     const before = bucket.length;
-    const batch: Task[] = [];
 
-    if (noop) {
-        // somente espelha os próximos até max, sem drenar
-        for (let i = 0; i < Math.min(max, bucket.length); i++) batch.push(bucket[i]);
-    } else {
-        while (batch.length < max && bucket.length > 0) {
-            batch.push(bucket.shift()!);
+    let batch: Task[] = [];
+    if (ENABLED) {
+        if (noop) {
+            batch = bucket.slice(0, max); // não drena
+        } else {
+            while (batch.length < max && bucket.length > 0) batch.push(bucket.shift()!);
+            // registra histórico
+            if (batch.length > 0) {
+                const h = hist(agentId);
+                h.push(...batch);
+                if (h.length > MAX_HISTORY) h.splice(0, h.length - MAX_HISTORY);
+            }
         }
     }
 
-    const servedIds = batch.map(t => t.id);
     const after = bucket.length;
+    const servedIds = batch.map(t => t.id);
 
+    // atualiza métricas
     const s = stat(agentId);
-    s.pollsTotal++;
-    s.servedTotal += noop ? 0 : batch.length;
+    s.polls += 1;
     s.lastTs = Date.now();
     s.lastServed = noop ? 0 : batch.length;
     s.lastPending = after;
 
-    if (!noop && batch.length) pushHistory(agentId, batch);
-
-    console.log(`[mt5-server] POLL agent=${agentId} max=${max} noop=${noop ? "Y" : "N"} served=${batch.length} pending=${after} (was ${before})`);
+    console.log(`[mt5-server] POLL agent=${agentId} noop=${noop} max=${max} served=${noop ? 0 : batch.length} pending=${after} (was ${before})`);
 
     return res.json({
         ok: true,
@@ -332,23 +325,25 @@ app.post("/ack", (req, res) => {
     res.json({ ok: true, received });
 });
 
-// -------- DEBUG --------
+// -------- DEBUG: peek fila corrente --------
 app.get("/debug/peek", (req, res) => {
-    const agentId = (req.query.agentId as string) || "mt5-ea-1";
+    const agentId = String(req.query.agentId || "mt5-ea-1");
     const bucket = q(agentId);
     res.json({ ok: true, agentId, pending: bucket.length, tasks: bucket });
 });
 
+// -------- DEBUG: métricas --------
 app.get("/debug/stats", (_req, res) => {
     const agents: Record<string, AgentStats> = {};
     for (const [k, v] of STATS.entries()) agents[k] = v;
     res.json({ ok: true, enabled: ENABLED, agents });
 });
 
+// -------- DEBUG: histórico de tasks servidas --------
 app.get("/debug/history", (req, res) => {
-    const agentId = (req.query.agentId as string) || "mt5-ea-1";
-    const arr = HISTORY.get(agentId) || [];
-    res.json({ ok: true, agentId, count: arr.length, items: arr });
+    const agentId = String(req.query.agentId || "mt5-ea-1");
+    const h = hist(agentId);
+    res.json({ ok: true, agentId, count: h.length, items: h });
 });
 
 app.listen(PORT, () => {

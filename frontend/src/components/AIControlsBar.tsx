@@ -4,7 +4,10 @@ import {
   fetchConfirmedSignals,
   runBacktest,
   enqueueMT5Order,
-  debugPeek,
+  execPeek,
+  execPollNoop,
+  execStats,
+  execEnable,
 } from "../services/api";
 import { useAIStore } from "../store/ai";
 import BacktestRunsPanel from "./BacktestRunsPanel";
@@ -52,7 +55,7 @@ type FiltersState = {
   symbol: string;
   timeframe: string;
   from: string | null; // "YYYY-MM-DD" ou null
-  to: string | null;   // "YYYY-MM-DD" ou null
+  to: string | null; // "YYYY-MM-DD" ou null
 };
 type FiltersAPI = {
   get: () => FiltersState;
@@ -163,9 +166,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // Execução MT5
   const [execEnabled, setExecEnabled] = React.useState<boolean>(!!execEnabled0);
-  const [execAgentId, setExecAgentId] = React.useState<string>(execAgentId0 || "mt5-ea-1");
+  const [execAgentId, setExecAgentId] = React.useState<string>(
+    execAgentId0 || "mt5-ea-1"
+  );
   const [execLots, setExecLots] = React.useState<number>(Number(execLots0) || 1);
   const [execMsg, setExecMsg] = React.useState<string | null>(null);
+
+  // Estado fila/telemetria
+  const [execPending, setExecPending] = React.useState<number>(0);
+  const [lastPeekAt, setLastPeekAt] = React.useState<number | null>(null);
+  const [serverEnabled, setServerEnabled] = React.useState<boolean | null>(null);
 
   // -------- Auto-refresh --------
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
@@ -251,7 +261,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         execLots,
       };
 
-      // 1) Projetados — overrides temporários
+      // 1) Projetados — overrides temporários pra liberar SELL por enquanto
       const payload: any = {
         ...params,
         rr,
@@ -346,14 +356,13 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // --- helper: monta task no formato que o EA/NodeBridge consome ---
   function makeMt5Task(side: "BUY" | "SELL") {
-    const p = baseParams();
     return {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       side,
       comment: `ui-test ${side} ${new Date().toISOString()}`,
       beAtPoints: breakEvenAtPts,
       beOffsetPoints: beOffsetPts,
-      //symbol: p.symbol || undefined, // geralmente omitimos; EA usa _Symbol
+      //symbol: p.symbol || undefined,   // usar _Symbol do gráfico
       timeframe: null,
       time: null,
       price: 0,
@@ -366,7 +375,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   // Enfileirar ordem de teste no MT5 (payload { agentId, tasks: [...] })
   async function onExecTest(side: "BUY" | "SELL") {
     setExecMsg(null);
-    if (!execEnabled) { setExecMsg("Execução desativada (ligue o toggle)."); return; }
+    if (!execEnabled) {
+      setExecMsg("Execução desativada (ligue o toggle).");
+      return;
+    }
 
     const body = {
       agentId: (execAgentId || "mt5-ea-1").trim(),
@@ -376,23 +388,23 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     try {
       const res = await enqueueMT5Order(body);
       setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
-      window.dispatchEvent(new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } }));
+      window.dispatchEvent(
+        new CustomEvent("daytrade:mt5-enqueue", {
+          detail: { when: Date.now(), body, res },
+        })
+      );
+      // após enfileirar, atualiza peek
+      try {
+        const pk = await execPeek(execAgentId || "mt5-ea-1");
+        setExecPending(pk?.pending ?? 0);
+        setLastPeekAt(Date.now());
+      } catch { }
     } catch (e: any) {
       const msg =
         (e?.message || "Falha no enqueue") +
         (e?.urlTried ? ` @ ${e.urlTried}` : "") +
         (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
       setExecMsg(`ERRO ${side}: ${msg}`);
-    }
-  }
-
-  // Peek fila do agente atual
-  async function onPeekQueue() {
-    try {
-      const res = await debugPeek(execAgentId);
-      setExecMsg(`PEEK: agent=${res?.agentId} pending=${res?.pending}`);
-    } catch (e: any) {
-      setExecMsg(`PEEK ERRO: ${(e?.message || "falha")}`);
     }
   }
 
@@ -459,6 +471,74 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     beOffsetPts,
   ]);
 
+  // Ao montar, tenta detectar se o servidor está ligado e captura pending inicial
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const st = await execStats();
+        setServerEnabled(!!st?.enabled);
+      } catch {
+        setServerEnabled(null);
+      }
+      try {
+        const pk = await execPeek(execAgentId || "mt5-ea-1");
+        setExecPending(pk?.pending ?? 0);
+        setLastPeekAt(Date.now());
+      } catch { }
+    })();
+  }, [execAgentId]);
+
+  // Listener pra atualizar fila após enfileirar por outros componentes
+  React.useEffect(() => {
+    function onEnq() {
+      execPeek(execAgentId || "mt5-ea-1")
+        .then((pk) => {
+          setExecPending(pk?.pending ?? 0);
+          setLastPeekAt(Date.now());
+        })
+        .catch(() => { });
+    }
+    window.addEventListener("daytrade:mt5-enqueue" as any, onEnq);
+    return () => window.removeEventListener("daytrade:mt5-enqueue" as any, onEnq);
+  }, [execAgentId]);
+
+  async function onPeekNow() {
+    try {
+      const pk = await execPeek(execAgentId || "mt5-ea-1");
+      setExecPending(pk?.pending ?? 0);
+      setLastPeekAt(Date.now());
+      setExecMsg(`peek: pending=${pk?.pending ?? 0}`);
+    } catch (e: any) {
+      setExecMsg(`peek erro: ${e?.message || "?"}`);
+    }
+  }
+
+  async function onPollNoop() {
+    try {
+      const res = await execPollNoop(execAgentId || "mt5-ea-1", 10);
+      setExecMsg(
+        `noop served=${res?.served ?? 0} tasks=${(res?.tasks || []).length}`
+      );
+      // noop não drena; reflete o pending atual:
+      const pk = await execPeek(execAgentId || "mt5-ea-1");
+      setExecPending(pk?.pending ?? 0);
+      setLastPeekAt(Date.now());
+      console.log("[poll noop]", res);
+    } catch (e: any) {
+      setExecMsg(`noop erro: ${e?.message || "?"}`);
+    }
+  }
+
+  async function onServerEnableToggle() {
+    try {
+      const res = await execEnable(true);
+      setServerEnabled(!!res?.enabled);
+      setExecMsg(`exec server enabled=${!!res?.enabled}`);
+    } catch (e: any) {
+      setExecMsg(`enable erro: ${e?.message || "?"}`);
+    }
+  }
+
   return (
     <>
       <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>
@@ -474,6 +554,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               </button>
               <strong>IA</strong>
 
+              {/* Botão painel Backtests */}
               <button
                 className="btn btn-sm btn-outline-primary ms-2"
                 onClick={() => setShowBacktests((v) => !v)}
@@ -616,7 +697,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     step={1}
                     className="form-control"
                     value={breakEvenAtPts}
-                    onChange={(e) => setBreakEvenAtPts(Number(e.target.value) || 0)}
+                    onChange={(e) =>
+                      setBreakEvenAtPts(Number(e.target.value) || 0)
+                    }
                   />
                 </div>
 
@@ -734,13 +817,44 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   SELL (teste)
                 </button>
 
-                <button
-                  className="btn btn-sm btn-outline-secondary"
-                  onClick={onPeekQueue}
-                  title="Inspecionar fila no servidor EXEC"
-                >
-                  Peek fila
-                </button>
+                {/* Controles de fila/diagnóstico */}
+                <div className="vr mx-2" />
+                <div className="d-flex align-items-center gap-2">
+                  <span className="badge text-bg-secondary">
+                    Fila MT5: {execPending}
+                  </span>
+                  <button
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={onPeekNow}
+                    title="Ler fila atual (debug/peek)"
+                  >
+                    Peek
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={onPollNoop}
+                    title="Simular poll sem drenar (poll?noop=1)"
+                  >
+                    Poll (noop)
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={onServerEnableToggle}
+                    title="Habilitar execução no servidor"
+                  >
+                    Ligar Exec Server
+                  </button>
+                  <small className="text-muted">
+                    {serverEnabled === null
+                      ? "srv:?"
+                      : serverEnabled
+                        ? "srv:ON"
+                        : "srv:OFF"}
+                    {lastPeekAt
+                      ? ` · peek:${new Date(lastPeekAt).toLocaleTimeString()}`
+                      : ""}
+                  </small>
+                </div>
 
                 {execMsg && (
                   <span
