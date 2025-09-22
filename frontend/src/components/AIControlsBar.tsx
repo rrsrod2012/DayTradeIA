@@ -22,7 +22,8 @@ function fmtDate(d: Date) {
    Helpers de persistência (LS)
    ============================ */
 const LS_FILTERS_KEY = "ai/controls/filters/v2";
-const LS_PARAMS_KEY = "ai/controls/params/v2";
+/** bump de versão pq adicionamos novos params (BB e patterns) */
+const LS_PARAMS_KEY = "ai/controls/params/v3";
 
 /** Auto-exec: memória de dedupe e “armado desde” */
 const LS_EXEC_SENT_KEYS = "ai/exec/sentKeys/v1";
@@ -159,11 +160,17 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execLots: execLots0,
     execMaxAgeSec: execMaxAgeSec0,
 
-    // >>> novos: SL/TP da tela
+    // SL/TP da tela
     sendStops: sendStops0,
     slPts: slPts0,
     tpPts: tpPts0,
     tpViaRR: tpViaRR0,
+
+    // NOVOS: Bollinger + Candle patterns
+    bbEnabled: bbEnabled0,
+    bbPeriod: bbPeriod0,
+    bbK: bbK0,
+    candlePatterns: candlePatterns0,
   } = lsGet(LS_PARAMS_KEY, {
     rr: 2,
     minProb: 0.52,
@@ -186,6 +193,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     slPts: 0,
     tpPts: 0,
     tpViaRR: true,
+
+    // defaults Bollinger/patterns
+    bbEnabled: false,
+    bbPeriod: 20,
+    bbK: 2,
+    candlePatterns: "engulfing,hammer,doji",
   });
 
   const [rr, setRr] = React.useState<number>(rr0);
@@ -196,7 +209,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [requireMtf, setRequireMtf] = React.useState<boolean>(requireMtf0);
   const [confirmTf, setConfirmTf] = React.useState<string>(confirmTf0);
 
-  // >>> BE por pontos (para o backtest e envio)
+  // BE por pontos (para o backtest e envio)
   const [breakEvenAtPts, setBreakEvenAtPts] = React.useState<number>(breakEvenAtPts0);
   const [beOffsetPts, setBeOffsetPts] = React.useState<number>(beOffsetPts0);
 
@@ -207,24 +220,30 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [execMaxAgeSec, setExecMaxAgeSec] = React.useState<number>(Number(execMaxAgeSec0) || 20);
   const [execMsg, setExecMsg] = React.useState<string | null>(null);
 
-  // >>> Novos controles de SL/TP
+  // SL/TP
   const [sendStops, setSendStops] = React.useState<boolean>(!!sendStops0);
   const [slPts, setSlPts] = React.useState<number>(Number(slPts0) || 0);
   const [tpPts, setTpPts] = React.useState<number>(Number(tpPts0) || 0);
   const [tpViaRR, setTpViaRR] = React.useState<boolean>(!!tpViaRR0);
 
-  // -------- Auto-refresh --------
+  // NOVOS: Bollinger + Candle patterns
+  const [bbEnabled, setBbEnabled] = React.useState<boolean>(!!bbEnabled0);
+  const [bbPeriod, setBbPeriod] = React.useState<number>(Number(bbPeriod0) || 20);
+  const [bbK, setBbK] = React.useState<number>(Number(bbK0) || 2);
+  const [candlePatterns, setCandlePatterns] = React.useState<string>(String(candlePatterns0 || ""));
+
+  // Auto-refresh
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
   const [refreshSec, setRefreshSec] = React.useState<number>(refreshSec0);
 
-  // -------- Estado geral --------
+  // Estado geral
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
-  // -------- Painel Backtests --------
+  // Painel Backtests
   const [showBacktests, setShowBacktests] = React.useState(false);
 
-  // -------- Último envio efetivo ao EA (reflete o que o MT5 recebeu) --------
+  // Último envio efetivo ao EA (espelho do envelope)
   const [lastSent, setLastSent] = React.useState<LastSent | null>(null);
 
   const setProjected = useAIStore((s) => s.setProjected);
@@ -251,11 +270,17 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       execLots,
       execMaxAgeSec,
 
-      // novos
+      // stops
       sendStops,
       slPts,
       tpPts,
       tpViaRR,
+
+      // bb/patterns
+      bbEnabled,
+      bbPeriod,
+      bbK,
+      candlePatterns,
     });
   }, [
     rr,
@@ -277,6 +302,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     slPts,
     tpPts,
     tpViaRR,
+    bbEnabled,
+    bbPeriod,
+    bbK,
+    candlePatterns,
   ]);
 
   const baseParams = React.useCallback(
@@ -291,7 +320,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   /** ------------- AUTO-EXEC HELPERS ------------- */
 
-  // chave de dedupe por confirmação (inclui symbol e tf ativos)
   function execKeyForConfirm(s: { side: string; time: string | undefined; price?: number | null }) {
     const p = baseParams();
     const t = s.time ? new Date(s.time).toISOString() : "";
@@ -385,7 +413,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       try {
         const res = await enqueueMT5Order(body);
         setExecMsg(`AUTO ${side}: ${JSON.stringify(res)}`);
-        // guarda último envio (espelho do que foi para o EA)
         setLastSent({
           at: new Date().toISOString(),
           agentId: body.agentId,
@@ -398,7 +425,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
           comment: task.comment,
           taskId,
         });
-        // evento para quem quiser ouvir
         window.dispatchEvent(
           new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
         );
@@ -454,6 +480,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         execLots,
         execMaxAgeSec,
 
+        // bb/patterns
+        bbEnabled,
+        bbPeriod,
+        bbK,
+        candlePatterns,
+
         // visuais
         sendStops,
         slPts,
@@ -467,7 +499,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         },
       };
 
-      // 1) Projetados — overrides temporários
+      // 1) Projetados — agora enviamos os filtros/gates como estão
       const payload: any = {
         ...params,
         rr,
@@ -477,18 +509,20 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         vwapFilter,
         requireMtf,
         confirmTf: String(confirmTf || "").trim().toUpperCase(),
+        // novos
+        bbEnabled,
+        bbPeriod,
+        bbK,
+        candlePatterns,
       };
       if (payload.minEV === 0) delete payload.minEV;
-      payload.vwapFilter = false;
-      payload.requireMtf = false;
-      delete payload.confirmTf;
 
       const proj = await projectedSignals(payload);
 
       if (process.env.NODE_ENV !== "production") {
         const buy = (proj || []).filter((r) => r.side === "BUY").length;
         const sell = (proj || []).filter((r) => r.side === "SELL").length;
-        console.log("[AIControlsBar] projected fetched (TEMP PATCH)", {
+        console.log("[AIControlsBar] projected fetched", {
           sent: payload,
           received: (proj || []).length,
           buy,
@@ -506,16 +540,19 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         vwapFilter,
         requireMtf,
         confirmTf,
+        bbEnabled,
+        bbPeriod,
+        bbK,
+        candlePatterns,
       });
 
-      // 2) Confirmados — passamos extras como any para não brigar com o tipo do api.ts
+      // 2) Confirmados — (se backend suportar) SL/TP também segue
       const confRaw = await fetchConfirmedSignals({
-        ...(params as any),
+        ...params,
         limit: 2000,
-        // estes campos são ignorados pelo tipo atual do api.ts, mas úteis se seu backend suportar
         slPoints: slPtsToSend ?? 0,
         tpPoints: tpPtsToSend ?? 0,
-      } as any);
+      });
       (window as any).__dbgConfirmedRaw = confRaw;
 
       setConfirmed(confRaw || [], {
@@ -526,19 +563,26 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         rr,
       });
 
-      // >>> 2.1) AUTO-EXEC: dispara a partir dos confirmados frescos
+      // 2.1) AUTO-EXEC
       await autoExecFromConfirmed(confRaw || []);
 
-      // 3) Backtest — inclui BE e SL/TP (seu backend pode ignorar SL/TP caso não implemente)
+      // 3) Backtest — inclui BE + SL/TP + BB/patterns/VWAP/MTF
       const bt = await runBacktest({
-        ...(params as any),
+        ...params,
         breakEvenAtPts,
         beOffsetPts,
         slPoints: slPtsToSend ?? 0,
         tpPoints: tpPtsToSend ?? 0,
         tpViaRR,
         rr,
-      } as any);
+
+        // gates/indicadores
+        vwapFilter,
+        bbEnabled,
+        bbPeriod,
+        bbK,
+        candlePatterns,
+      });
 
       const rawTrades =
         (Array.isArray(bt?.trades) && bt?.trades) ||
@@ -576,6 +620,11 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         rrApplied: rr,
         beAtPointsApplied: breakEvenAtPts,
         beOffsetApplied: beOffsetPts,
+        bbApplied: !!bbEnabled,
+        bbPeriodApplied: bbPeriod,
+        bbKApplied: bbK,
+        vwapApplied: !!vwapFilter,
+        patternsApplied: candlePatterns || "",
       });
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
@@ -624,7 +673,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     try {
       const res = await enqueueMT5Order(body);
       setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
-      // espelho do último envio
       setLastSent({
         at: new Date().toISOString(),
         agentId: body.agentId,
@@ -692,6 +740,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     slPts,
     tpPts,
     tpViaRR,
+    bbEnabled,
+    bbPeriod,
+    bbK,
+    candlePatterns,
   ]);
 
   // Invalidação por evento vindo do backend/WS
@@ -726,6 +778,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     slPts,
     tpPts,
     tpViaRR,
+    bbEnabled,
+    bbPeriod,
+    bbK,
+    candlePatterns,
   ]);
 
   return (
@@ -901,6 +957,57 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   />
                 </div>
 
+                {/* --------- Bollinger & Patterns --------- */}
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="bb-toggle"
+                    checked={bbEnabled}
+                    onChange={(e) => setBbEnabled(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="bb-toggle">
+                    Bollinger
+                  </label>
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 120 }}>
+                  <span className="input-group-text">BB P</span>
+                  <input
+                    type="number"
+                    min={5}
+                    step={1}
+                    className="form-control"
+                    value={bbPeriod}
+                    onChange={(e) => setBbPeriod(Math.max(5, Number(e.target.value) || 20))}
+                    disabled={!bbEnabled}
+                  />
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 120 }}>
+                  <span className="input-group-text">BB k</span>
+                  <input
+                    type="number"
+                    min={0.5}
+                    step={0.1}
+                    className="form-control"
+                    value={bbK}
+                    onChange={(e) => setBbK(Math.max(0.1, Number(e.target.value) || 2))}
+                    disabled={!bbEnabled}
+                  />
+                </div>
+
+                <div className="input-group input-group-sm" style={{ width: 260 }}>
+                  <span className="input-group-text">Patterns</span>
+                  <input
+                    className="form-control"
+                    placeholder="engulfing,hammer,doji"
+                    value={candlePatterns}
+                    onChange={(e) => setCandlePatterns(e.target.value)}
+                  />
+                </div>
+                {/* --------------------------------------- */}
+
                 <div className="vr mx-1" />
 
                 {/* Auto refresh */}
@@ -1003,7 +1110,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                   <span className="input-group-text">s</span>
                 </div>
 
-                {/* >>> novos: SL/TP da tela */}
+                {/* SL/TP da tela */}
                 <div className="form-check form-switch">
                   <input
                     className="form-check-input"

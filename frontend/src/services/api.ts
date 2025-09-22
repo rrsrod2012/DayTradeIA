@@ -42,6 +42,12 @@ export type ProjectedSignalsParams = {
   vwapFilter?: boolean;
   requireMtf?: boolean;
   confirmTf?: string;
+
+  // >>> novos (pass-through; backend pode ignorar sem quebrar)
+  bbEnabled?: boolean;
+  bbPeriod?: number;
+  bbK?: number;
+  candlePatterns?: string; // "engulfing,hammer,star,doji"
 };
 
 export type ExecPeekResponse = {
@@ -78,6 +84,59 @@ declare global {
   }
 }
 
+/* ===============================
+   Backtest — tipos (frontend)
+   =============================== */
+export type BacktestTradeDTO = {
+  id?: number | string;
+  side: "BUY" | "SELL";
+  entryTime: string;
+  exitTime: string;
+  entryPrice: number;
+  exitPrice: number;
+  pnl?: number;          // alguns backends mandam "pnl"
+  pnlPoints?: number;    // outros mandam "pnlPoints"
+  note?: string | null;  // motivo/nota direta
+  reason?: string | null; // alias usado por alguns payloads
+  conditionText?: string | null; // outro alias possível
+  comment?: string | null;       // outro alias possível
+  movedToBE?: boolean;
+  trailEvents?: number;
+};
+
+export type BacktestDTO = {
+  ok: boolean;
+  id: string;
+  ts: string;
+  version: string;
+  symbol: string;
+  timeframe: string;
+  from: string; // ISO
+  to: string;   // ISO
+  candles: number;
+  trades: BacktestTradeDTO[];
+  summary: {
+    trades: number;
+    wins: number;
+    losses: number;
+    ties: number;
+    winRate: number;
+    pnlPoints: number;
+    avgPnL: number;
+    profitFactor: number | "Infinity";
+    maxDrawdown: number;
+  };
+  pnlPoints: number;
+  pnlMoney: number;
+  lossCapApplied?: number;
+  maxConsecLossesApplied?: number;
+  policy?: any;
+  config?: any;
+};
+
+/* ===============================
+   Bases/URLs
+   =============================== */
 const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
 const API_BASE = String(RAW_API_BASE || "").replace(/\/$/, "");
 const RAW_EXEC_BASE = (import.meta as any).env?.VITE_EXEC_BASE ?? API_BASE;
@@ -226,6 +285,10 @@ export async function fetchConfirmedSignals(params: {
   from?: string;
   to?: string;
   limit?: number;
+
+  // >>> novos (apenas para alinhamento visual/legendas; o backend pode ignorar)
+  slPoints?: number;
+  tpPoints?: number;
 }): Promise<ConfirmedSignal[]> {
   const q = new URLSearchParams();
   q.set("symbol", params.symbol.toUpperCase());
@@ -233,6 +296,8 @@ export async function fetchConfirmedSignals(params: {
   if (params.from) q.set("from", params.from);
   if (params.to) q.set("to", params.to);
   if (params.limit) q.set("limit", String(params.limit));
+  if (params.slPoints != null) q.set("slPoints", String(params.slPoints));
+  if (params.tpPoints != null) q.set("tpPoints", String(params.tpPoints));
 
   const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, {
     method: "GET",
@@ -262,68 +327,120 @@ export async function fetchConfirmedSignals(params: {
   });
 }
 
+/* =========================================
+   Backtest — normalização de payload
+   ========================================= */
+function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeDTO & { pnlPoints: number; note: string | null; id: number | string } {
+  const pnlPoints =
+    Number.isFinite(t.pnlPoints as any)
+      ? Number(t.pnlPoints)
+      : Number(t.pnl ?? 0);
+
+  const noteRaw =
+    t.note ??
+    t.reason ??
+    t.conditionText ??
+    t.comment ??
+    null;
+
+  return {
+    id: t.id ?? idx + 1,
+    side: t.side,
+    entryTime: t.entryTime,
+    exitTime: t.exitTime,
+    entryPrice: Number(t.entryPrice),
+    exitPrice: Number(t.exitPrice),
+    pnlPoints, // garantido
+    note: noteRaw && String(noteRaw).trim() !== "" ? String(noteRaw).trim() : null,
+    movedToBE: !!t.movedToBE,
+    trailEvents: t.trailEvents ?? 0,
+    // mantemos campos originais para compatibilidade
+    pnl: t.pnl ?? pnlPoints,
+    reason: t.reason ?? null,
+    conditionText: t.conditionText ?? null,
+    comment: t.comment ?? null,
+  };
+}
+
+function normalizeBacktestPayload(raw: any): BacktestDTO {
+  // alguns backends podem embutir retorno em {ok:true, ...}, outros em {data:{...}}
+  const dto: any =
+    (raw && raw.data && typeof raw.data === "object" && raw.data) ||
+    raw;
+
+  const tradesArr: any[] =
+    (Array.isArray(dto?.trades) && dto.trades) ||
+    dto?.items ||
+    dto?.rows ||
+    [];
+
+  const trades = tradesArr.map(mapBacktestTrade);
+
+  // garante campos numéricos
+  const pnlPointsTop = Number(dto?.pnlPoints ?? dto?.summary?.pnlPoints ?? 0);
+  const pnlMoneyTop = Number(dto?.pnlMoney ?? 0);
+
+  return {
+    ok: dto?.ok !== false,
+    id: String(dto?.id ?? `run-${Date.now()}`),
+    ts: String(dto?.ts ?? new Date().toISOString()),
+    version: String(dto?.version ?? "unknown"),
+    symbol: String(dto?.symbol ?? ""),
+    timeframe: String(dto?.timeframe ?? ""),
+    from: String(dto?.from ?? new Date().toISOString()),
+    to: String(dto?.to ?? new Date().toISOString()),
+    candles: Number(dto?.candles ?? 0),
+    trades,
+    summary: {
+      trades: Number(dto?.summary?.trades ?? trades.length),
+      wins: Number(dto?.summary?.wins ?? trades.filter((t: any) => (t.pnlPoints ?? 0) > 0).length),
+      losses: Number(dto?.summary?.losses ?? trades.filter((t: any) => (t.pnlPoints ?? 0) < 0).length),
+      ties: Number(dto?.summary?.ties ?? trades.filter((t: any) => (t.pnlPoints ?? 0) === 0).length),
+      winRate: Number(dto?.summary?.winRate ?? 0),
+      pnlPoints: Number(dto?.summary?.pnlPoints ?? pnlPointsTop),
+      avgPnL: Number(dto?.summary?.avgPnL ?? (trades.length ? (trades.reduce((a: number, b: any) => a + Number(b.pnlPoints ?? 0), 0) / trades.length) : 0)),
+      profitFactor: dto?.summary?.profitFactor ?? 0,
+      maxDrawdown: Number(dto?.summary?.maxDrawdown ?? 0),
+    },
+    pnlPoints: pnlPointsTop,
+    pnlMoney: pnlMoneyTop,
+    lossCapApplied: dto?.lossCapApplied ?? 0,
+    maxConsecLossesApplied: dto?.maxConsecLossesApplied ?? 0,
+    policy: dto?.policy ?? undefined,
+    config: dto?.config ?? undefined,
+  };
+}
+
 /** ===========================
  * Backtest com política completa
  * =========================== */
 export async function runBacktest(params: {
-  symbol: string;
-  timeframe: string;
-  from?: string;
-  to?: string;
-
-  // custos / limites diários
-  pointValue?: number;
-  costPts?: number;
-  slippagePts?: number;
-  lossCap?: number;
-  maxConsecLosses?: number;
-
-  // política de saída
-  rr?: number;
-  kSL?: number;
-  kTrail?: number;
-  breakEvenAtR?: number;
-  beOffsetR?: number;
-  breakEvenAtPts?: number | null;
-  beOffsetPts?: number | null;
-  timeStopBars?: number;
-  horizonBars?: number;
-
-  // filtros/IA
-  evalWindow?: number;
-  regime?: any;
-  tod?: any;
-  conformal?: any;
-  minProb?: number;
-  minEV?: number;
-  useMicroModel?: boolean;
-  vwapFilter?: boolean;
-}) {
+  symbol: string; timeframe: string; from?: string; to?: string;
+  pointValue?: number; costPts?: number; slippagePts?: number; lossCap?: number; maxConsecLosses?: number;
+  rr?: number; kSL?: number; kTrail?: number; breakEvenAtR?: number; beOffsetR?: number;
+  breakEvenAtPts?: number | null; beOffsetPts?: number | null; timeStopBars?: number; horizonBars?: number;
+  evalWindow?: number; regime?: any; tod?: any; conformal?: any; minProb?: number; minEV?: number; useMicroModel?: boolean;
+  vwapFilter?: boolean; bbEnabled?: boolean; bbPeriod?: number; bbK?: number; candlePatterns?: string;
+  slPoints?: number; tpPoints?: number; tpViaRR?: boolean;
+}): Promise<BacktestDTO> {
   const body = JSON.stringify(params);
 
-  // 1) POST /api/backtest (preferido)
-  try {
-    return await jsonFetch<any>("/api/backtest", { method: "POST", body });
-  } catch (e: any) {
-    if (process.env.NODE_ENV !== "production") {
-      console.warn("[api] POST /api/backtest falhou", e?.status, e?.urlTried || "");
-    }
-  }
-
-  // 2) GET /backtest?query (fallback)
-  try {
+  // helpers
+  const post = (base: string, path: string) =>
+    jsonFetchBase<any>(base, path, { method: "POST", body });
+  const getQ = (base: string, path: string) => {
     const q = new URLSearchParams();
     q.set("symbol", params.symbol.toUpperCase());
     q.set("timeframe", params.timeframe.toUpperCase());
     if (params.from) q.set("from", params.from);
     if (params.to) q.set("to", params.to);
-
+    // custos / limites
     if (params.pointValue != null) q.set("pointValue", String(params.pointValue));
     if (params.costPts != null) q.set("costPts", String(params.costPts));
     if (params.slippagePts != null) q.set("slippagePts", String(params.slippagePts));
     if (params.lossCap != null) q.set("lossCap", String(params.lossCap));
     if (params.maxConsecLosses != null) q.set("maxConsecLosses", String(params.maxConsecLosses));
-
+    // política
     if (params.rr != null) q.set("rr", String(params.rr));
     if (params.kSL != null) q.set("kSL", String(params.kSL));
     if (params.kTrail != null) q.set("kTrail", String(params.kTrail));
@@ -333,7 +450,7 @@ export async function runBacktest(params: {
     if (params.beOffsetPts != null) q.set("beOffsetPts", String(params.beOffsetPts));
     if (params.timeStopBars != null) q.set("timeStopBars", String(params.timeStopBars));
     if (params.horizonBars != null) q.set("horizonBars", String(params.horizonBars));
-
+    // filtros/IA
     if (params.evalWindow != null) q.set("evalWindow", String(params.evalWindow));
     if (params.regime != null) q.set("regime", String(params.regime));
     if (params.tod != null) q.set("tod", String(params.tod));
@@ -341,17 +458,47 @@ export async function runBacktest(params: {
     if (params.minProb != null) q.set("minProb", String(params.minProb));
     if (params.minEV != null) q.set("minEV", String(params.minEV));
     if (params.useMicroModel != null) q.set("useMicroModel", String(params.useMicroModel ? 1 : 0));
+    // indicadores/gates
     if (params.vwapFilter != null) q.set("vwapFilter", String(params.vwapFilter ? 1 : 0));
+    if (params.bbEnabled != null) q.set("bbEnabled", String(params.bbEnabled ? 1 : 0));
+    if (params.bbPeriod != null) q.set("bbPeriod", String(params.bbPeriod));
+    if (params.bbK != null) q.set("bbK", String(params.bbK));
+    if (params.candlePatterns) q.set("candlePatterns", params.candlePatterns);
+    // stops explícitos
+    if (params.slPoints != null) q.set("slPoints", String(params.slPoints));
+    if (params.tpPoints != null) q.set("tpPoints", String(params.tpPoints));
+    if (params.tpViaRR != null) q.set("tpViaRR", String(params.tpViaRR ? 1 : 0));
+    return jsonFetchBase<any>(base, `${path}?${q.toString()}`, { method: "GET" });
+  };
 
-    return await jsonFetch<any>(`/backtest?${q.toString()}`, { method: "GET" });
-  } catch (e: any) {
-    if (process.env.NODE_ENV !== "production") {
-      console.warn("[api] GET /backtest falhou", e?.status, e?.urlTried || "");
-    }
-  }
+  // ORDEM DE TENTATIVA:
+  // 1) EXEC_BASE -> /api/backtest (preferido)
+  try { return normalizeBacktestPayload(await post(EXEC_BASE, "/api/backtest")); }
+  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] POST EXEC /api/backtest falhou", e?.status, e?.urlTried || ""); }
 
-  // 3) POST /backtest (último fallback)
-  return jsonFetch<any>("/backtest", { method: "POST", body });
+  // 2) EXEC_BASE -> GET /api/backtest
+  try { return normalizeBacktestPayload(await getQ(EXEC_BASE, "/api/backtest")); }
+  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] GET EXEC /api/backtest falhou", e?.status, e?.urlTried || ""); }
+
+  // 3) EXEC_BASE -> /backtest (alias no broker)
+  try { return normalizeBacktestPayload(await post(EXEC_BASE, "/backtest")); }
+  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] POST EXEC /backtest falhou", e?.status, e?.urlTried || ""); }
+
+  try { return normalizeBacktestPayload(await getQ(EXEC_BASE, "/backtest")); }
+  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] GET EXEC /backtest falhou", e?.status, e?.urlTried || ""); }
+
+  // 4) API_BASE (fallback final — caso você também tenha montado lá)
+  try { return normalizeBacktestPayload(await post(API_BASE, "/api/backtest")); } catch { }
+  try { return normalizeBacktestPayload(await getQ(API_BASE, "/api/backtest")); } catch { }
+  try { return normalizeBacktestPayload(await post(API_BASE, "/backtest")); } catch { }
+  return normalizeBacktestPayload(await getQ(API_BASE, "/backtest")); // joga última tentativa
+}
+
+/** (opcional) lista execuções de backtest salvas */
+export async function fetchBacktestRuns(limit = 100) {
+  const q = new URLSearchParams();
+  q.set("limit", String(limit));
+  return jsonFetchBase<any>(EXEC_BASE, `/api/backtest/runs?${q.toString()}`, { method: "GET" });
 }
 
 /** ===========================
@@ -391,10 +538,7 @@ function mapSymbolForBroker(sym: string): string {
    Execução MT5 — client
    ========================= */
 export async function execEnable(on?: boolean) {
-  const qs =
-    on === undefined
-      ? ""
-      : `?on=${on ? "1" : "0"}`;
+  const qs = on === undefined ? "" : `?on=${on ? "1" : "0"}`;
   return jsonFetchBase<any>(EXEC_BASE, `/enable${qs}`, { method: "GET" });
 }
 

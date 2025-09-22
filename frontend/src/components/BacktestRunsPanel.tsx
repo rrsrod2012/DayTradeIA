@@ -1,11 +1,34 @@
 import React from "react";
 
+// Descobre a base do broker/backtest (porta 3002)
+const RAW_EXEC_BASE = (import.meta as any).env?.VITE_EXEC_BASE ?? "";
+const EXEC_BASE = String(RAW_EXEC_BASE || "").replace(/\/$/, "");
+
+// helpers HTTP simples contra EXEC_BASE
+async function execGet(path: string) {
+    const url = `${EXEC_BASE}${path.startsWith("/") ? path : "/" + path}`;
+    const r = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok) {
+        const msg = data?.error || `${r.status} ${r.statusText}`;
+        const err: any = new Error(msg);
+        err.status = r.status;
+        err.url = url;
+        err.response = data;
+        throw err;
+    }
+    return data;
+}
+
 /**
  * Painel para listar execuções de backtest (mais recentes primeiro)
  * - Filtros client-side por símbolo/TF
  * - Botão "Ver" carrega o snapshot e mostra resumo + trades
  * - Auto-refresh opcional
- * - Endpoints:
+ * - Endpoints (no EXEC_BASE):
  *    GET /api/backtest/runs?limit=100
  *    GET /api/backtest/run/:id
  */
@@ -46,18 +69,12 @@ type Trade = {
     exitPrice: number;
     pnl: number;
     note?: string;
-
-    // --- campos opcionais (flags/telemetria de saída) ---
     movedToBE?: boolean;
     trailEvents?: number;
     partials?: PartialFill[];
 };
 
-//
-// NOVO: política de saída com compatibilidade de nomes
-//
 type ExitPolicy = {
-    // nomes novos (recomendados)
     beAtR?: number;
     beOffset?: number;
     trailAtrK?: number;
@@ -66,8 +83,6 @@ type ExitPolicy = {
     emaExit?: boolean;
     vwapExit?: boolean;
     rr?: number;
-
-    // nomes legados (se o backend ainda mandar)
     kSL?: number;
     kTrail?: number;
     breakEvenAtR?: number;
@@ -96,8 +111,6 @@ type BacktestRunSnapshot = {
     pnlMoney?: number;
     lossCapApplied?: number;
     maxConsecLossesApplied?: number;
-
-    // configuração aplicada pelo motor (opcional)
     config?: {
         vwapFilter?: boolean;
         minProb?: number;
@@ -127,13 +140,8 @@ function n2(x: any, digits = 2) {
     const v = Number(x);
     return Number.isFinite(v) ? v.toFixed(digits) : String(x ?? "-");
 }
-
 function hasExtraTradeInfo(t: Trade) {
-    return !!(
-        t?.movedToBE ||
-        (t?.trailEvents && t.trailEvents > 0) ||
-        (t?.partials && t.partials.length > 0)
-    );
+    return !!(t?.movedToBE || (t?.trailEvents && t.trailEvents > 0) || (t?.partials && t.partials.length > 0));
 }
 function flagsForTrade(t: Trade) {
     const bits: string[] = [];
@@ -142,8 +150,6 @@ function flagsForTrade(t: Trade) {
     if (t.partials && t.partials.length > 0) bits.push(`P${t.partials.length}`);
     return bits.join(" · ");
 }
-
-// util local para CSV
 function toCSV(rows: Record<string, any>[], headers: string[]) {
     const esc = (v: any) => {
         if (v == null) return "";
@@ -174,6 +180,7 @@ export default function BacktestRunsPanel() {
     const [selectedId, setSelectedId] = React.useState<string | null>(null);
     const [selected, setSelected] = React.useState<BacktestRunSnapshot | null>(null);
     const [loadingSel, setLoadingSel] = React.useState(false);
+    const [selErr, setSelErr] = React.useState<string | null>(null);
 
     const [autoRefresh, setAutoRefresh] = React.useState(true);
     const [refreshSec, setRefreshSec] = React.useState(20);
@@ -182,8 +189,8 @@ export default function BacktestRunsPanel() {
         setLoading(true);
         setErr(null);
         try {
-            const r = await fetch(`/api/backtest/runs?limit=100`, { method: "GET" });
-            const data = await r.json();
+            const limit = 100;
+            const data = await execGet(`/api/backtest/runs?limit=${limit}`);
             if (data?.ok) {
                 setRuns(Array.isArray(data.items) ? data.items : []);
             } else {
@@ -191,6 +198,7 @@ export default function BacktestRunsPanel() {
             }
         } catch (e: any) {
             setErr(e?.message || "Erro ao listar backtests");
+            setRuns([]);
         } finally {
             setLoading(false);
         }
@@ -198,9 +206,9 @@ export default function BacktestRunsPanel() {
 
     const loadRunById = React.useCallback(async (id: string) => {
         setLoadingSel(true);
+        setSelErr(null);
         try {
-            const r = await fetch(`/api/backtest/run/${encodeURIComponent(id)}`, { method: "GET" });
-            const data = await r.json();
+            const data = await execGet(`/api/backtest/run/${encodeURIComponent(id)}`);
             if (data?.ok && data?.run) {
                 setSelected(data.run as BacktestRunSnapshot);
             } else {
@@ -208,7 +216,7 @@ export default function BacktestRunsPanel() {
             }
         } catch (e: any) {
             setSelected(null);
-            alert(e?.message || "Erro ao carregar execução");
+            setSelErr(e?.message || "Erro ao carregar execução");
         } finally {
             setLoadingSel(false);
         }
@@ -223,9 +231,7 @@ export default function BacktestRunsPanel() {
             if (!alive) return;
             await loadRuns();
             if (!alive) return;
-            if (autoRefresh) {
-                timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
-            }
+            if (autoRefresh) timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
         };
 
         tick(); // carga imediata
@@ -241,7 +247,6 @@ export default function BacktestRunsPanel() {
         return okSym && okTf;
     });
 
-    // helpers para cartões do resumo
     const pfLabel =
         selected?.summary?.profitFactor === "Infinity"
             ? "Infinity"
@@ -252,7 +257,6 @@ export default function BacktestRunsPanel() {
         [selected]
     );
 
-    // Exportar CSV de trades da execução selecionada
     const exportSelectedTradesCSV = React.useCallback(() => {
         if (!selected) return;
         const rows = (selected.trades || []).map((t) => ({
@@ -381,6 +385,7 @@ export default function BacktestRunsPanel() {
                                             const next = selectedId === r.id ? null : r.id;
                                             setSelectedId(next);
                                             setSelected(null);
+                                            setSelErr(null);
                                             if (next) loadRunById(next);
                                         }}
                                     >
@@ -405,6 +410,11 @@ export default function BacktestRunsPanel() {
                 <div className="card mt-3">
                     <div className="card-body">
                         {loadingSel && <div className="text-muted">Carregando execução...</div>}
+                        {!loadingSel && selErr && (
+                            <div className="alert alert-warning py-2">
+                                {selErr} — o servidor pode não expor <code>/api/backtest/run/:id</code>.
+                            </div>
+                        )}
                         {!loadingSel && selected && (
                             <>
                                 <div className="d-flex flex-wrap justify-content-between">
@@ -425,7 +435,6 @@ export default function BacktestRunsPanel() {
                                     </div>
                                 </div>
 
-                                {/* Chips de configurações aplicadas (se presentes) */}
                                 {(selected.lossCapApplied ||
                                     selected.maxConsecLossesApplied ||
                                     selected.config ||
@@ -464,7 +473,6 @@ export default function BacktestRunsPanel() {
                                                 </>
                                             )}
 
-                                            {/* Política de saída (nomes novos + legados) */}
                                             {(selected.policy) && (
                                                 <>
                                                     {typeof rr === "number" && (
@@ -496,7 +504,6 @@ export default function BacktestRunsPanel() {
                                                         </span>
                                                     )}
 
-                                                    {/* legados extras informativos */}
                                                     {"slippagePts" in selected.policy && Number(selected.policy.slippagePts) > 0 && (
                                                         <span className="badge bg-danger">
                                                             Slippage: {n2(selected.policy.slippagePts, 1)} pts

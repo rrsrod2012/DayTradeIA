@@ -24,6 +24,8 @@ export type Trade = {
   pnlMoney?: number | null;
   rr?: number | null;
   note?: string | null;
+  movedToBE?: boolean;
+  trailEvents?: number | null;
 };
 
 type AIState = {
@@ -40,15 +42,13 @@ type AIState = {
   setProjected: (rows: ProjectedSignal[], params?: Record<string, any>) => void;
   setConfirmed: (rows: ConfirmedSignal[], params?: Record<string, any>) => void;
   setPnL: (summary: PnLSummary) => void;
-  setTrades: (rows: any[], meta?: any) => void; // meta opcional para pointValue
+  setTrades: (rows: any[], meta?: any) => void; // meta opcional para pointValue/summary
   clear: () => void;
 };
 
 // ---- Normalização robusta do lado (nunca “perder” SELL/BUY) ----
 function normSide(raw: any): "BUY" | "SELL" | "FLAT" {
-  const s = String(raw ?? "")
-    .trim()
-    .toUpperCase();
+  const s = String(raw ?? "").trim().toUpperCase();
   if (
     s === "SELL" ||
     s === "SHORT" ||
@@ -118,23 +118,23 @@ function normalizeTrade(row: any): Trade | null {
   const entryTime =
     toISO(
       row.entryTime ??
-        row.openTime ??
-        row.inTime ??
-        row.timeIn ??
-        row.time_open ??
-        row.start ??
-        row.time
+      row.openTime ??
+      row.inTime ??
+      row.timeIn ??
+      row.time_open ??
+      row.start ??
+      row.time
     ) || new Date().toISOString();
 
   const exitTime =
     toISO(
       row.exitTime ??
-        row.closeTime ??
-        row.outTime ??
-        row.timeOut ??
-        row.time_close ??
-        row.end ??
-        row.closeAt
+      row.closeTime ??
+      row.outTime ??
+      row.timeOut ??
+      row.time_close ??
+      row.end ??
+      row.closeAt
     ) || null;
 
   const num = (v: any) => (v === undefined || v === null ? null : Number(v));
@@ -148,11 +148,11 @@ function normalizeTrade(row: any): Trade | null {
 
   const pnlPoints = num(
     row.pnlPoints ??
-      row.pnl_points ??
-      row.points ??
-      row.plPoints ??
-      row.resultPoints ??
-      row.pnl
+    row.pnl_points ??
+    row.points ??
+    row.plPoints ??
+    row.resultPoints ??
+    row.pnl
   );
   const pnlMoney = num(
     row.pnlMoney ?? row.plMoney ?? row.money ?? row.resultMoney
@@ -169,6 +169,11 @@ function normalizeTrade(row: any): Trade | null {
     row.obs ??
     null;
 
+  const movedToBE =
+    (row.movedToBE ?? row.breakEven ?? row.beMoved ?? row.moved_be) ?? null;
+  const trailEvents =
+    (row.trailEvents ?? row.trails ?? row.trail_updates) ?? null;
+
   return {
     side: side as "BUY" | "SELL",
     entryTime,
@@ -178,7 +183,12 @@ function normalizeTrade(row: any): Trade | null {
     pnlPoints,
     pnlMoney,
     rr,
-    note,
+    note: note != null ? String(note) : null,
+    movedToBE: movedToBE != null ? Boolean(movedToBE) : undefined,
+    trailEvents:
+      trailEvents != null && Number.isFinite(Number(trailEvents))
+        ? Number(trailEvents)
+        : null,
   };
 }
 
@@ -258,6 +268,65 @@ function inferDefaultRiskPoints(meta?: any): number | null {
   return null;
 }
 
+/* ---------- Util: resumo PnL derivado (se precisar) ---------- */
+function derivePnLSummary(
+  trades: Trade[],
+  pointValue?: number | null
+): PnLSummary {
+  if (!trades.length) {
+    return {
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      ties: 0,
+      winRate: 0,
+      pnlPoints: 0,
+      pnlMoney: 0,
+      avgPnL: 0,
+      profitFactor: 0,
+      maxDrawdown: 0,
+    };
+  }
+  const vals = trades.map((t) => Number(t.pnlPoints ?? 0));
+  const wins = vals.filter((v) => v > 0).length;
+  const losses = vals.filter((v) => v < 0).length;
+  const ties = vals.filter((v) => v === 0).length;
+  const pnlPoints = Number(vals.reduce((a, b) => a + b, 0).toFixed(2));
+  const avgPnL = Number((pnlPoints / trades.length).toFixed(2));
+  const sumWin = vals.filter((v) => v > 0).reduce((a, b) => a + b, 0);
+  const sumLossAbs = Math.abs(vals.filter((v) => v < 0).reduce((a, b) => a + b, 0));
+  const profitFactor =
+    sumLossAbs > 0 ? Number((sumWin / sumLossAbs).toFixed(3)) : wins > 0 ? Infinity : 0;
+
+  // max drawdown em pontos
+  let peak = 0,
+    dd = 0,
+    run = 0;
+  for (const v of vals) {
+    run += v;
+    peak = Math.max(peak, run);
+    dd = Math.min(dd, run - peak);
+  }
+  const maxDrawdown = Number(dd.toFixed(2));
+  const pnlMoney =
+    pointValue != null && Number.isFinite(pointValue)
+      ? Number((pnlPoints * pointValue).toFixed(2))
+      : undefined;
+
+  return {
+    trades: trades.length,
+    wins,
+    losses,
+    ties,
+    winRate: Number((wins / trades.length || 0).toFixed(4)),
+    pnlPoints,
+    pnlMoney,
+    avgPnL,
+    profitFactor,
+    maxDrawdown,
+  };
+}
+
 const useAIStore = create<AIState>((set) => ({
   lastParams: null,
   projected: [],
@@ -278,7 +347,6 @@ const useAIStore = create<AIState>((set) => ({
         if (side === "BUY") buy++;
         else if (side === "SELL") sell++;
 
-        // Coerção numérica sem engolir 0
         const num = (v: any) =>
           v === undefined || v === null ? null : Number(v);
 
@@ -336,12 +404,12 @@ const useAIStore = create<AIState>((set) => ({
             r?.price != null
               ? Number(r.price)
               : r?.entry != null
-              ? Number(r.entry)
-              : r?.value != null
-              ? Number(r.value)
-              : r?.execPrice != null
-              ? Number(r.execPrice)
-              : null,
+                ? Number(r.entry)
+                : r?.value != null
+                  ? Number(r.value)
+                  : r?.execPrice != null
+                    ? Number(r.execPrice)
+                    : null,
           note: r?.note ?? r?.reason ?? r?.conditionText ?? r?.comment ?? null,
         };
         return out;
@@ -363,16 +431,18 @@ const useAIStore = create<AIState>((set) => ({
 
   setTrades: (rows, meta) =>
     set((state) => {
-      // detecta coleção
+      // detecta coleção (agora também suporta rows.trades)
       const src = Array.isArray(rows)
         ? rows
-        : Array.isArray(rows?.data)
-        ? rows.data
-        : Array.isArray(rows?.rows)
-        ? rows.rows
-        : Array.isArray(rows?.items)
-        ? rows.items
-        : [];
+        : Array.isArray(rows?.trades)
+          ? rows.trades
+          : Array.isArray(rows?.data)
+            ? rows.data
+            : Array.isArray(rows?.rows)
+              ? rows.rows
+              : Array.isArray(rows?.items)
+                ? rows.items
+                : [];
 
       const mapped = src
         .map((r) => normalizeTrade(r))
@@ -410,6 +480,39 @@ const useAIStore = create<AIState>((set) => ({
         }
       }
 
+      // Se veio um summary do back-end, usa; senão, deriva
+      const summaryFromMeta: PnLSummary =
+        meta?.summary && typeof meta.summary === "object"
+          ? {
+            trades: Number(meta.summary.trades ?? mapped.length),
+            wins: Number(meta.summary.wins ?? 0),
+            losses: Number(meta.summary.losses ?? 0),
+            ties: Number(meta.summary.ties ?? 0),
+            winRate: Number(meta.summary.winRate ?? 0),
+            pnlPoints: Number(meta.summary.pnlPoints ?? 0),
+            pnlMoney:
+              meta.summary.pnlMoney != null
+                ? Number(meta.summary.pnlMoney)
+                : pointValue != null
+                  ? Number(
+                    (Number(meta.summary.pnlPoints ?? 0) * pointValue).toFixed(
+                      2
+                    )
+                  )
+                  : undefined,
+            avgPnL: Number(meta.summary.avgPnL ?? 0),
+            profitFactor:
+              typeof meta.summary.profitFactor === "number"
+                ? meta.summary.profitFactor
+                : Number(meta.summary.profitFactor ?? 0),
+            maxDrawdown: Number(meta.summary.maxDrawdown ?? 0),
+          }
+          : null;
+
+      const derived =
+        summaryFromMeta ??
+        derivePnLSummary(mapped, pointValue != null ? Number(pointValue) : null);
+
       if (process.env.NODE_ENV !== "production") {
         // eslint-disable-next-line no-console
         const buy = mapped.filter((t) => t.side === "BUY").length;
@@ -425,7 +528,7 @@ const useAIStore = create<AIState>((set) => ({
         });
       }
 
-      return { trades: mapped };
+      return { trades: mapped, pnl: derived };
     }),
 
   clear: () =>
