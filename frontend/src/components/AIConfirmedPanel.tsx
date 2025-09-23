@@ -14,21 +14,44 @@ function tfToMinutes(tf?: string | null) {
   if (s === "H1") return 60;
   const m = s.match(/^M(\d+)$/);
   if (m) return Math.max(1, Number(m[1]));
-  const h = s.match(/^H(\d+)$/);
-  if (h) return Math.max(1, Number(h[1]) * 60);
-  return 5;
+  return 1;
 }
+
 function toTs(iso?: string | null): number | null {
   if (!iso) return null;
   const t = Date.parse(iso);
   return Number.isFinite(t) ? t : null;
 }
-function minutesBetween(aIso?: string | null, bIso?: string | null): number {
-  const a = toTs(aIso);
-  const b = toTs(bIso);
-  if (a == null || b == null) return Infinity;
-  return Math.abs(b - a) / 60000;
+
+function minutesBetween(a?: string | null, b?: string | null) {
+  if (!a || !b) return Infinity;
+  const ta = toTs(a);
+  const tb = toTs(b);
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return Infinity;
+  return Math.abs((tb! - ta!) / 60000);
 }
+
+function findIndexForTs(
+  candles: Array<{ time: string }>,
+  targetIso: string | null
+) {
+  if (!targetIso) return -1;
+  const t = toTs(targetIso);
+  if (!Number.isFinite(t)) return -1;
+  let lo = 0,
+    hi = candles.length - 1,
+    ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const tm = toTs(candles[mid]?.time) ?? 0;
+    if (tm >= (t as number)) {
+      ans = mid;
+      hi = mid - 1;
+    } else lo = mid + 1;
+  }
+  return ans;
+}
+
 function parseQS() {
   const sp =
     typeof window !== "undefined"
@@ -49,20 +72,41 @@ function parseQS() {
 function fmtLocalDateTime(iso?: string | null) {
   if (!iso) return "—";
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return "—";
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+  if (!Number.isFinite(d.getTime())) return "—";
+  return d.toLocaleString("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: undefined,
+    hour12: false,
+  });
 }
 
-/* ========= Componente ========= */
-export default function AIConfirmedPanel() {
+/* ========= Painel ========= */
+function AIConfirmedPanel() {
   const rows = useAIStore((s: any) => s.confirmed);
   const params = useAIStore((s: any) => s.lastParams);
+
+  // Controles de URL para alternar filtros sem recarregar
+  const [, __forceRerender] = React.useReducer((c) => c + 1, 0);
+  const setQS = React.useCallback((patch: Partial<{ entriesOnly: boolean; syncWithTrades: boolean; nextOpenEntry: boolean; reEntryBars: number | string | null; }>) => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (patch.entriesOnly !== undefined) sp.set("entriesOnly", patch.entriesOnly ? "1" : "0");
+    if (patch.syncWithTrades !== undefined) sp.set("syncWithTrades", patch.syncWithTrades ? "1" : "0");
+    if (patch.nextOpenEntry !== undefined) sp.set("nextOpenEntry", patch.nextOpenEntry ? "1" : "0");
+    if (patch.reEntryBars !== undefined) {
+      const v: any = patch.reEntryBars;
+      if (v === null || v === "" || (typeof v === "number" && !Number.isFinite(v))) sp.delete("reEntryBars");
+      else sp.set("reEntryBars", String(v));
+    }
+    const url = window.location.pathname + "?" + sp.toString();
+    window.history.replaceState(null, "", url);
+    __forceRerender();
+  }, []);
 
   const { entriesOnly, reEntryBars, syncWithTrades, nextOpenEntry } = parseQS();
   const tfMin = tfToMinutes(params?.timeframe);
@@ -92,11 +136,11 @@ export default function AIConfirmedPanel() {
     let lastCloseTime: string | null = null;
 
     for (const s of listAsc) {
-      const side = String(s?.side || "").toUpperCase();
-      const t = s?.time ?? null;
+      const t = s?.time ? String(s.time) : null;
+      const side = String(s?.side ?? "").toUpperCase();
+      if (!t || side === "FLAT" || side === "NEUTRAL") continue;
 
       if (flat) {
-        // cooldown após "fechamento" lógico
         if (
           lastCloseTime &&
           minutesBetween(lastCloseTime, t) < reEntryBarsEff * tfMin
@@ -129,16 +173,14 @@ export default function AIConfirmedPanel() {
   const timeframe = String(params?.timeframe || "").toUpperCase();
 
   const [candles, setCandles] = React.useState<
-    { time: string; open: number; high: number; low: number; close: number }[]
+    Array<{ time: string; open: number; high: number; low: number; close: number }>
   >([]);
 
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      if (!syncWithTrades || !nextOpenEntry || !params) {
-        setCandles([]);
-        return;
-      }
+      if (!syncWithTrades || !nextOpenEntry) return;
+      if (!symbol || !timeframe) return;
       try {
         const rows = await fetchCandles({
           symbol,
@@ -170,49 +212,33 @@ export default function AIConfirmedPanel() {
       return entriesOnlyList;
     }
 
-    // Reconstroi as ENTRADAS "next-open" a partir dos confirmados
-    const times = candles.map((c) => toTs(c.time) as number);
-    const idxByTs = new Map<number, number>();
-    for (let i = 0; i < times.length; i++) idxByTs.set(times[i], i);
-
-    function findIndexForTs(ts: number): number | null {
-      if (!Number.isFinite(ts) || times.length === 0) return null;
-      let lo = 0,
-        hi = times.length - 1;
-      if (ts <= times[lo]) return lo;
-      if (ts >= times[hi]) return hi;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const v = times[mid];
-        if (v === ts) return mid;
-        if (v < ts) lo = mid + 1;
-        else hi = mid - 1;
-      }
-      return hi >= 0 ? hi : lo;
-    }
-
-    // Simulador: queremos apenas a lista de ENTRADAS (sinais) que realmente abririam posição
     const selectedEntries: any[] = [];
-
     let positionOpen = false;
     let lastSide: "BUY" | "SELL" | null = null;
     let lastCloseIdx: number | null = null;
 
-    for (const s of listAsc) {
-      const side = String(s?.side || "").toUpperCase();
-      const st = toTs(s?.time);
-      if (st == null) continue;
+    const tfMinLocal = tfToMinutes(timeframe);
+    const cooldownMin = Math.max(0, reEntryBarsEff * tfMinLocal);
 
-      let idx = idxByTs.get(st) ?? findIndexForTs(st);
-      if (idx == null) continue;
+    for (const s of entriesOnlyList) {
+      const t = String(s.time);
+      const side = String(s.side ?? "").toUpperCase() as "BUY" | "SELL";
+      if (!t || (side !== "BUY" && side !== "SELL")) continue;
 
-      const nextIdx = idx + 1;
-      if (nextIdx >= candles.length) continue;
+      const idx = findIndexForTs(candles, t);
+      if (idx < 0) continue;
+      const nextIdx = Math.min(idx + 1, candles.length - 1);
 
-      // cooldown após fechamento lógico
-      if (!positionOpen && lastCloseIdx != null) {
-        if (nextIdx - lastCloseIdx < reEntryBarsEff) {
-          continue;
+      // cooldown desde o fechamento lógico?
+      if (lastCloseIdx != null) {
+        const tClose = candles[lastCloseIdx]?.time || null;
+        const nextOpenIso = candles[nextIdx]?.time || null;
+        if (
+          tClose &&
+          nextOpenIso &&
+          minutesBetween(tClose, nextOpenIso) < cooldownMin
+        ) {
+          continue; // ainda no cooldown
         }
       }
 
@@ -272,6 +298,53 @@ export default function AIConfirmedPanel() {
             </div>
           </div>
 
+          {/* Controles rápidos (não alteram nomes/estrutura) */}
+          <div className="d-flex flex-wrap align-items-center gap-3 mb-3">
+            <div className="form-check form-switch">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                id="swEntriesOnly"
+                checked={entriesOnly}
+                onChange={(e) => setQS({ entriesOnly: e.target.checked })}
+              />
+              <label className="form-check-label" htmlFor="swEntriesOnly">
+                Só entradas
+              </label>
+            </div>
+            <div className="form-check form-switch">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                id="swSyncNextOpen"
+                checked={syncWithTrades}
+                onChange={(e) => setQS({ syncWithTrades: e.target.checked })}
+              />
+              <label className="form-check-label" htmlFor="swSyncNextOpen">
+                Sync (next-open)
+              </label>
+            </div>
+            <div className="input-group input-group-sm" style={{ maxWidth: 260 }}>
+              <span className="input-group-text">reEntryBars</span>
+              <input
+                type="number"
+                min={0}
+                className="form-control"
+                value={Number.isFinite(reEntryBars) ? (reEntryBars as number) : ("" as any)}
+                placeholder={String(reEntryBarsEff) + " (auto)"}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setQS({ reEntryBars: v === "" ? "" : Math.max(0, Number(v)) });
+                }}
+              />
+              <span className="input-group-text">× {tfMin}m</span>
+            </div>
+
+            <span className="badge text-bg-light border">
+              entriesOnly={String(entriesOnly)} · syncWithTrades={String(syncWithTrades)} · nextOpenEntry={String(nextOpenEntry)} · reEntryBars={Number.isFinite(reEntryBars) ? String(reEntryBars) : "auto(" + String(reEntryBarsEff) + ")"}
+            </span>
+          </div>
+
           <div className="table-responsive">
             <table className="table table-sm align-middle mb-0">
               <thead>
@@ -283,36 +356,34 @@ export default function AIConfirmedPanel() {
                 </tr>
               </thead>
               <tbody>
-                {view.length === 0 && (
+                {view.length === 0 ? (
                   <tr>
-                    <td className="text-muted" colSpan={4}>
-                      Sem dados. Use a barra para buscar.
+                    <td colSpan={4} className="text-center text-muted py-4">
+                      Nenhum sinal para os filtros atuais.
                     </td>
                   </tr>
+                ) : (
+                  view.map((s: any, i: number) => (
+                    <tr key={i}>
+                      <td className="text-muted">{fmtLocalDateTime(s.time)}</td>
+                      <td>
+                        <span
+                          className={
+                            String(s.side).toUpperCase() === "BUY"
+                              ? "badge text-bg-primary"
+                              : "badge text-bg-warning"
+                          }
+                        >
+                          {String(s.side).toUpperCase()}
+                        </span>
+                      </td>
+                      <td>{Number.isFinite(Number(s.price)) ? Number(s.price) : "—"}</td>
+                      <td className="text-muted">
+                        {s.note ?? s.comment ?? s.obs ?? "—"}
+                      </td>
+                    </tr>
+                  ))
                 )}
-                {view.map((r: any, i: number) => (
-                  <tr key={i}>
-                    <td>
-                      <code>{fmtLocalDateTime(r.time)}</code>
-                    </td>
-                    <td>
-                      <span
-                        className={
-                          "badge " +
-                          (r.side === "BUY"
-                            ? "text-bg-success"
-                            : r.side === "SELL"
-                              ? "text-bg-danger"
-                              : "text-bg-secondary")
-                        }
-                      >
-                        {r.side}
-                      </span>
-                    </td>
-                    <td>{r.price ?? "-"}</td>
-                    <td className="text-muted">{r.note ?? "-"}</td>
-                  </tr>
-                ))}
               </tbody>
               {view.length > 0 && (
                 <tfoot>
@@ -330,3 +401,5 @@ export default function AIConfirmedPanel() {
     </div>
   );
 }
+
+export default AIConfirmedPanel;

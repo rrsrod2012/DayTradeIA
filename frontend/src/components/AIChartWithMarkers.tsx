@@ -28,25 +28,24 @@ const fmtTimeNoSecBRT = new Intl.DateTimeFormat("pt-BR", {
   hour12: false,
 });
 
-// usado pelo crosshair/tooltip
-function timeFormatterBRT(t: any): string {
-  if (typeof t === "number") {
-    const d = new Date(t * 1000);
-    return fmtTimeBRT.format(d); // HH:mm:ss em BRT
+// usado nos tooltips de candle
+function timeFormatterBRT(time: any /* Time */): string {
+  if (typeof time === "number") {
+    const d = new Date(time * 1000);
+    return fmtDateShortBRT.format(d) + " " + fmtTimeBRT.format(d);
   }
-  if (t && typeof t === "object" && "year" in t && "month" in t && "day" in t) {
-    const d = new Date(Date.UTC((t as any).year, (t as any).month - 1, (t as any).day));
-    return fmtDateShortBRT.format(d); // dd/mm/aa em BRT
+  if (time && typeof time === "object" && "year" in time) {
+    const d = new Date(Date.UTC(time.year, time.month - 1, time.day));
+    return fmtDateShortBRT.format(d) + " 00:00:00";
   }
-  return String(t ?? "");
+  return String(time ?? "");
 }
 
-// usado pelos rótulos do eixo de tempo
-function tickMarkFormatterBRT(time: any /* Time */, _tickType: any): string {
+// usado nos rótulos do tooltip custom
+function timeToLabelBRT(time: any /* Time */): string {
   if (typeof time === "number") {
-    // time = UTCTimestamp (segundos)
     const d = new Date(time * 1000);
-    return fmtTimeNoSecBRT.format(d); // HH:mm
+    return fmtDateShortBRT.format(d) + " " + fmtTimeNoSecBRT.format(d); // dd/mm/aa HH:mm
   }
   if (time && typeof time === "object" && "year" in time) {
     // BusinessDay
@@ -63,7 +62,43 @@ function isoToUtcTs(iso: string | undefined | null): UTCTimestamp | null {
   return Math.floor(t / 1000) as UTCTimestamp;
 }
 
-// Normaliza SELL/BUY de forma agressiva (não deixa SELL virar outra coisa)
+// ----- QS helpers (usar mesmos flags do painel) -----
+function parseQS() {
+  const sp =
+    typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search)
+      : new URLSearchParams();
+  const entriesOnly = (sp.get("entriesOnly") ?? "1").trim() !== "0";
+  const reStr = sp.get("reEntryBars");
+  const reEntryBars =
+    reStr != null && reStr !== "" && Number.isFinite(Number(reStr))
+      ? Number(reStr)
+      : NaN;
+  const syncWithTrades = (sp.get("syncWithTrades") ?? "1").trim() !== "0";
+  const nextOpenEntry = (sp.get("nextOpenEntry") ?? "1").trim() !== "0";
+  return { entriesOnly, reEntryBars, syncWithTrades, nextOpenEntry };
+}
+
+function tfToMinutes(tf?: string | null) {
+  const s = String(tf || "").trim().toUpperCase();
+  if (s === "M1") return 1;
+  if (s === "M5") return 5;
+  if (s === "M15") return 15;
+  if (s === "M30") return 30;
+  if (s === "H1") return 60;
+  const m = s.match(/^M(\d+)$/);
+  if (m) return Math.max(1, Number(m[1]));
+  return 1;
+}
+
+function minutesBetween(a?: string | null, b?: string | null) {
+  if (!a || !b) return Infinity;
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return Infinity;
+  return Math.abs(tb - ta) / 60000;
+}
+
 function normSide(raw: any): "BUY" | "SELL" | "FLAT" {
   const s = String(raw ?? "")
     .trim()
@@ -100,18 +135,41 @@ type Marker = ReturnType<
     time: UTCTimestamp;
     position: "aboveBar" | "belowBar";
     color: string;
-    shape: any;
+    shape:
+    | "circle"
+    | "square"
+    | "arrowUp"
+    | "arrowDown"
+    | "arrowUp"
+    | "arrowDown";
     text?: string;
     size?: number;
   }
   : never;
 
-export default function AIChartWithMarkers() {
+function AIChartWithMarkers() {
+  // Controles locais para alternar entriesOnly via URL e re-renderizar
+  const [, __forceRerender] = React.useReducer((c) => c + 1, 0);
+  const { entriesOnly, reEntryBars, syncWithTrades, nextOpenEntry } = parseQS();
+  const setQS = React.useCallback((patch: Partial<{ entriesOnly: boolean; reEntryBars: number | string | null; syncWithTrades: boolean; nextOpenEntry: boolean; }>) => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (patch.entriesOnly !== undefined) sp.set("entriesOnly", patch.entriesOnly ? "1" : "0");
+    if (patch.syncWithTrades !== undefined) sp.set("syncWithTrades", patch.syncWithTrades ? "1" : "0");
+    if (patch.nextOpenEntry !== undefined) sp.set("nextOpenEntry", patch.nextOpenEntry ? "1" : "0");
+    if (patch.reEntryBars !== undefined) {
+      const v: any = patch.reEntryBars;
+      if (v === null || v === "" || (typeof v === "number" && !Number.isFinite(v))) sp.delete("reEntryBars");
+      else sp.set("reEntryBars", String(v));
+    }
+    const url = window.location.pathname + "?" + sp.toString();
+    window.history.replaceState(null, "", url);
+    __forceRerender();
+  }, []);
+
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<IChartApi | null>(null);
-  const seriesRef = React.useRef<ReturnType<
-    IChartApi["addCandlestickSeries"]
-  > | null>(null);
+  const seriesRef = React.useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null);
 
   // Tempos existentes na série (em segundos UTC), em ordem asc
   const candleTimesRef = React.useRef<UTCTimestamp[]>([]);
@@ -146,30 +204,27 @@ export default function AIChartWithMarkers() {
       localization: {
         locale: "pt-BR",
         timeFormatter: (t: any) => timeFormatterBRT(t),
-      } as any,
+      },
     });
-
-    // >>> AQUI: rótulos do eixo de tempo em BRT
-    chart.timeScale().applyOptions({
-      tickMarkFormatter: (time: any, tickType: any, _locale?: string) =>
-        tickMarkFormatterBRT(time, tickType),
-    } as any);
 
     const series = chart.addCandlestickSeries({
-      upColor: "#22c55e",
+      upColor: "#16a34a",
       downColor: "#ef4444",
-      borderUpColor: "#22c55e",
-      borderDownColor: "#ef4444",
-      wickUpColor: "#22c55e",
+      borderVisible: false,
+      wickUpColor: "#16a34a",
       wickDownColor: "#ef4444",
     });
+
+    chart.timeScale().fitContent();
 
     chartRef.current = chart;
     seriesRef.current = series;
 
-    const ro = new ResizeObserver(() =>
-      chart.applyOptions({ width: el.clientWidth })
-    );
+    // resize
+    const ro = new ResizeObserver(() => {
+      const rect = el.getBoundingClientRect();
+      chart.applyOptions({ width: Math.floor(rect.width) });
+    });
     ro.observe(el);
 
     return () => {
@@ -230,26 +285,30 @@ export default function AIChartWithMarkers() {
         }
       } catch (e) {
         // eslint-disable-next-line no-console
-        console.warn("[AIChartWithMarkers] erro carregando candles", e);
+        console.warn("[AIChartWithMarkers] erro carregando candles", e)
       }
     })();
   }, [params?.symbol, params?.timeframe, params?.from, params?.to]);
 
-  // Snap do timestamp para um candle existente (se necessário)
+  // Snap de um timestamp (seg UTC) ao candle mais próximo existente
   const snapToExistingBar = React.useCallback(
-    (ts: UTCTimestamp | null): UTCTimestamp | null => {
-      if (ts == null) return null;
+    (tsRaw: UTCTimestamp | null) => {
+      if (tsRaw == null) return null;
       const arr = candleTimesRef.current;
-      if (!arr.length) return null;
-      // caso mais comum: se já existir exatamente, retorna
+      if (!arr || arr.length === 0) return null;
+
+      // clamp a [first,last]
+      const first = arr[0] as number;
+      const last = arr[arr.length - 1] as number;
+      const ts = Math.max(first, Math.min(last, tsRaw as number));
+
+      // busca binária: candle mais próximo
       let lo = 0,
         hi = arr.length - 1;
-      if (ts <= arr[lo]) return arr[lo];
-      if (ts >= arr[hi]) return arr[hi];
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
         const v = arr[mid] as number;
-        if (v === ts) return arr[mid];
+        if (v === (ts as number)) return v as UTCTimestamp;
         if (v < (ts as number)) lo = mid + 1;
         else hi = mid - 1;
       }
@@ -284,65 +343,92 @@ export default function AIChartWithMarkers() {
     const projSrc = Array.isArray(projectedRaw) ? projectedRaw : [];
     const confSrc = Array.isArray(confirmedRaw) ? confirmedRaw : [];
 
+    // Aplica filtro "Só entradas" opcional (básico, sem sincronização de next-open no gráfico)
+    let confSrcFiltered = confSrc;
+    if (entriesOnly) {
+      const tfMin = tfToMinutes(params?.timeframe);
+      const reEntryBarsEff = Number.isFinite(reEntryBars) ? Math.max(0, Number(reEntryBars)) : (tfMin <= 1 ? 4 : 3);
+      const asc = [...confSrc].sort((a: any, b: any) => {
+        const ta = (a && a.time) ? Date.parse(a.time) : 0;
+        const tb = (b && b.time) ? Date.parse(b.time) : 0;
+        return ta - tb;
+      });
+      const out: any[] = [];
+      let flat = true;
+      let lastSide: "BUY" | "SELL" | null = null;
+      let lastCloseTime: string | null = null;
+      for (const s of asc) {
+        const t = s?.time ? String(s.time) : null;
+        const side = normSide((s as any).side);
+        if (!t || side === "FLAT") continue;
+        if (flat) {
+          if (lastCloseTime && minutesBetween(lastCloseTime, t) < reEntryBarsEff * tfMin) continue;
+          out.push(s);
+          flat = false;
+          lastSide = side as any;
+        } else {
+          if (side !== String(lastSide)) {
+            flat = true;
+            lastSide = null;
+            lastCloseTime = t;
+          } else {
+            // mesmo lado durante posição -> ignora
+          }
+        }
+      }
+      confSrcFiltered = out;
+    }
+
     // Contadores de origem (do store) — antes de qualquer transformação
     let srcBuy = 0,
       srcSell = 0;
 
     // Limites temporais: agora (UTC) e extremos da série de candles
     const nowTs = Math.floor(Date.now() / 1000) as UTCTimestamp;
-    const arr = candleTimesRef.current;
-    const firstBar = arr.length ? (arr[0] as number) : null;
-    const lastBar = arr.length ? (arr[arr.length - 1] as number) : null;
+    const firstTs = candleTimesRef.current[0] ?? null;
+    const lastTs =
+      candleTimesRef.current[candleTimesRef.current.length - 1] ?? null;
 
     const inRange = (ts: UTCTimestamp | null) => {
       if (ts == null) return false;
-      if (firstBar != null && ts < firstBar) return false;
-      if (lastBar != null && ts > lastBar) return false;
-      if (ts > (nowTs as number)) return false; // clamp “no futuro”
+      if (firstTs != null && (ts as number) < (firstTs as number)) return false;
+      if (lastTs != null && (ts as number) > (lastTs as number)) return false;
+      if ((ts as number) > (nowTs as number)) return false;
       return true;
     };
 
-    // ---------- Projetados ----------
+    // Projetados -> setas
+    type Marker = any;
     const projMarkers: Marker[] = projSrc
-      .map((r, idx) => {
-        const side = normSide((r as any).side);
-        if (side === "BUY") srcBuy++;
-        else if (side === "SELL") srcSell++;
-        const tsRaw = isoToUtcTs((r as any).time);
+      .map((s, idx) => {
+        const side = normSide((s as any).side);
+        const tsRaw = isoToUtcTs((s as any).time);
         if (!inRange(tsRaw)) return null;
         const ts = snapToExistingBar(tsRaw);
         if (ts == null) return null;
 
         const isBuy = side === "BUY";
-        const color = isBuy ? "#16a34a" : "#dc2626";
-        const shape = isBuy ? "arrowUp" : "arrowDown";
-
-        const prob =
-          (r as any).probHit != null
-            ? `${((r as any).probHit * 100).toFixed(1)}%`
-            : "-";
-        const ev =
-          (r as any).expectedValuePoints != null
-            ? `${Number((r as any).expectedValuePoints).toFixed(2)} pts`
-            : "-";
+        if (isBuy) srcBuy++;
+        else if (side === "SELL") srcSell++;
 
         return {
           time: ts,
           position: isBuy ? ("belowBar" as const) : ("aboveBar" as const),
-          color,
-          shape: shape as any,
-          text: `PROJ ${isBuy ? "BUY" : "SELL"} • Prob ${prob} • EV ${ev}`,
+          color: isBuy ? "#16a34a" : "#ef4444",
+          shape: isBuy ? ("arrowUp" as any) : ("arrowDown" as any),
+          text: `PROJ ${isBuy ? "BUY" : "SELL"}${(s as any).note ? ` • ${(s as any).note}` : ""
+            }`,
           size: 1,
           // @ts-ignore
-          __k: `p${idx}`,
+          __k: `p#${idx}`,
           // @ts-ignore
           __isBuy: isBuy,
         } as any;
       })
       .filter(Boolean) as any;
 
-    // ---------- Confirmados ----------
-    const confMarkers: Marker[] = confSrc
+    // Confirmados -> bolinhas
+    const confMarkers: Marker[] = confSrcFiltered
       .map((s, idx) => {
         const side = normSide((s as any).side);
         const tsRaw = isoToUtcTs((s as any).time);
@@ -361,7 +447,7 @@ export default function AIChartWithMarkers() {
             }`,
           size: 1,
           // @ts-ignore
-          __k: `c${idx}`,
+          __k: `c#${idx}`,
           // @ts-ignore
           __isBuy: isBuy,
         } as any;
@@ -392,12 +478,8 @@ export default function AIChartWithMarkers() {
     } catch (err) {
       const onlyGood = clean.filter((m) => Number.isFinite(m.time as any));
       onlyGood.sort((a, b) => (a.time as number) - (b.time as number));
+      // fallback em caso de out-of-range
       seriesRef.current.setMarkers(onlyGood as any);
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[AIChartWithMarkers] fallback markers por tempo inválido",
-        err
-      );
     }
 
     // Diagnóstico (considerando projetados para manter compat com seu log atual)
@@ -422,7 +504,7 @@ export default function AIChartWithMarkers() {
         droppedByTime,
       });
     }
-  }, [projectedRaw, confirmedRaw, snapToExistingBar]);
+  }, [projectedRaw, confirmedRaw, snapToExistingBar, entriesOnly, reEntryBars, params?.timeframe]);
 
   return (
     <div className="container my-3">
@@ -430,15 +512,10 @@ export default function AIChartWithMarkers() {
         <div className="card-body">
           <div className="d-flex align-items-center gap-2 mb-2">
             <h6 className="mb-0">
-              Candles + Marcadores (Projetados & Confirmados)
+              Gráfico de Candles &nbsp;
+              <small className="text-muted">com sinais projetados/confirmados</small>
             </h6>
-            <div className="text-muted small">
-              {/* params apenas informativo */}
-            </div>
-          </div>
-          <div ref={containerRef} style={{ width: "100%", height: 420 }} />
-          <div className="text-muted small mt-2 d-flex flex-wrap gap-3">
-            <span className="me-3">
+            <span className="ms-3 text-muted small">
               Projetados: <span className="text-success">BUY ↑</span> /{" "}
               <span className="text-danger">SELL ↓</span>
             </span>
@@ -446,9 +523,33 @@ export default function AIChartWithMarkers() {
               Confirmados: <span style={{ color: "#2563eb" }}>BUY ●</span> /{" "}
               <span style={{ color: "#f59e0b" }}>SELL ●</span>
             </span>
+            <div className="ms-auto">
+              <div className="form-check form-switch">
+                <input
+                  id="swChartEntriesOnly"
+                  className="form-check-input"
+                  type="checkbox"
+                  checked={entriesOnly}
+                  onChange={(e) => setQS({ entriesOnly: e.target.checked })}
+                />
+                <label className="form-check-label" htmlFor="swChartEntriesOnly">
+                  Só entradas
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div ref={containerRef} />
+
+          <div className="mt-2 text-muted small">
+            <span className="me-3">src: BUY={diag.srcBuy} SELL={diag.srcSell}</span>
+            <span className="me-3">plotted: BUY={diag.plottedBuy} SELL={diag.plottedSell}</span>
+            <span>descartados por tempo={diag.droppedByTime}</span>
           </div>
         </div>
       </div>
     </div>
   );
 }
+
+export default AIChartWithMarkers;

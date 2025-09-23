@@ -8,6 +8,8 @@ import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
 import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
 import logger from "./logger";
+// ===== AJUSTE: importa default E named, e escolhe o que existir
+import notifyRoutesDefault, { notifyRoutes as notifyRoutesNamed } from "./notifyRoutes";
 
 import { bootPipeline, processImportedRange } from "./services/pipeline";
 // ⚠️ Removido o router externo de backtest que gerava conflito de 404
@@ -150,6 +152,15 @@ app.use(express.json({ limit: "5mb" }));
 
 // 0) (Opcional) ping de diagnóstico
 app.get("/__ping/backtest", (_req, res) => res.json({ ok: true }));
+
+// 0.1) **Notify (WhatsApp) — backend recebe eventos do EA e envia Whats**
+const notifyRouter: any = (notifyRoutesDefault as any) || (notifyRoutesNamed as any);
+if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.use === "function") {
+  app.use("/notify", notifyRouter);
+  logger.info("[SERVER] /notify montado com sucesso");
+} else {
+  logger.warn("[SERVER] notifyRoutes NÃO exportou um Router válido (default ou named). Rota /notify desabilitada.");
+}
 
 /* =========================
    BACKTEST — Fallbacks inline p/ /api/backtest e /backtest
@@ -804,7 +815,8 @@ app.get("/__ping/backtest", (_req, res) => res.json({ ok: true }));
         const nowUp = e9[i] != null && e21[i] != null && (e9[i] as number) > (e21[i] as number);
         const prevDn =
           e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) >= (e21[i - 1] as number);
-        const nowDn = e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
+        const nowDn =
+          e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
         const crossUp = prevUp && nowUp;
         const crossDn = prevDn && nowDn;
         if (!crossUp && !crossDn) continue;
@@ -964,7 +976,8 @@ app.get("/api/signals", async (req, res) => {
       const nowUp = e9[i] != null && e21[i] != null && (e9[i] as number) > (e21[i] as number);
       const prevDn =
         e9[i - 1] != null && e21[i - 1] != null && (e9[i - 1] as number) >= (e21[i - 1] as number);
-      const nowDn = e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
+      const nowDn =
+        e9[i] != null && e21[i] != null && (e9[i] as number) < (e21[i] as number);
       const crossUp = prevUp && nowUp;
       const crossDn = prevDn && nowDn;
       if (!crossUp && !crossDn) continue;
