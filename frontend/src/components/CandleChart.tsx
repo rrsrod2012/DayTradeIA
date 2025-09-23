@@ -22,7 +22,6 @@ type Trade = {
   entryPrice?: number;
   exitTime?: string; // ISO
   exitPrice?: number;
-  // Campos opcionais para identificar TP/SL
   takeProfitPrice?: number;
   stopLossPrice?: number;
   tpPrice?: number;
@@ -40,30 +39,17 @@ type Props = {
   ema21?: (number | null)[];
   showFibo?: boolean;
   darkMode?: boolean;
-
-  /** Overlay de trades (já filtrados, se aplicável) */
   trades?: Trade[];
-
-  /** Altura opcional do gráfico (px) */
   height?: number;
-
-  /** Permite desativar a navegação se necessário */
   enableNavigation?: boolean;
+
+  /** Fuso apenas quando as strings TÊM timezone (Z ou +HH:MM). */
+  displayTimeZone?: string;
+
+  /** Correção visual para rótulos “no futuro” (apenas datas com TZ). */
+  autoCorrectFutureLabels?: boolean;
 };
 
-/**
- * CandleChart interativo:
- * - Pan (drag do mouse) por padrão
- * - Zoom por seleção (segure SHIFT e arraste)
- * - Zoom pela roda do mouse (foco no cursor)
- * - Tooltip/crosshair por hover (tempo, OHLC, Δ, EMAs)
- * - Duplo clique para resetar zoom
- * - EMAs e overlay de trades (entry/exit + TP/SL)
- * - Mini-mapa com janela arrastável + botão "Ir para o fim"
- * - Popover clicável em cada trade com detalhes e "Ir para o trade"
- * - Popover ao clicar no candle (métricas da barra)
- * - Exportar SVG/PNG e atalhos de navegação (H/J/K/L, Ctrl+←/→)
- */
 export default function CandleChart({
   candles,
   ema9 = [],
@@ -73,37 +59,97 @@ export default function CandleChart({
   trades = [],
   height = 360,
   enableNavigation = true,
+  displayTimeZone = "America/Sao_Paulo",
+  autoCorrectFutureLabels = true,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const miniRef = useRef<SVGSVGElement | null>(null);
   const [containerW, setContainerW] = useState<number>(640);
 
+  // ======= Helpers de data/horário =======
+  // Detecta se a string possui timezone explícito (Z ou ±HH:MM)
+  const hasExplicitTZ = (s: string) => /([zZ])|([+\-]\d{2}:?\d{2})$/.test(s);
+
+  // Parse “ingênuo” de YYYY-MM-DD[ T]HH:mm(:ss)? sem aplicar fuso nenhum
+  const formatNaiveYMDHM = (s: string) => {
+    const m =
+      s &&
+      s.match(
+        /(\d{4})[-\/](\d{2})[-\/](\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}))?)?/
+      );
+    if (!m) return s || "—";
+    const [, y, mo, d, H = "00", M = "00"] = m;
+    return `${d}/${mo}/${y} ${H}:${M}`;
+  };
+
+  const fmtDateBR = useMemo(
+    () =>
+      new Intl.DateTimeFormat("pt-BR", {
+        timeZone: displayTimeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }),
+    [displayTimeZone]
+  );
+  const fmtTimeBR = useMemo(
+    () =>
+      new Intl.DateTimeFormat("pt-BR", {
+        timeZone: displayTimeZone,
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    [displayTimeZone]
+  );
+
+  // Corrige labels no futuro apenas quando a data TIVER TZ
+  const labelShiftMinutes = useMemo(() => {
+    if (!autoCorrectFutureLabels || candles.length === 0) return 0;
+    // Procura o último candle COM timezone; se não houver, não aplica shift
+    const lastWithTZ = [...candles].reverse().find((c) => hasExplicitTZ(c.time));
+    if (!lastWithTZ) return 0;
+    const lastMs = new Date(lastWithTZ.time).getTime();
+    const nowMs = Date.now();
+    const diffMs = lastMs - nowMs;
+    if (diffMs > 25 * 60_000 && diffMs < 6 * 60 * 60_000) {
+      return -Math.round(diffMs / 60_000);
+    }
+    return 0;
+  }, [autoCorrectFutureLabels, candles]);
+
+  // Formata respeitando regra:
+  // - Sem TZ: exibe como veio (naive), SEM conversão de fuso.
+  // - Com TZ: usa Intl + displayTimeZone (com shift visual opcional).
+  const formatWhen = useCallback(
+    (iso: string) => {
+      if (!iso) return "—";
+      if (!hasExplicitTZ(iso)) {
+        return formatNaiveYMDHM(iso);
+      }
+      const ms = new Date(iso).getTime();
+      const shifted = new Date(ms + labelShiftMinutes * 60_000);
+      return `${fmtDateBR.format(shifted)} ${fmtTimeBR.format(shifted)}`;
+    },
+    [fmtDateBR, fmtTimeBR, labelShiftMinutes]
+  );
+
   // ======= Navegação (zoom/pan) =======
   const [pxPerBar, setPxPerBar] = useState<number>(6); // [2..36]
   const [offset, setOffset] = useState<number>(0);
-
-  // Hover
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-
-  // Seleção para zoom (drag retângulo com SHIFT)
-  const [sel, setSel] = useState<{ active: boolean; x0: number; x1: number }>({
-    active: false,
-    x0: 0,
-    x1: 0,
-  });
-
-  // Estado de pan
+  const [sel, setSel] = useState<{ active: boolean; x0: number; x1: number }>(
+    { active: false, x0: 0, x1: 0 }
+  );
   const [isPanning, setIsPanning] = useState(false);
 
-  // Mini-mapa (arrasto da janela)
   const miniDrag = useRef<{
     active: boolean;
     startX: number;
     startOffset: number;
   }>({ active: false, startX: 0, startOffset: 0 });
 
-  // ======= Popovers =======
   const [selectedTrade, setSelectedTrade] = useState<{
     x: number;
     y: number;
@@ -118,7 +164,7 @@ export default function CandleChart({
     idx: number;
   } | null>(null);
 
-  // Atualiza largura do container com ResizeObserver
+  // Largura do container
   useEffect(() => {
     if (!wrapRef.current) return;
     const ro = new ResizeObserver((entries) => {
@@ -145,27 +191,26 @@ export default function CandleChart({
   const startIndex = Math.min(Math.max(0, Math.floor(offset)), maxStart);
   const endIndex = Math.min(candles.length - 1, startIndex + barsFit - 1);
 
-  // Mini-mapa dimensões
+  // Mini-mapa
   const miniH = 56;
   const miniPaddingTop = 6;
   const miniPaddingBottom = 12;
   const miniInnerH = miniH - miniPaddingTop - miniPaddingBottom;
 
-  // Ao trocar a largura ou escalas, mantenha janela válida
+  // Mantém janela válida ao mudar escala/largura
   useEffect(() => {
     const fit = Math.max(1, Math.floor(innerW / Math.max(2, pxPerBar)));
     const maxS = Math.max(0, candles.length - fit);
     setOffset((prev) => Math.min(prev, maxS));
   }, [innerW, pxPerBar, candles.length]);
 
-  // Escalas Y (com base na janela visível)
+  // Escala Y
   const { minPrice, maxPrice, xForIndex, yForPrice } = useMemo(() => {
     const prices: number[] = [];
     for (let i = startIndex; i <= endIndex; i++) {
       const c = candles[i];
       prices.push(c.low, c.high);
     }
-    // incluir EMAs se disponíveis (apenas faixa visível)
     for (let i = startIndex; i <= endIndex; i++) {
       const v9 = ema9[i];
       const v21 = ema21[i];
@@ -190,7 +235,7 @@ export default function CandleChart({
     return { minPrice, maxPrice, xForIndex, yForPrice };
   }, [candles, ema9, ema21, startIndex, endIndex, innerW, h, barsFit]);
 
-  // Cores por tema
+  // Cores
   const colorAxis = darkMode ? "#8b8b8b" : "#666";
   const colorGrid = darkMode ? "#2d2f33" : "#eee";
   const colorBull = darkMode ? "#22c55e" : "#198754";
@@ -210,7 +255,7 @@ export default function CandleChart({
     : "rgba(13,110,253,0.18)";
   const miniWindowBorder = darkMode ? "#6366f1" : "#0d6efd";
 
-  // Eixos e grid (apenas algumas linhas de preço)
+  // Y ticks
   const yTicks = useMemo(() => {
     const n = 5;
     const ticks: number[] = [];
@@ -221,7 +266,7 @@ export default function CandleChart({
     return ticks;
   }, [minPrice, maxPrice]);
 
-  // EMAs em paths (apenas faixa visível)
+  // EMAs em path
   const emaPath = (series: (number | null)[]) => {
     const pts: string[] = [];
     for (let i = startIndex; i <= endIndex; i++) {
@@ -235,7 +280,7 @@ export default function CandleChart({
     return pts.join(" ");
   };
 
-  // ======= Overlay de Trades (só se ambos entry/exit estiverem visíveis) =======
+  // Overlay de trades
   const tradeMarkers = useMemo(() => {
     if (!candles.length || !trades?.length) return [];
 
@@ -316,21 +361,21 @@ export default function CandleChart({
         };
       })
       .filter(Boolean) as Array<{
-      trade: Trade;
-      iEntry: number;
-      iExit: number;
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-      yTP: number | null;
-      ySL: number | null;
-      isWin: boolean;
-      side?: string;
-    }>;
+        trade: Trade;
+        iEntry: number;
+        iExit: number;
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        yTP: number | null;
+        ySL: number | null;
+        isWin: boolean;
+        side?: string;
+      }>;
   }, [candles, trades, startIndex, endIndex, xForIndex, yForPrice]);
 
-  // ======= Utilitários =======
+  // Utilitários
   const clampOffset = useCallback(
     (value: number, nextPxPerBar: number = pxPerBar) => {
       const fit = Math.max(1, Math.floor(innerW / Math.max(2, nextPxPerBar)));
@@ -350,17 +395,17 @@ export default function CandleChart({
     return { i, xCanvas: x };
   };
 
-  // ======= Interação: pan/zoom/seleção =======
+  // Interação
   const dragRef = useRef<{
     dragging: boolean;
     startX: number;
     startOffset: number;
-    selecting: boolean; // SHIFT pressionado
+    selecting: boolean;
   }>({ dragging: false, startX: 0, startOffset: 0, selecting: false });
 
   const onMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if (!enableNavigation) return;
-    const isShift = e.shiftKey; // SHIFT ativa seleção para zoom
+    const isShift = e.shiftKey;
     dragRef.current = {
       dragging: true,
       startX: e.clientX,
@@ -368,7 +413,6 @@ export default function CandleChart({
       selecting: isShift,
     };
     if (isShift) {
-      // inicia retângulo de seleção
       const rect = svgRef.current!.getBoundingClientRect();
       const x = Math.min(
         Math.max(e.clientX - rect.left, paddingLeft),
@@ -381,7 +425,6 @@ export default function CandleChart({
   };
 
   const onMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    // hover/crosshair
     const pos = indexFromClientX(e.clientX);
     setHoverIdx(pos?.i ?? null);
 
@@ -389,14 +432,12 @@ export default function CandleChart({
     if (!dragRef.current.dragging) return;
 
     if (!dragRef.current.selecting) {
-      // PAN (padrão)
       const dx = e.clientX - dragRef.current.startX;
       const barsDelta = -dx / Math.max(2, pxPerBar);
       setOffset(clampOffset(dragRef.current.startOffset + barsDelta));
       return;
     }
 
-    // Seleção de faixa (SHIFT)
     const rect = svgRef.current!.getBoundingClientRect();
     const x = Math.min(
       Math.max(e.clientX - rect.left, paddingLeft),
@@ -410,7 +451,6 @@ export default function CandleChart({
     if (!dragRef.current.dragging) return;
 
     if (dragRef.current.selecting) {
-      // finalizar seleção
       const x0 = Math.max(Math.min(sel.x0, sel.x1), paddingLeft);
       const x1 = Math.min(Math.max(sel.x0, sel.x1), w - paddingRight);
       const span = Math.abs(x1 - x0);
@@ -441,11 +481,8 @@ export default function CandleChart({
     setIsPanning(false);
   };
 
-  // Clique no candle para abrir popover
   const onClickMain = (e: React.MouseEvent<SVGSVGElement>) => {
-    // Evita que clique no gráfico feche popovers imediatamente (o handler global fecha)
     e.stopPropagation();
-    // Se foi clique de seleção (Shift), ignorar
     if (dragRef.current.selecting) return;
     const pos = indexFromClientX(e.clientX);
     if (!pos) return;
@@ -453,7 +490,7 @@ export default function CandleChart({
     const xCanvas = pos.xCanvas;
     const c = candles[idx];
     if (!c) return;
-    setSelectedTrade(null); // fecha popover de trade se aberto
+    setSelectedTrade(null);
     setSelectedCandle({
       x: xCanvas,
       y: yForPrice(c.close),
@@ -461,14 +498,11 @@ export default function CandleChart({
     });
   };
 
-  // Zoom com roda do mouse (scroll)
   const onWheel = (e: React.WheelEvent<SVGSVGElement>) => {
     if (!enableNavigation) return;
-    // evita scroll da página
     e.preventDefault();
 
-    // deltaY < 0 => zoom in; deltaY > 0 => zoom out
-    const step = Math.max(-1, Math.min(1, e.deltaY / 100)); // normaliza
+    const step = Math.max(-1, Math.min(1, e.deltaY / 100));
     const zoomFactor = step < 0 ? 1.2 : 1 / 1.2;
 
     const newPx = Math.min(36, Math.max(2, pxPerBar * zoomFactor));
@@ -484,7 +518,6 @@ export default function CandleChart({
     setOffset(clampOffset(newStart, newPx));
   };
 
-  // Duplo clique: reset zoom para mostrar o final
   const onDoubleClick = () => {
     if (!enableNavigation) return;
     const basePx = 6;
@@ -494,7 +527,7 @@ export default function CandleChart({
     setOffset(start);
   };
 
-  // Teclado (setas, +/- e atalhos novos)
+  // Teclado
   useEffect(() => {
     if (!enableNavigation) return;
     const handler = (e: KeyboardEvent) => {
@@ -505,14 +538,12 @@ export default function CandleChart({
       )
         return;
 
-      // Fecha popovers com ESC
       if (e.key === "Escape") {
         setSelectedTrade(null);
         setSelectedCandle(null);
         return;
       }
 
-      // Ctrl + setas: pan de meia janela
       if (e.ctrlKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
         const delta = Math.floor(barsFit / 2);
         setOffset((prev) =>
@@ -521,7 +552,6 @@ export default function CandleChart({
         return;
       }
 
-      // H/L pan curto; J/K zoom out/in
       if (e.key.toLowerCase() === "h") {
         setOffset((prev) =>
           clampOffset(prev - Math.max(1, Math.floor(barsFit * 0.1)))
@@ -553,7 +583,6 @@ export default function CandleChart({
         return;
       }
 
-      // Setas padrão e +/-
       if (e.key === "ArrowLeft") {
         setOffset((prev) =>
           clampOffset(prev - Math.max(1, Math.floor(barsFit * 0.2)))
@@ -598,14 +627,13 @@ export default function CandleChart({
     return () => window.removeEventListener("click", handler);
   }, []);
 
-  // ======= Export helpers =======
+  // Export helpers
   const downloadSVG = () => {
     const svg = svgRef.current;
     if (!svg) return;
     const serializer = new XMLSerializer();
     let source = serializer.serializeToString(svg);
 
-    // Adiciona namespace caso falte
     if (!source.match(/^<svg[^>]+xmlns=/)) {
       source = source.replace(
         /^<svg/,
@@ -648,7 +676,6 @@ export default function CandleChart({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Para evitar problemas de CORS em algumas fontes
     img.crossOrigin = "anonymous";
     img.onload = () => {
       ctx.clearRect(0, 0, w, h);
@@ -664,8 +691,7 @@ export default function CandleChart({
     img.src = svgUrl;
   };
 
-  // ======= Render =======
-  // Grid horizontal + labels
+  // Render
   const yGrid = yTicks.map((t, i) => (
     <g key={`yt-${i}`}>
       <line
@@ -688,7 +714,6 @@ export default function CandleChart({
     </g>
   ));
 
-  // Candles visíveis
   const bodyW = Math.max(1, Math.floor(pxPerBar) - 2);
   const candleNodes = [];
   for (let i = startIndex; i <= endIndex; i++) {
@@ -710,7 +735,6 @@ export default function CandleChart({
 
     candleNodes.push(
       <g key={i}>
-        {/* wick */}
         <line
           x1={wickX}
           y1={yHigh}
@@ -719,7 +743,6 @@ export default function CandleChart({
           stroke={colorWick}
           strokeWidth={1}
         />
-        {/* body */}
         <rect
           x={x - bodyW / 2}
           y={top}
@@ -735,55 +758,53 @@ export default function CandleChart({
   const ema9Path = ema9.length > 0 ? emaPath(ema9) : "";
   const ema21Path = ema21.length > 0 ? emaPath(ema21) : "";
 
-  // Fibo simples (baseado na janela visível)
   const fiboNodes =
     showFibo && endIndex - startIndex >= 2
       ? (() => {
-          const slice = candles.slice(startIndex, endIndex + 1);
-          const hi = Math.max(...slice.map((c) => c.high));
-          const lo = Math.min(...slice.map((c) => c.low));
-          const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
-          return (
-            <g>
-              {levels.map((lv, idx) => {
-                const price = lo + (hi - lo) * (1 - lv);
-                const y = yForPrice(price);
-                return (
-                  <g key={`fibo-${idx}`}>
-                    <line
-                      x1={paddingLeft}
-                      y1={y}
-                      x2={w - paddingRight}
-                      y2={y}
-                      stroke={darkMode ? "#444" : "#ddd"}
-                      strokeDasharray="4 4"
-                      strokeWidth={0.75}
-                    />
-                    <text
-                      x={w - paddingRight}
-                      y={y - 2}
-                      textAnchor="end"
-                      fontSize={9}
-                      fill={colorText}
-                    >
-                      {`${(lv * 100).toFixed(1)}%`}
-                    </text>
-                  </g>
-                );
-              })}
-            </g>
-          );
-        })()
+        const slice = candles.slice(startIndex, endIndex + 1);
+        const hi = Math.max(...slice.map((c) => c.high));
+        const lo = Math.min(...slice.map((c) => c.low));
+        const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
+        return (
+          <g>
+            {levels.map((lv, idx) => {
+              const price = lo + (hi - lo) * (1 - lv);
+              const y = yForPrice(price);
+              return (
+                <g key={`fibo-${idx}`}>
+                  <line
+                    x1={paddingLeft}
+                    y1={y}
+                    x2={w - paddingRight}
+                    y2={y}
+                    stroke={darkMode ? "#444" : "#ddd"}
+                    strokeDasharray="4 4"
+                    strokeWidth={0.75}
+                  />
+                  <text
+                    x={w - paddingRight}
+                    y={y - 2}
+                    textAnchor="end"
+                    fontSize={9}
+                    fill={colorText}
+                  >
+                    {`${(lv * 100).toFixed(1)}%`}
+                  </text>
+                </g>
+              );
+            })}
+          </g>
+        );
+      })()
       : null;
 
-  // Overlay de TRADES (com clique para popover)
   const tradeNodes = tradeMarkers.map((m, idx) => (
     <g
       key={`tm-${idx}`}
       opacity={0.95}
       onClick={(e) => {
         e.stopPropagation();
-        setSelectedCandle(null); // fecha candle popover
+        setSelectedCandle(null);
         setSelectedTrade({
           x: m.x2,
           y: m.y2,
@@ -794,7 +815,6 @@ export default function CandleChart({
       }}
       style={{ cursor: "pointer" }}
     >
-      {/* linha conectando entry->exit */}
       <line
         x1={m.x1}
         y1={m.y1}
@@ -803,7 +823,6 @@ export default function CandleChart({
         stroke={m.isWin ? colorBull : colorBear}
         strokeWidth={1.2}
       />
-      {/* entry marker: triângulo apontando para cima/baixo conforme lado */}
       {(() => {
         const size = 5;
         const s = m.side === "SELL" ? -1 : 1;
@@ -816,7 +835,6 @@ export default function CandleChart({
           <polygon points={points} fill={m.isWin ? colorBull : colorBear} />
         );
       })()}
-      {/* exit marker: X */}
       <g
         transform={`translate(${m.x2},${m.y2})`}
         stroke={m.isWin ? colorBull : colorBear}
@@ -826,7 +844,6 @@ export default function CandleChart({
         <line x1={-4} y1={4} x2={4} y2={-4} />
       </g>
 
-      {/* TP/SL markers (linhas horizontais pontilhadas) */}
       {typeof m.yTP === "number" && (
         <line
           x1={Math.min(m.x1, m.x2)}
@@ -852,18 +869,14 @@ export default function CandleChart({
     </g>
   ));
 
-  // Eixo X em 5 marcações ao longo da janela visível
+  // Eixo X — usa formatWhen (naive quando sem TZ; Intl quando com TZ)
   const xAxisNodes =
     candles.length > 1 ? (
       <g>
         {[0, 0.25, 0.5, 0.75, 1].map((p, i) => {
           const idx = Math.round(startIndex + p * (endIndex - startIndex));
           const x = xForIndex(idx);
-          const d = new Date(candles[idx].time);
-          const label =
-            d.toLocaleDateString() +
-            " " +
-            d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          const label = formatWhen(candles[idx].time);
           return (
             <g key={`xt-${i}`}>
               <line
@@ -888,79 +901,72 @@ export default function CandleChart({
       </g>
     ) : null;
 
-  // Crosshair + tooltip
+  // Crosshair + tooltip (usa formatWhen)
   const hoverNode =
     hoverIdx !== null && hoverIdx >= startIndex && hoverIdx <= endIndex
       ? (() => {
-          const c = candles[hoverIdx];
-          const x = xForIndex(hoverIdx);
-          const y = yForPrice(c.close);
-          const ema9v =
-            typeof ema9[hoverIdx] === "number"
-              ? (ema9[hoverIdx] as number)
-              : null;
-          const ema21v =
-            typeof ema21[hoverIdx] === "number"
-              ? (ema21[hoverIdx] as number)
-              : null;
-          const dt = new Date(c.time);
-          const pct = ((c.close - c.open) / (c.open || 1)) * 100;
+        const c = candles[hoverIdx];
+        const x = xForIndex(hoverIdx);
+        const y = yForPrice(c.close);
+        const ema9v =
+          typeof ema9[hoverIdx] === "number"
+            ? (ema9[hoverIdx] as number)
+            : null;
+        const ema21v =
+          typeof ema21[hoverIdx] === "number"
+            ? (ema21[hoverIdx] as number)
+            : null;
+        const whenStr = formatWhen(c.time);
+        const pct = ((c.close - c.open) / (c.open || 1)) * 100;
 
-          const boxW = 200;
-          const boxH = 96;
-          const bx = Math.min(x + 12, w - boxW - 6);
-          const by = Math.max(
-            paddingTop + 4,
-            Math.min(y - boxH / 2, h - paddingBottom - boxH - 4)
-          );
+        const boxW = 200;
+        const boxH = 96;
+        const bx = Math.min(x + 12, w - boxW - 6);
+        const by = Math.max(
+          paddingTop + 4,
+          Math.min(y - boxH / 2, h - paddingBottom - boxH - 4)
+        );
 
-          return (
-            <g>
-              {/* guia vertical */}
-              <line
-                x1={x}
-                y1={paddingTop}
-                x2={x}
-                y2={h - paddingBottom}
-                stroke={crosshair}
-                strokeDasharray="3 3"
-                strokeWidth={0.8}
-              />
-              {/* tooltip */}
-              <rect
-                x={bx}
-                y={by}
-                width={boxW}
-                height={boxH}
-                rx={8}
-                ry={8}
-                fill={tooltipBg}
-                stroke={tooltipBd}
-              />
-              <text x={bx + 8} y={by + 16} fontSize={12} fill={colorText}>
-                {dt.toLocaleDateString()}{" "}
-                {dt.toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </text>
-              <text x={bx + 8} y={by + 32} fontSize={12} fill={colorText}>
-                O:{c.open.toFixed(2)} H:{c.high.toFixed(2)} L:{c.low.toFixed(2)}
-              </text>
-              <text x={bx + 8} y={by + 48} fontSize={12} fill={colorText}>
-                C:{c.close.toFixed(2)} Δ:{(c.close - c.open).toFixed(2)} (
-                {pct.toFixed(2)}%)
-              </text>
-              <text x={bx + 8} y={by + 64} fontSize={12} fill={colorText}>
-                EMA9:{ema9v !== null ? ema9v.toFixed(2) : "—"} EMA21:
-                {ema21v !== null ? ema21v.toFixed(2) : "—"}
-              </text>
-            </g>
-          );
-        })()
+        return (
+          <g>
+            <line
+              x1={x}
+              y1={paddingTop}
+              x2={x}
+              y2={h - paddingBottom}
+              stroke={crosshair}
+              strokeDasharray="3 3"
+              strokeWidth={0.8}
+            />
+            <rect
+              x={bx}
+              y={by}
+              width={boxW}
+              height={boxH}
+              rx={8}
+              ry={8}
+              fill={tooltipBg}
+              stroke={tooltipBd}
+            />
+            <text x={bx + 8} y={by + 16} fontSize={12} fill={colorText}>
+              {whenStr}
+            </text>
+            <text x={bx + 8} y={by + 32} fontSize={12} fill={colorText}>
+              O:{c.open.toFixed(2)} H:{c.high.toFixed(2)} L:{c.low.toFixed(2)}
+            </text>
+            <text x={bx + 8} y={by + 48} fontSize={12} fill={colorText}>
+              C:{c.close.toFixed(2)} Δ:{(c.close - c.open).toFixed(2)} (
+              {pct.toFixed(2)}%)
+            </text>
+            <text x={bx + 8} y={by + 64} fontSize={12} fill={colorText}>
+              EMA9:{ema9v !== null ? ema9v.toFixed(2) : "—"} EMA21:
+              {ema21v !== null ? ema21v.toFixed(2) : "—"}
+            </text>
+          </g>
+        );
+      })()
       : null;
 
-  // Retângulo de seleção para zoom
   const selectionNode =
     sel.active && Math.abs(sel.x1 - sel.x0) > 2 ? (
       <rect
@@ -974,17 +980,15 @@ export default function CandleChart({
       />
     ) : null;
 
-  // Cursor visual
   const cursorStyle = isPanning ? "grabbing" : "crosshair";
 
-  // ======= Mini-mapa =======
+  // Mini-mapa
   const miniXForIndexGlobal = (i: number) => {
     if (candles.length <= 1) return paddingLeft;
     const rel = i / (candles.length - 1);
     return paddingLeft + rel * innerW;
   };
 
-  // escala Y global do mini-mapa
   const miniYForPrice = (() => {
     const allLows = candles.map((c) => c.low);
     const allHighs = candles.map((c) => c.high);
@@ -998,7 +1002,6 @@ export default function CandleChart({
       (1 - (p - minP) / Math.max(1e-9, maxP - minP)) * miniInnerH;
   })();
 
-  // path linha de fechamento no mini-mapa (downsample simples)
   const miniPath = useMemo(() => {
     if (candles.length === 0) return "";
     const step = Math.max(
@@ -1011,7 +1014,6 @@ export default function CandleChart({
       const y = miniYForPrice(candles[i].close).toFixed(1);
       pts.push(`${pts.length ? "L" : "M"} ${x} ${y}`);
     }
-    // garante último ponto
     const xEnd = miniXForIndexGlobal(candles.length - 1).toFixed(1);
     const yEnd = miniYForPrice(candles[candles.length - 1].close).toFixed(1);
     pts.push(`L ${xEnd} ${yEnd}`);
@@ -1036,7 +1038,6 @@ export default function CandleChart({
     };
 
     if (!inWindow) {
-      // clique fora: centraliza janela nesse ponto
       const rel = Math.min(1, Math.max(0, (x - paddingLeft) / innerW));
       const centerIndex = rel * (candles.length - 1);
       const newStart = centerIndex - (barsFit - 1) / 2;
@@ -1049,7 +1050,7 @@ export default function CandleChart({
     if (!miniDrag.current.active) return;
 
     const dx = e.clientX - miniDrag.current.startX;
-    const barsDelta = (dx / innerW) * (candles.length - 1); // proporcional ao total
+    const barsDelta = (dx / innerW) * (candles.length - 1);
     setOffset(clampOffset(miniDrag.current.startOffset + barsDelta));
   };
 
@@ -1062,7 +1063,6 @@ export default function CandleChart({
   };
 
   const onMiniWheel = (e: React.WheelEvent<SVGSVGElement>) => {
-    // zoom pelo mini-mapa (mesma lógica do principal)
     if (!enableNavigation) return;
     e.preventDefault();
     const step = Math.max(-1, Math.min(1, e.deltaY / 100));
@@ -1080,14 +1080,13 @@ export default function CandleChart({
     setOffset(clampOffset(newStart, newPx));
   };
 
-  // ======= Botões utilitários =======
   const goToEnd = () => {
     const fit = Math.max(1, Math.floor(innerW / Math.max(2, pxPerBar)));
     const start = Math.max(0, candles.length - fit);
     setOffset(start);
   };
 
-  // ======= Helpers Popover =======
+  // Helpers Popover
   const formatMinutes = (mins: number) => {
     if (!Number.isFinite(mins)) return "—";
     if (mins < 60) return `${Math.round(mins)} min`;
@@ -1102,7 +1101,6 @@ export default function CandleChart({
     setSelectedTrade(null);
   };
 
-  // Durations calculadas para o popover de trade
   const calcDurations = (t: Trade, iEntry: number, iExit: number) => {
     const candlesDur = Math.max(0, iExit - iEntry);
     let minutesDur = NaN;
@@ -1115,7 +1113,6 @@ export default function CandleChart({
     return { candlesDur, minutesDur };
   };
 
-  // ======= Métricas do candle selecionado =======
   const renderCandlePopover = () => {
     if (!selectedCandle) return null;
     const i = selectedCandle.idx;
@@ -1126,7 +1123,7 @@ export default function CandleChart({
     const upperWick = c.high - Math.max(c.open, c.close);
     const lowerWick = Math.min(c.open, c.close) - c.low;
     const pct = ((c.close - c.open) / (c.open || 1)) * 100;
-    const dt = new Date(c.time);
+    const when = formatWhen(c.time);
 
     return (
       <div
@@ -1150,10 +1147,7 @@ export default function CandleChart({
         onClick={(e) => e.stopPropagation()}
       >
         <div style={{ marginBottom: 6 }}>
-          <b>
-            {dt.toLocaleDateString()}{" "}
-            {dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-          </b>
+          <b>{when}</b>
         </div>
         <div>
           Open: {c.open.toFixed(2)} · High: {c.high.toFixed(2)}
@@ -1265,7 +1259,7 @@ export default function CandleChart({
           touchAction: "none",
           userSelect: "none",
           background: "transparent",
-          cursor: cursorStyle,
+          cursor: isPanning ? "grabbing" : "crosshair",
         }}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
@@ -1333,7 +1327,6 @@ export default function CandleChart({
         onMouseLeave={onMiniMouseLeave}
         onWheel={onMiniWheel}
       >
-        {/* Fundo e eixo */}
         <rect
           x={paddingLeft}
           y={miniPaddingTop}
@@ -1343,12 +1336,10 @@ export default function CandleChart({
           stroke={darkMode ? "#3f3f46" : "#e9ecef"}
         />
 
-        {/* Close line path */}
         {miniPath && (
           <path d={miniPath} fill="none" stroke={miniLine} strokeWidth={1} />
         )}
 
-        {/* Janela visível */}
         <rect
           x={miniWindowX}
           y={miniPaddingTop}
@@ -1360,7 +1351,7 @@ export default function CandleChart({
         />
       </svg>
 
-      {/* ======= Popover de Trade ======= */}
+      {/* Popover de Trade */}
       {selectedTrade && (
         <div
           className="trade-popover"
@@ -1389,13 +1380,14 @@ export default function CandleChart({
               selectedTrade.iEntry,
               selectedTrade.iExit
             );
+            const entryStr = t.entryTime ? formatWhen(t.entryTime) : "—";
+            const exitStr = t.exitTime ? formatWhen(t.exitTime) : "—";
             return (
               <>
                 <div style={{ marginBottom: 6 }}>
                   <b>{t.side || "—"}</b>{" "}
                   <span style={{ opacity: 0.7 }}>
-                    {t.entryTime ? new Date(t.entryTime).toLocaleString() : "—"}{" "}
-                    → {t.exitTime ? new Date(t.exitTime).toLocaleString() : "—"}
+                    {entryStr} → {exitStr}
                   </span>
                 </div>
                 <div>
@@ -1441,7 +1433,7 @@ export default function CandleChart({
         </div>
       )}
 
-      {/* ======= Popover de Candle ======= */}
+      {/* Popover de Candle */}
       {renderCandlePopover()}
     </div>
   );

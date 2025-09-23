@@ -41,7 +41,7 @@ function timeFormatterBRT(time: any /* Time */): string {
   return String(time ?? "");
 }
 
-// usado nos rótulos do tooltip custom
+// usado nos rótulos do tooltip custom e AGORA no eixo X
 function timeToLabelBRT(time: any /* Time */): string {
   if (typeof time === "number") {
     const d = new Date(time * 1000);
@@ -151,25 +151,44 @@ function AIChartWithMarkers() {
   // Controles locais para alternar entriesOnly via URL e re-renderizar
   const [, __forceRerender] = React.useReducer((c) => c + 1, 0);
   const { entriesOnly, reEntryBars, syncWithTrades, nextOpenEntry } = parseQS();
-  const setQS = React.useCallback((patch: Partial<{ entriesOnly: boolean; reEntryBars: number | string | null; syncWithTrades: boolean; nextOpenEntry: boolean; }>) => {
-    if (typeof window === "undefined") return;
-    const sp = new URLSearchParams(window.location.search);
-    if (patch.entriesOnly !== undefined) sp.set("entriesOnly", patch.entriesOnly ? "1" : "0");
-    if (patch.syncWithTrades !== undefined) sp.set("syncWithTrades", patch.syncWithTrades ? "1" : "0");
-    if (patch.nextOpenEntry !== undefined) sp.set("nextOpenEntry", patch.nextOpenEntry ? "1" : "0");
-    if (patch.reEntryBars !== undefined) {
-      const v: any = patch.reEntryBars;
-      if (v === null || v === "" || (typeof v === "number" && !Number.isFinite(v))) sp.delete("reEntryBars");
-      else sp.set("reEntryBars", String(v));
-    }
-    const url = window.location.pathname + "?" + sp.toString();
-    window.history.replaceState(null, "", url);
-    __forceRerender();
-  }, []);
+  const setQS = React.useCallback(
+    (
+      patch: Partial<{
+        entriesOnly: boolean;
+        reEntryBars: number | string | null;
+        syncWithTrades: boolean;
+        nextOpenEntry: boolean;
+      }>
+    ) => {
+      if (typeof window === "undefined") return;
+      const sp = new URLSearchParams(window.location.search);
+      if (patch.entriesOnly !== undefined)
+        sp.set("entriesOnly", patch.entriesOnly ? "1" : "0");
+      if (patch.syncWithTrades !== undefined)
+        sp.set("syncWithTrades", patch.syncWithTrades ? "1" : "0");
+      if (patch.nextOpenEntry !== undefined)
+        sp.set("nextOpenEntry", patch.nextOpenEntry ? "1" : "0");
+      if (patch.reEntryBars !== undefined) {
+        const v: any = patch.reEntryBars;
+        if (
+          v === null ||
+          v === "" ||
+          (typeof v === "number" && !Number.isFinite(v))
+        )
+          sp.delete("reEntryBars");
+        else sp.set("reEntryBars", String(v));
+      }
+      const url = window.location.pathname + "?" + sp.toString();
+      window.history.replaceState(null, "", url);
+      __forceRerender();
+    },
+    []
+  );
 
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<IChartApi | null>(null);
-  const seriesRef = React.useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null);
+  const seriesRef =
+    React.useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null);
 
   // Tempos existentes na série (em segundos UTC), em ordem asc
   const candleTimesRef = React.useRef<UTCTimestamp[]>([]);
@@ -198,6 +217,8 @@ function AIChartWithMarkers() {
         borderVisible: false,
         timeVisible: true,
         secondsVisible: false,
+        // >>> AQUI: formata os rótulos do eixo X em BRT (São Paulo)
+        tickMarkFormatter: (time: any /* Time */) => timeToLabelBRT(time),
       },
       crosshair: { mode: 0 },
       // crosshair/tooltip (não afeta eixo)
@@ -279,48 +300,49 @@ function AIChartWithMarkers() {
             count: candleTimesRef.current.length,
             first,
             last,
-            first_brt: first ? fmtTimeBRT.format(new Date((first as number) * 1000)) : null,
-            last_brt: last ? fmtTimeBRT.format(new Date((last as number) * 1000)) : null,
+            first_brt: first
+              ? fmtTimeBRT.format(new Date((first as number) * 1000))
+              : null,
+            last_brt: last
+              ? fmtTimeBRT.format(new Date((last as number) * 1000))
+              : null,
           });
         }
       } catch (e) {
         // eslint-disable-next-line no-console
-        console.warn("[AIChartWithMarkers] erro carregando candles", e)
+        console.warn("[AIChartWithMarkers] erro carregando candles", e);
       }
     })();
   }, [params?.symbol, params?.timeframe, params?.from, params?.to]);
 
   // Snap de um timestamp (seg UTC) ao candle mais próximo existente
-  const snapToExistingBar = React.useCallback(
-    (tsRaw: UTCTimestamp | null) => {
-      if (tsRaw == null) return null;
-      const arr = candleTimesRef.current;
-      if (!arr || arr.length === 0) return null;
+  const snapToExistingBar = React.useCallback((tsRaw: UTCTimestamp | null) => {
+    if (tsRaw == null) return null;
+    const arr = candleTimesRef.current;
+    if (!arr || arr.length === 0) return null;
 
-      // clamp a [first,last]
-      const first = arr[0] as number;
-      const last = arr[arr.length - 1] as number;
-      const ts = Math.max(first, Math.min(last, tsRaw as number));
+    // clamp a [first,last]
+    const first = arr[0] as number;
+    const last = arr[arr.length - 1] as number;
+    const ts = Math.max(first, Math.min(last, tsRaw as number));
 
-      // busca binária: candle mais próximo
-      let lo = 0,
-        hi = arr.length - 1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const v = arr[mid] as number;
-        if (v === (ts as number)) return v as UTCTimestamp;
-        if (v < (ts as number)) lo = mid + 1;
-        else hi = mid - 1;
-      }
-      const prev = arr[Math.max(0, hi)];
-      const next = arr[Math.min(arr.length - 1, lo)];
-      return Math.abs((prev as number) - (ts as number)) <=
-        Math.abs((next as number) - (ts as number))
-        ? prev
-        : next;
-    },
-    []
-  );
+    // busca binária: candle mais próximo
+    let lo = 0,
+      hi = arr.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const v = arr[mid] as number;
+      if (v === (ts as number)) return v as UTCTimestamp;
+      if (v < (ts as number)) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    const prev = arr[Math.max(0, hi)];
+    const next = arr[Math.min(arr.length - 1, lo)];
+    return Math.abs((prev as number) - (ts as number)) <=
+      Math.abs((next as number) - (ts as number))
+      ? prev
+      : next;
+  }, []);
 
   // Aplica markers (Projetados + Confirmados) com clamp de futuro
   const [diag, setDiag] = React.useState<{
@@ -347,7 +369,9 @@ function AIChartWithMarkers() {
     let confSrcFiltered = confSrc;
     if (entriesOnly) {
       const tfMin = tfToMinutes(params?.timeframe);
-      const reEntryBarsEff = Number.isFinite(reEntryBars) ? Math.max(0, Number(reEntryBars)) : (tfMin <= 1 ? 4 : 3);
+      const reEntryBarsEff = Number.isFinite(reEntryBars)
+        ? Math.max(0, Number(reEntryBars))
+        : (tfMin <= 1 ? 4 : 3);
       const asc = [...confSrc].sort((a: any, b: any) => {
         const ta = (a && a.time) ? Date.parse(a.time) : 0;
         const tb = (b && b.time) ? Date.parse(b.time) : 0;
@@ -380,8 +404,7 @@ function AIChartWithMarkers() {
     }
 
     // Contadores de origem (do store) — antes de qualquer transformação
-    let srcBuy = 0,
-      srcSell = 0;
+    let srcBuy = 0, srcSell = 0;
 
     // Limites temporais: agora (UTC) e extremos da série de candles
     const nowTs = Math.floor(Date.now() / 1000) as UTCTimestamp;
@@ -504,7 +527,14 @@ function AIChartWithMarkers() {
         droppedByTime,
       });
     }
-  }, [projectedRaw, confirmedRaw, snapToExistingBar, entriesOnly, reEntryBars, params?.timeframe]);
+  }, [
+    projectedRaw,
+    confirmedRaw,
+    snapToExistingBar,
+    entriesOnly,
+    reEntryBars,
+    params?.timeframe,
+  ]);
 
   return (
     <div className="container my-3">
@@ -513,7 +543,9 @@ function AIChartWithMarkers() {
           <div className="d-flex align-items-center gap-2 mb-2">
             <h6 className="mb-0">
               Gráfico de Candles &nbsp;
-              <small className="text-muted">com sinais projetados/confirmados</small>
+              <small className="text-muted">
+                com sinais projetados/confirmados
+              </small>
             </h6>
             <span className="ms-3 text-muted small">
               Projetados: <span className="text-success">BUY ↑</span> /{" "}
@@ -532,7 +564,10 @@ function AIChartWithMarkers() {
                   checked={entriesOnly}
                   onChange={(e) => setQS({ entriesOnly: e.target.checked })}
                 />
-                <label className="form-check-label" htmlFor="swChartEntriesOnly">
+                <label
+                  className="form-check-label"
+                  htmlFor="swChartEntriesOnly"
+                >
                   Só entradas
                 </label>
               </div>
@@ -542,8 +577,12 @@ function AIChartWithMarkers() {
           <div ref={containerRef} />
 
           <div className="mt-2 text-muted small">
-            <span className="me-3">src: BUY={diag.srcBuy} SELL={diag.srcSell}</span>
-            <span className="me-3">plotted: BUY={diag.plottedBuy} SELL={diag.plottedSell}</span>
+            <span className="me-3">
+              src: BUY={diag.srcBuy} SELL={diag.srcSell}
+            </span>
+            <span className="me-3">
+              plotted: BUY={diag.plottedBuy} SELL={diag.plottedSell}
+            </span>
             <span>descartados por tempo={diag.droppedByTime}</span>
           </div>
         </div>
