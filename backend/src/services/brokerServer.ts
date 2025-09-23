@@ -209,14 +209,14 @@ app.get("/api/backtest/run/:id", (req, res) => {
 
 /* --------- Start (PORTA PRÓPRIA DO BROKER) --------- */
 // ⚠️ NÃO usar process.env.PORT aqui para não colidir com o servidor principal/front.
-// Ordem de precedência: BROKER_HTTP_PORT > EXEC_PORT > 3005 (default do broker)
-const PORT = Number(process.env.BROKER_HTTP_PORT || process.env.EXEC_PORT || 3005);
+// Ordem de precedência: BROKER_HTTP_PORT > EXEC_PORT > 3002 (default do broker)
+const PORT = Number(process.env.BROKER_HTTP_PORT || process.env.EXEC_PORT || 3002);
 const server = http.createServer(app);
 
 server.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
         console.warn(`[EXEC+BT] porta ${PORT} ocupada — desativando broker sem derrubar o processo.`);
-        console.warn(`[EXEC+BT] Dica: defina BROKER_HTTP_PORT=3005 (ou outra livre).`);
+        console.warn(`[EXEC+BT] Dica: defina BROKER_HTTP_PORT=3002 (ou outra livre).`);
         // Não relança: só não inicia o broker; o restante da app (se importado) continua vivo.
         return;
     }
