@@ -1,6 +1,7 @@
 import React from "react";
 import { useAIStore } from "../store/ai";
 import { fetchCandles } from "../services/api";
+import OrderLogsModal from "./OrderLogsModal";
 
 /** ======= Helpers de formatação ======= */
 function fmtTime(iso?: string | null) {
@@ -124,6 +125,9 @@ export default function AIPnLPanel() {
       ? 4
       : 3;
 
+  // ===== Modal de LOG =====
+  const [openTaskId, setOpenTaskId] = React.useState<string | null>(null);
+
   /** ======= Carrega candles (para reconstrução quando necessário) ======= */
   const [candles, setCandles] = React.useState<
     { time: string; open: number; high: number; low: number; close: number }[]
@@ -176,19 +180,29 @@ export default function AIPnLPanel() {
       pnlMoney?: number;
       rr?: number;
       note?: string;
+      /** chave para abrir logs (taskId/entrySignalId) */
+      taskKey?: string | null;
     };
 
     const hasBacktest = Array.isArray(tradesStore) && tradesStore.length > 0;
     const preferBacktest = hasBacktest && !forceNextOpen;
 
     if (preferBacktest) {
-      // Mapeia trades do backtest para a mesma forma da visão, preservando BE
+      // Mapeia trades do backtest para a mesma forma, tentando extrair um identificador para logs
       const rows: T[] = (tradesStore as any[]).map((r: any) => {
-        const pnlPts = Number(r.pnl ?? (r.exitPrice - r.entryPrice) * (r.side === "BUY" ? 1 : -1)) || 0;
+        const pnlPts =
+          Number(r.pnl ?? (r.exitPrice - r.entryPrice) * (r.side === "BUY" ? 1 : -1)) || 0;
         const note =
           r.movedToBE
             ? (r.note ? String(r.note) + " (BE)" : "be/stop")
             : (r.note ?? undefined);
+
+        // 🔑 tentativas de chave: taskId > entrySignalId > (fallback sintético)
+        const taskKey =
+          (r as any).taskId ??
+          (r as any).entrySignalId ??
+          `${symbol}|${timeframe}|${r.entryTime}|${r.side}`;
+
         return {
           side: r.side,
           entryTime: r.entryTime,
@@ -199,6 +213,7 @@ export default function AIPnLPanel() {
           pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : pnlPts * Number(pointValue),
           rr: defaultRiskPoints !== 0 ? pnlPts / Number(defaultRiskPoints) : undefined,
           note,
+          taskKey,
         };
       });
       // ordena por entrada
@@ -208,7 +223,6 @@ export default function AIPnLPanel() {
 
     // Se não há backtest (ou forceNextOpen=1), reconstrói via “próximo open”
     if (!nextOpenEntry) {
-      // Sem reconstrução e sem backtest => devolve store “como está”
       const rows: T[] = Array.isArray(tradesStore) ? (tradesStore as any[]).map((r: any) => ({
         side: r.side,
         entryTime: r.entryTime,
@@ -219,6 +233,7 @@ export default function AIPnLPanel() {
         pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : Number(r.pnl ?? 0) * Number(pointValue),
         rr: defaultRiskPoints !== 0 ? Number(r.pnl ?? 0) / Number(defaultRiskPoints) : undefined,
         note: r.note ?? undefined,
+        taskKey: (r as any).taskId ?? (r as any).entrySignalId ?? `${symbol}|${timeframe}|${r.entryTime}|${r.side}`,
       })) : [];
       rows.sort((a, b) => (toTs(a.entryTime)! - toTs(b.entryTime)!));
       return { tradesView: rows, policyUsed: "store" as const };
@@ -240,6 +255,7 @@ export default function AIPnLPanel() {
         pnlMoney: Number.isFinite(Number(r.pnlMoney)) ? Number(r.pnlMoney) : Number(r.pnl ?? 0) * Number(pointValue),
         rr: defaultRiskPoints !== 0 ? Number(r.pnl ?? 0) / Number(defaultRiskPoints) : undefined,
         note: r.note ?? undefined,
+        taskKey: (r as any).taskId ?? (r as any).entrySignalId ?? `${symbol}|${timeframe}|${r.entryTime}|${r.side}`,
       })) : [];
       rows.sort((a, b) => (toTs(a.entryTime)! - toTs(b.entryTime)!));
       return { tradesView: rows, policyUsed: "store" as const };
@@ -271,6 +287,7 @@ export default function AIPnLPanel() {
       entryPrice: number;
       entrySigName: string;
       entrySigTimeISO: string;
+      entrySignalId?: string | number | null;
     } = null;
     let lastCloseIdx: number | null = null;
 
@@ -295,6 +312,14 @@ export default function AIPnLPanel() {
       const side = String(s.side).toUpperCase() as "BUY" | "SELL";
       const sigName = pickSigName(s);
 
+      // tente detectar um id do sinal confirmado (vindo do backend/prisma, se houver)
+      const sigId =
+        (s as any).id ??
+        (s as any).signalId ??
+        (s as any).entrySignalId ??
+        (s as any).taskId ??
+        null;
+
       if (position === null) {
         position = {
           side,
@@ -303,6 +328,7 @@ export default function AIPnLPanel() {
           entryPrice: Number(openBar.open),
           entrySigName: sigName,
           entrySigTimeISO: String(s.time),
+          entrySignalId: sigId ?? undefined,
         };
       } else if (side !== position.side) {
         const exitBar = openBar;
@@ -322,6 +348,11 @@ export default function AIPnLPanel() {
           `saída: reversão${exitSigName ? ` (${exitSigName})` : ""} — próx. abertura • ` +
           `hold: ${holdBars} barra${holdBars === 1 ? "" : "s"} (${holdMin}min)`;
 
+        // 🔑 chave de logs preferindo id real do sinal
+        const taskKey =
+          (position.entrySignalId != null ? String(position.entrySignalId) : null) ??
+          `${symbol}|${timeframe}|${position.entryTime}|${position.side}`;
+
         out.push({
           side: position.side,
           entryTime: position.entryTime,
@@ -332,6 +363,7 @@ export default function AIPnLPanel() {
           pnlMoney: pnlPts * Number(pointValue),
           rr: defaultRiskPoints !== 0 ? pnlPts / Number(defaultRiskPoints) : undefined,
           note: noteRich,
+          taskKey,
         });
 
         lastCloseIdx = exitIdx;
@@ -350,6 +382,8 @@ export default function AIPnLPanel() {
     tfMin,
     pointValue,
     defaultRiskPoints,
+    symbol,
+    timeframe,
   ]);
 
   const totals = React.useMemo(() => {
@@ -431,6 +465,11 @@ export default function AIPnLPanel() {
     policyUsed,
   ]);
 
+  const onClickSide = (t: any) => {
+    const key = t?.taskKey;
+    if (key) setOpenTaskId(String(key));
+  };
+
   return (
     <div className="container my-3">
       <div className="card shadow-sm border-0">
@@ -498,6 +537,7 @@ export default function AIPnLPanel() {
           <div className="mb-2">
             <span className="badge bg-success me-2">BUY: {totals.buy}</span>
             <span className="badge bg-danger">SELL: {totals.sell}</span>
+            <span className="ms-3 text-muted small">dica: clique no <b>Lado</b> para ver o LOG</span>
           </div>
 
           {/* Tabela de trades */}
@@ -538,15 +578,26 @@ export default function AIPnLPanel() {
                         ? pnlPts / defaultRiskPoints
                         : NaN;
 
+                    const clickable = !!t.taskKey;
+
                     return (
                       <tr key={`${t.entryTime ?? "t"}_${idx}`}>
                         <td>
-                          <span
-                            className="badge"
-                            style={{ backgroundColor: sideBg, color: "#fff", fontWeight: 600 }}
+                          <button
+                            type="button"
+                            className="badge border-0"
+                            style={{
+                              backgroundColor: sideBg,
+                              color: "#fff",
+                              fontWeight: 600,
+                              cursor: clickable ? "pointer" : "not-allowed",
+                              opacity: clickable ? 1 : 0.7,
+                            }}
+                            title={clickable ? "Ver LOG da ordem" : "Sem id para logs"}
+                            onClick={() => clickable && onClickSide(t)}
                           >
                             {t.side}
-                          </span>
+                          </button>
                         </td>
                         <td><code>{fmtTime(t.entryTime)}</code></td>
                         <td><code>{fmtTime(t.exitTime)}</code></td>
@@ -572,6 +623,11 @@ export default function AIPnLPanel() {
           </div>
         </div>
       </div>
+
+      {/* Modal de Logs */}
+      {openTaskId && (
+        <OrderLogsModal taskId={openTaskId} onClose={() => setOpenTaskId(null)} />
+      )}
     </div>
   );
 }

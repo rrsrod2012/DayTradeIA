@@ -1032,6 +1032,103 @@ app.get("/api/debug/availability", async (_req, res) => {
 });
 
 /* =========================
+   /api/order-logs — eventos por taskId/key
+   ========================= */
+app.get("/api/order-logs", async (req, res) => {
+  noStore(res);
+  try {
+    const keyRaw = String(req.query.taskId ?? req.query.key ?? req.query.id ?? "").trim();
+    const limit = req.query.limit ? Math.min(1000, Math.max(1, Number(req.query.limit))) : 300;
+    if (!keyRaw) {
+      return res.status(400).json({ ok: false, error: "Faltou 'taskId' (ou 'key')" });
+    }
+
+    // helpers p/ tentar múltiplos modelos/colunas sem quebrar tipagem
+    async function tryModel(
+      modelName: string,
+      where: Record<string, any>,
+      orderBy: any = { createdAt: "desc" as const }
+    ): Promise<{ model: string; rows: any[] } | null> {
+      const m = (prisma as any)?.[modelName];
+      if (!m?.findMany) return null;
+      try {
+        const rows = await m.findMany({ where, orderBy, take: limit });
+        return { model: modelName, rows };
+      } catch {
+        return null; // coluna inexistente nesse modelo? sem crise
+      }
+    }
+
+    // Tentativas por taskId (string)
+    const attempts: Array<Promise<{ model: string; rows: any[] } | null>> = [
+      tryModel("orderLog", { taskId: keyRaw }),
+      tryModel("mt5Event", { taskId: keyRaw }),
+      tryModel("notifyEvent", { taskId: keyRaw }),
+      tryModel("orderEvent", { taskId: keyRaw }),
+    ];
+
+    let usedModel: string | null = null;
+    let rows: any[] = [];
+    for (const p of attempts) {
+      const r = await p;
+      if (r && r.rows?.length) {
+        usedModel = r.model;
+        rows = r.rows;
+        break;
+      }
+    }
+
+    // Se não achou nada e key é número, tentar por entrySignalId numérico
+    if (!rows.length && /^\d+$/.test(keyRaw)) {
+      const keyNum = Number(keyRaw);
+      const attemptsNum: Array<Promise<{ model: string; rows: any[] } | null>> = [
+        tryModel("orderLog", { entrySignalId: keyNum }),
+        tryModel("mt5Event", { entrySignalId: keyNum }),
+        tryModel("notifyEvent", { entrySignalId: keyNum }),
+        tryModel("orderEvent", { entrySignalId: keyNum }),
+      ];
+      for (const p of attemptsNum) {
+        const r = await p;
+        if (r && r.rows?.length) {
+          usedModel = r.model;
+          rows = r.rows;
+          break;
+        }
+      }
+    }
+
+    // Normaliza saída para o modal
+    const out = rows.map((r: any) => ({
+      at: r.createdAt
+        ? new Date(r.createdAt).toISOString()
+        : r.at
+          ? new Date(r.at).toISOString()
+          : null,
+      taskId: r.taskId ?? keyRaw,
+      entrySignalId: r.entrySignalId ?? null,
+      level: r.level || r.severity || r.status || "info",
+      type: r.type || r.eventType || r.kind || null,
+      message: r.message || r.text || r.msg || r.description || null,
+      data: r.data || r.payload || r.extra || null,
+      symbol: r.symbol || r.instrument || null,
+      price: Number.isFinite(Number(r.price)) ? Number(r.price) : null,
+      brokerOrderId: r.brokerOrderId ?? r.ticket ?? null,
+    }));
+
+    return res.json({
+      ok: true,
+      key: keyRaw,
+      modelUsed: usedModel,
+      count: out.length,
+      logs: out,
+    });
+  } catch (e: any) {
+    console.error("[/api/order-logs] erro:", e?.message || e);
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================
    /api/trades
    ========================= */
 app.get("/api/trades", async (req, res) => {
@@ -1083,6 +1180,14 @@ app.get("/api/trades", async (req, res) => {
     const out = filtered.map((tr) => {
       const entryTime = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time).toISOString() : null;
       const exitTime = tr.exitSignal?.candle?.time ? new Date(tr.exitSignal.candle.time).toISOString() : null;
+
+      // tenta expor taskId se existir no schema (defensivo)
+      const taskId =
+        (tr as any).taskId ??
+        (tr as any).entryTaskId ??
+        (tr as any).orderTaskId ??
+        null;
+
       return {
         id: tr.id,
         symbol: tr.instrument.symbol,
@@ -1091,6 +1196,7 @@ app.get("/api/trades", async (req, res) => {
         side: tr.entrySignal?.side || null,
         entrySignalId: tr.entrySignalId,
         exitSignalId: tr.exitSignalId,
+        taskId, // <<=== novo (opcional)
         entryPrice: tr.entryPrice,
         exitPrice: tr.exitPrice,
         // ⬇ sua UI às vezes lê pnlMoney; aqui exponho os dois
@@ -1338,7 +1444,7 @@ app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     service: "server",
-    version: "server:v5-with-inline-backtest:fix-404+fix-be+trace+sameBarExit+debug",
+    version: "server:v6-inline-backtest+logs-endpoint",
   })
 );
 
