@@ -578,7 +578,9 @@ export default function AIPnLPanel() {
                         ? pnlPts / defaultRiskPoints
                         : NaN;
 
-                    const clickable = !!t.taskKey;
+                    // só habilita clique quando a chave parece válida p/ backend (sem fallback sintético)
+                    const isLikelyKey = typeof t.taskKey === 'string' && !String(t.taskKey).includes('|');
+                    const clickable = !!t.taskKey && isLikelyKey;
 
                     return (
                       <tr key={`${t.entryTime ?? "t"}_${idx}`}>

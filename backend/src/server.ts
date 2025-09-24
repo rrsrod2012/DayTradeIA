@@ -143,6 +143,25 @@ app.options(
 
 app.use(express.json({ limit: "5mb" }));
 
+/** =========================
+ * Gate opcional por API key (EA)
+ * ========================= */
+const EA_KEY = (process.env.EA_API_KEY || "").trim();
+function requireEAKey(paths: string[]) {
+  app.use(paths, (req, res, next) => {
+    if (!EA_KEY) return next(); // sem chave => livre (modo dev)
+    const k = String(req.headers["x-ea-key"] || "");
+    if (k !== EA_KEY) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    return next();
+  });
+}
+// ⚠️ aplicando gate SOMENTE em /api/signals/projected por padrão
+requireEAKey(["/api/signals/projected"]);
+// Se quiser proteger também os confirmados, descomente:
+// requireEAKey(["/api/signals"]);
+
 /**
  * Ordem:
  * - fallbacks de backtest **antes** dos routers legados
@@ -161,6 +180,23 @@ if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.us
 } else {
   logger.warn("[SERVER] notifyRoutes NÃO exportou um Router válido (default ou named). Rota /notify desabilitada.");
 }
+
+/** =========================
+ * TRACE de chamadas do EA/Front para sinais
+ * ========================= */
+app.use(["/api/signals", "/api/signals/projected"], (req, _res, next) => {
+  if (req.method !== "OPTIONS") {
+    const payload = req.method === "GET" ? req.query : req.body;
+    logger.info("[TRACE signals]", {
+      path: req.path,
+      method: req.method,
+      q: payload,
+      ua: req.headers["user-agent"] || null,
+      ip: req.ip,
+    });
+  }
+  next();
+});
 
 /* =========================
    BACKTEST — Fallbacks inline p/ /api/backtest e /backtest
@@ -773,6 +809,9 @@ if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.us
         expectedValuePoints?: number | null;
         time: string;
         date: string;
+        // ===== Novos campos p/ EA/dedupe:
+        source?: "projected";
+        entryKey?: string;
       };
       const out: Row[] = [];
 
@@ -869,6 +908,8 @@ if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.us
         if (evPts < Number(minEV)) continue;
 
         out.push({
+          source: "projected",
+          entryKey: `${sym}|${tfU}|${candles[i].time.toISOString()}|${isBuy ? "BUY" : "SELL"}`,
           side: isBuy ? "BUY" : "SELL",
           suggestedEntry: entry,
           stopSuggestion: sl,
@@ -983,6 +1024,8 @@ app.get("/api/signals", async (req, res) => {
       if (!crossUp && !crossDn) continue;
 
       out.push({
+        source: "confirmed",
+        entryKey: `${symbol}|${timeframe}|${rows[i].time.toISOString()}|${crossUp ? "BUY" : "SELL"}`,
         side: crossUp ? "BUY" : "SELL",
         time: rows[i].time.toISOString(),
         price: Number(rows[i].close),
@@ -1444,7 +1487,7 @@ app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     service: "server",
-    version: "server:v6-inline-backtest+logs-endpoint",
+    version: "server:v7-inline-backtest+signals-trace+ea-key+entryKey",
   })
 );
 

@@ -44,7 +44,7 @@ export type ProjectedSignalsParams = {
   confirmTf?: string;
 
   // >>> novos (pass-through; backend pode ignorar sem quebrar)
-  bbEnabled?: boolean;
+  bbEnabled?: number | boolean;
   bbPeriod?: number;
   bbK?: number;
   candlePatterns?: string; // "engulfing,hammer,star,doji"
@@ -260,6 +260,7 @@ export async function projectedSignals(
     evRaw = evRaw === null || evRaw === undefined ? null : Number(evRaw);
     let expectedValuePoints: number | null =
       evRaw === null || !Number.isFinite(evRaw) ? null : evRaw;
+    // deixamos EV sempre positivo no frontend para SELL também (magnitude)
     if (expectedValuePoints !== null && side === "SELL") {
       expectedValuePoints = Math.abs(expectedValuePoints);
     }
@@ -678,4 +679,86 @@ export async function enqueueMT5Order(
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(envelope),
   });
+}
+
+/* =========================
+   (NOVO) /api/trades (diagnóstico rápido)
+   ========================= */
+export type TradeRow = {
+  id: number;
+  symbol: string;
+  timeframe: string;
+  qty: number;
+  side: "BUY" | "SELL" | null;
+  entrySignalId: number | null;
+  exitSignalId: number | null;
+  taskId?: string | null; // <- pode vir do backend (quando existir)
+  entryPrice: number | null;
+  exitPrice: number | null;
+  pnlPoints: number | null;
+  pnlMoney: number | null;
+  entryTime: string | null; // ISO
+  exitTime: string | null;  // ISO
+};
+
+export async function fetchTrades(params: {
+  symbol?: string;
+  timeframe?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+}): Promise<TradeRow[]> {
+  const q = new URLSearchParams();
+  if (params.symbol) q.set("symbol", params.symbol.toUpperCase());
+  if (params.timeframe) q.set("timeframe", params.timeframe.toUpperCase());
+  if (params.from) q.set("from", params.from);
+  if (params.to) q.set("to", params.to);
+  if (params.limit) q.set("limit", String(params.limit));
+  const raw = await jsonFetch<any>(`/api/trades?${q.toString()}`, { method: "GET" });
+  const arr: any[] = Array.isArray(raw) ? raw : (raw?.data || raw?.rows || []);
+  return arr.map((t: any) => ({
+    id: Number(t.id),
+    symbol: String(t.symbol ?? ""),
+    timeframe: String(t.timeframe ?? ""),
+    qty: Number(t.qty ?? 0),
+    side: t.side ? normalizeSide(t.side) : null,
+    entrySignalId: t.entrySignalId ?? null,
+    exitSignalId: t.exitSignalId ?? null,
+    taskId: t.taskId ?? null,
+    entryPrice: t.entryPrice != null ? Number(t.entryPrice) : null,
+    exitPrice: t.exitPrice != null ? Number(t.exitPrice) : null,
+    pnlPoints: t.pnlPoints != null ? Number(t.pnlPoints) : null,
+    pnlMoney: t.pnlMoney != null ? Number(t.pnlMoney) : null,
+    entryTime: t.entryTime ?? null,
+    exitTime: t.exitTime ?? null,
+  }));
+}
+
+/* =========================
+   (NOVO) /api/order-logs (ligação tarefa↔ordem)
+   ========================= */
+export type OrderLogEntry = {
+  at: string | null;         // ISO
+  taskId: string | null;
+  entrySignalId: number | null;
+  level: string | null;      // "info" | "warn" | "error" | ...
+  type: string | null;       // "order_ok" | "order_fail" | "market_closed" | ...
+  message: string | null;
+  data: any | null;
+  symbol: string | null;
+  price: number | null;
+  brokerOrderId: string | null; // ticket/ordem no broker (quando houver)
+};
+
+export async function fetchOrderLogs(key: string | number, limit = 300): Promise<{
+  ok: boolean;
+  key: string;
+  modelUsed?: string | null;
+  count: number;
+  logs: OrderLogEntry[];
+}> {
+  const q = new URLSearchParams();
+  q.set("taskId", String(key));
+  q.set("limit", String(limit));
+  return jsonFetch<any>(`/api/order-logs?${q.toString()}`, { method: "GET" });
 }
