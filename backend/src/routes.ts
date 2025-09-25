@@ -665,3 +665,41 @@ router.get("/ml/auto/status", async (_req, res) => {
 });
 
 export default router;
+
+
+/* ===== Broker: execuções reais e comparativo ===== */
+router.get("/api/broker/executions", async (req, res) => {
+  try {
+    const { symbol, from, to } = req.query as any;
+    const where: any = {};
+    if (symbol) where.symbol = String(symbol);
+    if (from || to) {
+      where.time = {};
+      if (from) where.time.gte = parse(String(from));
+      if (to) where.time.lte = parse(String(to), true);
+    }
+    const rows = await prisma.brokerExecution.findMany({
+      where,
+      orderBy: { time: "asc" },
+    });
+    return res.status(200).json({ ok: true, rows });
+  } catch (e: any) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+router.get("/api/broker/compare", async (req, res) => {
+  try {
+    const tradeId = Number((req.query?.tradeId as any) || 0);
+    if (!tradeId) return res.status(200).json({ ok: false, error: "faltou tradeId" });
+    const trade = await prisma.trade.findUnique({ where: { id: tradeId } });
+    if (!trade) return res.status(200).json({ ok: false, error: "trade não encontrado" });
+    const rows = await prisma.brokerExecution.findMany({
+      where: { taskId: { contains: `trade-${tradeId}-` } },
+      orderBy: { createdAt: "asc" },
+    });
+    return res.status(200).json({ ok: true, trade, executions: rows });
+  } catch (e: any) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});

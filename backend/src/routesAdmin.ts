@@ -221,13 +221,13 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
       candles.length > 0
         ? candles
         : await prisma.candle.findMany({
-            where: {
-              instrumentId: instrument.id,
-              timeframe,
-              time: { gte, lte },
-            },
-            orderBy: { time: "asc" },
-          });
+          where: {
+            instrumentId: instrument.id,
+            timeframe,
+            time: { gte, lte },
+          },
+          orderBy: { time: "asc" },
+        });
 
     if (!tfCandles.length) {
       return res.json({
@@ -318,3 +318,83 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
 });
 
 export default router;
+
+
+/**
+ * Gera task de execução real (EA/MT5) a partir de um Trade existente,
+ * replicando parâmetros do pipeline para SL/TP/BE e usando o agregador para ATR.
+ * POST /exec/trigger-from-trade/:id?agentId=MT5
+ */
+import { enqueue as brokerEnqueue } from "./services/brokerPersist";
+import { loadCandlesAnyTF } from "./lib/aggregation";
+import { DateTime } from "luxon";
+
+router.post("/exec/trigger-from-trade/:id", async (req, res) => {
+  try {
+    const id = Number(req.params?.id || 0);
+    const agentId = String((req.query?.agentId as any) || "MT5");
+    if (!id) return res.status(200).json({ ok: false, error: "faltou id" });
+
+    const trade = await prisma.trade.findUnique({
+      where: { id },
+      include: {
+        instrument: true,
+        entrySignal: { include: { candle: true } },
+      },
+    });
+    if (!trade) return res.status(200).json({ ok: false, error: "trade não encontrado" });
+    const symbol = trade.instrument?.symbol || "WIN";
+    const timeframe = trade.entrySignal?.timeframe || "M5";
+    const entryTime = trade.entrySignal?.time || trade.entryAt || trade.createdAt;
+
+    // ATR14 no mesmo TF/instante
+    const to = DateTime.fromJSDate(entryTime).toUTC();
+    const from = to.minus({ hours: 24 });
+    const candles = await loadCandlesAnyTF(symbol, timeframe, { gte: from.toJSDate(), lte: to.toJSDate() });
+    // cálculo simples ATR14 (true range em pontos)
+    function atr14(cs: any[]) {
+      const n = 14;
+      if (cs.length < n + 1) return 100;
+      let sum = 0;
+      for (let i = cs.length - n; i < cs.length; i++) {
+        const c = cs[i];
+        const p = cs[i - 1];
+        const tr = Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
+        sum += tr;
+      }
+      return Math.round(sum / n);
+    }
+    const atr = atr14(candles);
+
+    const SL_ATR = Number(process.env.AUTO_TRAINER_SL_ATR || 1.5);
+    const RR = Number(process.env.AUTO_TRAINER_RR || 2);
+    const beAt = Number(process.env.AUTO_TRAINER_BE_AT_PTS || 0);
+    const beOff = Number(process.env.AUTO_TRAINER_BE_OFFSET_PTS || 0);
+
+    const slPoints = Math.round(atr * SL_ATR);
+    const tpPoints = Math.round(atr * RR);
+
+    const side = trade.side as any; // "BUY" | "SELL"
+    const volume = Number(trade.qty || 1);
+
+    const task = {
+      id: `trade-${trade.id}-${Date.now()}`,
+      side,
+      symbol,
+      timeframe,
+      time: entryTime,
+      price: trade.entryPrice || undefined,
+      volume,
+      slPoints,
+      tpPoints,
+      beAtPoints: beAt || null,
+      beOffsetPoints: beOff || null,
+      comment: `trade#${trade.id}`,
+    };
+
+    const r = brokerEnqueue(agentId, [task]);
+    return res.status(200).json({ ok: true, agentId, enqueued: r, task });
+  } catch (e: any) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});

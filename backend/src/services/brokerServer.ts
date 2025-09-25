@@ -5,6 +5,7 @@ import express from "express";
 import http from "http";
 
 // ===== EXEC: persistência mínima em memória =====
+import { persistAck, persistTask } from "./brokerPrisma";
 import {
     setEnabled,
     isEnabled,
@@ -82,7 +83,7 @@ app.get("/enable", (req, res) => {
     res.status(200).json(ok({ enabled: val }));
 });
 
-app.post("/enqueue", (req, res) => {
+app.post("/enqueue", async (req, res) => {
     try {
         const body = req.body || {};
         const agentId = String(body.agentId || "mt5-ea-1").trim();
@@ -90,6 +91,8 @@ app.post("/enqueue", (req, res) => {
         if (!agentId) return res.status(200).json(bad("faltou agentId"));
         if (!tasks.length) return res.status(200).json(bad("tasks vazio"));
         const r = enqueue(agentId, tasks); // aceita mesmo com enabled=false
+        // persist each task
+        try { for (const t of tasks) { await persistTask(agentId, t); } } catch { }
         return res.status(200).json(ok({ agentId, ...r }));
     } catch (e: any) {
         return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
@@ -113,7 +116,7 @@ app.post("/poll", (req, res) => {
     }
 });
 
-app.post("/ack", (req, res) => {
+app.post("/ack", async (req, res) => {
     try {
         const body = req.body || {};
         const agentId = String(body.agentId || "mt5-ea-1").trim();
@@ -121,6 +124,7 @@ app.post("/ack", (req, res) => {
         if (!agentId) return res.status(200).json(bad("faltou agentId"));
         if (!done.length) return res.status(200).json(bad("done vazio"));
         const r = ackPersist(agentId, done);
+        try { await persistAck(agentId, done); } catch { }
         return res.status(200).json(ok({ agentId, ...r }));
     } catch (e: any) {
         return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));

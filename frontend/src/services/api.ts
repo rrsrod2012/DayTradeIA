@@ -1,4 +1,16 @@
 // Frontend API client — daytrade-ia
+// frontend/src/services/api.ts
+
+import axios from "axios";
+
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3002";
+
+// Comparação detalhada: Simulado vs Real
+export async function getBrokerComparison(tradeId: number) {
+  const { data } = await axios.get(`/admin/broker/compare-detailed?tradeId=${tradeId}`);
+  return data;
+}
+
 
 export type Candle = {
   time: string; // ISO

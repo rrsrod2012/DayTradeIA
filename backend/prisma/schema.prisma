@@ -136,3 +136,37 @@ model TrainingMetric {
   ev           Float?     // expected value estimado no passo
   createdAt    DateTime   @default(now())
 }
+
+
+model BrokerTask {
+  id             String   @id
+  agentId        String
+  side           String
+  symbol         String?
+  timeframe      String?
+  time           DateTime?
+  price          Int?
+  volume         Int?
+  slPoints       Int?
+  tpPoints       Int?
+  beAtPoints     Int?
+  beOffsetPoints Int?
+  comment        String?
+  createdAt      DateTime @default(now())
+}
+
+model BrokerExecution {
+  id        Int      @id @default(autoincrement())
+  taskId    String?
+  agentId   String
+  side      String
+  symbol    String?
+  orderId   String?
+  status    String?
+  time      DateTime?
+  price     Int?
+  volume    Int?
+  pnlPoints Int?
+  raw       String?
+  createdAt DateTime @default(now())
+}

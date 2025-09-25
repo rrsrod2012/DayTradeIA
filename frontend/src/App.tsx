@@ -6,6 +6,7 @@ import AIPnLPanel from "./components/AIPnLPanel";
 import AIChartWithMarkers from "./components/AIChartWithMarkers";
 import ImportProgress from "./components/ImportProgress";
 import { AIControlsProvider } from "./components/AIControlsContext";
+import { BrokerComparison } from "./components/BrokerComparison";
 
 // NOVO: tabela de trades (usa /api/trades)
 import AITradesPanel from "./components/AITradesPanel";
@@ -28,6 +29,9 @@ export default function App() {
 
       {/* Resumo de PnL (backtest) */}
       <AIPnLPanel />
+
+      {/* Exemplo: comparar trade #123 */}
+      <BrokerComparison tradeId={123} />
     </AIControlsProvider>
   );
 }

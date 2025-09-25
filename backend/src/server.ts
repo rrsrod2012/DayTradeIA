@@ -3,7 +3,11 @@ import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import routes from "./routes";
+
 import adminRoutes from "./routesAdmin";
+// novo arquivo aditivo
+import routesAdminCompare from "./routesAdminCompare";
+
 import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
 import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
 import { setupWS } from "./services/ws";
@@ -1469,6 +1473,8 @@ app.get("/admin/trades/inspect", async (req, res) => {
 
 // ====== ROTAS LEGADAS ======
 app.use("/api", routes);
+
+app.use("/admin", routesAdminCompare);  // adiciona /admin/broker/compare-detailed
 app.use("/admin", adminRoutes);
 
 // (opcional) dump da pilha de rotas p/ checar ordem real
@@ -1536,19 +1542,22 @@ server.listen(PORT, () => {
 
   // AutoTrainer on boot (se configurado)
   try {
-    if ((process.env.MICRO_MODEL_URL || "").trim()) {
+    const MICRO = (process.env.MICRO_MODEL_URL || "").trim();
+    const ENABLED = String(process.env.AUTO_TRAINER_BE_ENABLED ?? "1");
+    const IS_ENABLED = !(ENABLED === "0" || /^false$/i.test(ENABLED));
+    if (MICRO && IS_ENABLED) {
       const r = startAutoTrainer?.();
       if ((r as any)?.ok !== false) {
         logger.info("[AutoTrainer] iniciado automaticamente");
       } else {
         logger.warn("[AutoTrainer] não iniciou automaticamente", r);
       }
-    } else {
+    } else if (!MICRO) {
       logger.warn("[AutoTrainer] MICRO_MODEL_URL não configurada — treino contínuo inativo");
+    } else {
+      logger.info("[AutoTrainer] AUTO_TRAINER_BE_ENABLED=false — não iniciar no boot");
     }
   } catch (e: any) {
     logger.warn("[AutoTrainer] falha ao iniciar no boot", { err: e?.message || e });
   }
 });
-
-export default server;
