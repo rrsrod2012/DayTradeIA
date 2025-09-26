@@ -18,7 +18,7 @@ try {
   eventBus = null;
 }
 
-async function upsertInstrument(symbol: string) {
+async function upsertInstrument(symbol) {
   const s = String(symbol || "").trim().toUpperCase();
   if (!s) throw new Error("Símbolo inválido");
   const existing = await prisma.instrument.findFirst({
@@ -33,22 +33,7 @@ async function upsertInstrument(symbol: string) {
   return created.id;
 }
 
-async function upsertCandle({
-  instrumentId,
-  timeframe,
-  row,
-}: {
-  instrumentId: number;
-  timeframe: string;
-  row: {
-    time: Date;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number | null;
-  };
-}) {
+async function upsertCandle({ instrumentId, timeframe, row }) {
   const existing = await prisma.candle.findFirst({
     where: { instrumentId, time: row.time, timeframe },
     select: { id: true },
@@ -65,7 +50,7 @@ async function upsertCandle({
         volume: row.volume,
       },
     });
-    return { id: existing.id, action: "updated" as const };
+    return { id: existing.id, action: "updated" };
   } else {
     const created = await prisma.candle.create({
       data: {
@@ -80,16 +65,16 @@ async function upsertCandle({
       },
       select: { id: true },
     });
-    return { id: created.id, action: "inserted" as const };
+    return { id: created.id, action: "inserted" };
   }
 }
 
-async function countLines(filePath: string) {
+async function countLines(filePath) {
   try {
     let total = 0;
     await new Promise((resolve, reject) => {
       const s = fs.createReadStream(filePath);
-      s.on("data", (buf: Buffer) => {
+      s.on("data", (buf) => {
         let i = -1;
         total--;
         do {
@@ -107,7 +92,7 @@ async function countLines(filePath: string) {
 }
 
 /** WINM5.csv → { symbol: "WIN", timeframe: "M5" } */
-function inferSymbolAndTFFromFilename(filePath: string) {
+function inferSymbolAndTFFromFilename(filePath) {
   const base = path.basename(filePath).replace(/\.[^.]+$/, "");
   const clean = base.replace(/[\s_-]+/g, "").toUpperCase();
   const m = /(M|H)?(\d+)$/.exec(clean);
@@ -121,21 +106,21 @@ function inferSymbolAndTFFromFilename(filePath: string) {
   return { symbol: clean.slice(0, 3), timeframe: "M5" };
 }
 
-function detectDelimiter(firstLine: string) {
+function detectDelimiter(firstLine) {
   if (firstLine.includes(";")) return ";";
   if (firstLine.includes(",")) return ",";
   if (firstLine.includes("\t")) return "\t";
   return ",";
 }
 
-function parseDateFlexible(s: string) {
+function parseDateFlexible(s) {
   const raw = String(s).trim().replace(/[“”"']/g, "");
   const hasOffset = /[zZ]$|[+-]\d{2}:\d{2}$/.test(raw);
 
   // 1) ISO
   let dt = hasOffset
-    ? DateTime.fromISO(raw, { setZone: true }) // respeita 'Z' ou offset presente
-    : DateTime.fromISO(raw, { zone: CSV_TZ }); // sem offset → CSV_TZ
+    ? DateTime.fromISO(raw, { setZone: true })
+    : DateTime.fromISO(raw, { zone: CSV_TZ });
 
   if (dt.isValid) return dt.toUTC().toJSDate();
 
@@ -164,16 +149,9 @@ function parseDateFlexible(s: string) {
   throw new Error(`Não consegui interpretar data/hora: "${s}"`);
 }
 
-function findHeaderIndexes(header: string, delim = ",") {
+function findHeaderIndexes(header, delim = ",") {
   const cols = header.split(delim).map((s) => s.trim().toLowerCase());
-  const idx = {
-    time: -1,
-    open: -1,
-    high: -1,
-    low: -1,
-    close: -1,
-    volume: -1,
-  };
+  const idx = { time: -1, open: -1, high: -1, low: -1, close: -1, volume: -1 };
   for (let i = 0; i < cols.length; i++) {
     const c = cols[i];
     if (idx.time < 0 && /^(time|date|datetime|data|hora)$/i.test(c)) idx.time = i;
@@ -188,68 +166,42 @@ function findHeaderIndexes(header: string, delim = ",") {
   return idx;
 }
 
-/** Tenta inferir se a 1ª linha é dado (headerless) do MT5 */
-function looksLikeDataRow(line: string, delim: string) {
+/** Heurística: primeira linha parece dado (MT5 headerless)? */
+function looksLikeDataRow(line, delim) {
   const parts = line.split(delim).map((s) => s.trim());
   if (parts.length < 5) return false;
-  // primeira coluna: data/hora (yyyy.MM.dd HH:mm[:ss] ou ISO)
   try {
     parseDateFlexible(parts[0]);
   } catch {
     return false;
   }
-  // colunas seguintes: números
   for (let i = 1; i <= 4; i++) {
     if (!/^-?\d+(\.\d+)?$/.test(parts[i])) return false;
   }
-  // volume (se existir) também numérico
-  if (parts[5] != null && parts[5] !== "" && !/^\d+(\.\d+)?$/.test(parts[5]))
-    return false;
+  if (parts[5] != null && parts[5] !== "" && !/^\d+(\.\d+)?$/.test(parts[5])) return false;
   return true;
 }
 
 /* ------------------ Import principal ------------------ */
-async function importCsv(filePath: string) {
-  if (!fs.existsSync(filePath))
-    throw new Error(`Arquivo não encontrado: ${filePath}`);
+// AGORA ACEITA opts: { timeframe?: string }
+async function importCsv(filePath, opts = {}) {
+  if (!fs.existsSync(filePath)) throw new Error(`Arquivo não encontrado: ${filePath}`);
 
   const t0 = Date.now();
   const file = path.basename(filePath);
-  const { symbol, timeframe } = inferSymbolAndTFFromFilename(filePath);
+  const inf = inferSymbolAndTFFromFilename(filePath);
 
-  // ---- Guardrail opcional: aceitar apenas CSVs M1 quando IMPORT_M1_ONLY=true
-  const __M1_ONLY = String(process.env.IMPORT_M1_ONLY || "").toLowerCase() === "true";
-  if (__M1_ONLY && timeframe !== "M1") {
-    const totalLines = await countLines(filePath);
-    try {
-      eventBus?.emit?.("csv:skipped", {
-        file,
-        symbol,
-        timeframe,
-        reason: "IMPORT_M1_ONLY",
-        total: totalLines ?? null,
-      });
-    } catch { }
-    const durationMs = Date.now() - t0;
-    const outSkip = {
-      ok: true,
-      skipped: true,
-      reason: "IMPORT_M1_ONLY",
-      file,
-      symbol,
-      timeframe,
-      inserted: 0,
-      updated: 0,
-      processed: 0,
-      total: totalLines ?? 0,
-      durationMs,
-    };
-    console.warn(JSON.stringify({ msg: "[CSVImporter] ignorado IMPORT_M1_ONLY", ...outSkip }));
-    return outSkip;
-  }
+  // TF efetivo (prioridade: opts.timeframe -> CSV_FORCE_TF -> CSV_TF -> "M1")
+  let effectiveTF = String(
+    opts?.timeframe || process.env.CSV_FORCE_TF || process.env.CSV_TF || "M1"
+  ).toUpperCase();
 
+  // Se quiser forçar "somente M1", apenas sobrescreve (não pula import)
+  const M1_ONLY = String(process.env.IMPORT_M1_ONLY || "").toLowerCase() === "true";
+  if (M1_ONLY) effectiveTF = "M1";
+
+  const symbol = inf.symbol.toUpperCase();
   const instrumentId = await upsertInstrument(symbol);
-
   const totalLines = await countLines(filePath);
 
   console.log(
@@ -258,7 +210,8 @@ async function importCsv(filePath: string) {
       file,
       instrumentId,
       symbol,
-      timeframe,
+      inferredTimeframe: inf.timeframe,
+      effectiveTimeframe: effectiveTF,
       totalLines,
       CSV_TZ,
     })
@@ -277,14 +230,7 @@ async function importCsv(filePath: string) {
 
   let header = "";
   let delim = ",";
-  let headerIdx = {
-    time: -1,
-    open: -1,
-    high: -1,
-    low: -1,
-    close: -1,
-    volume: -1,
-  };
+  let headerIdx = { time: -1, open: -1, high: -1, low: -1, close: -1, volume: -1 };
   let headerIsData = false;
 
   let lastEmit = Date.now();
@@ -295,15 +241,12 @@ async function importCsv(filePath: string) {
 
     if (lineNo === 0) {
       delim = detectDelimiter(line);
-      // Se a primeira linha parece dado (MT5 headerless), não trate como header
       if (looksLikeDataRow(line, delim)) {
         headerIsData = true;
-        // fallback de índices padrão: time, open, high, low, close, (volume)
         headerIdx = { time: 0, open: 1, high: 2, low: 3, close: 4, volume: 5 };
       } else {
         header = line;
         headerIdx = findHeaderIndexes(header, delim);
-        // se não localizou colunas essenciais, tente tratar como dado mesmo assim
         if (
           headerIdx.time < 0 ||
           headerIdx.open < 0 ||
@@ -321,8 +264,6 @@ async function importCsv(filePath: string) {
           }
         }
       }
-
-      // Se a primeira linha já é dado, caímos para o processamento dela
       if (!headerIsData) {
         lineNo++;
         continue;
@@ -332,7 +273,7 @@ async function importCsv(filePath: string) {
     const parts = line.split(delim).map((s) => s.trim());
 
     try {
-      const get = (name: keyof typeof headerIdx) => {
+      const get = (name) => {
         const i = headerIdx[name];
         return i >= 0 ? parts[i] ?? "" : "";
       };
@@ -355,7 +296,7 @@ async function importCsv(filePath: string) {
       ) {
         // ignora linha inválida
       } else {
-        const r = await upsertCandle({ instrumentId, timeframe, row });
+        const r = await upsertCandle({ instrumentId, timeframe: effectiveTF, row });
         if (r.action === "inserted") inserted++;
         else updated++;
       }
@@ -368,13 +309,12 @@ async function importCsv(filePath: string) {
       const now = Date.now();
       if (processed % 500 === 0 || now - lastEmit > 250) {
         lastEmit = now;
-        const pct =
-          total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+        const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
         try {
           eventBus?.emit?.("csv:progress", {
             file,
             symbol,
-            timeframe,
+            timeframe: effectiveTF,
             processed,
             total,
             pct,
@@ -398,7 +338,7 @@ async function importCsv(filePath: string) {
     ok: true,
     file,
     symbol,
-    timeframe,
+    timeframe: effectiveTF,
     inserted,
     updated,
     processed,
@@ -413,7 +353,7 @@ async function importCsv(filePath: string) {
       const at = require("../workers/autoTrainer");
       const runOnce =
         at?.runOnce ||
-        at?.pokeAutoTrainer || // fallback se existir com outro nome
+        at?.pokeAutoTrainer ||
         (typeof at === "function" ? at : null);
       if (typeof runOnce === "function") {
         console.log(JSON.stringify({ msg: "[CSVImporter] AUTO_TRAINER_POKE_ON_IMPORT → runOnce" }));

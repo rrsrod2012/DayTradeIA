@@ -1,74 +1,65 @@
-// SQLite
+generator client {
+  provider = "prisma-client-js"
+}
+
 datasource db {
   provider = "sqlite"
   url      = "file:./dev.db"
 }
 
-generator client {
-  provider = "prisma-client-js"
-}
-
-// NOTE: SQLite connector (Prisma) não dá suporte a Json nem enums nativos.
-// Usamos strings para representar enums e string para params (JSON serializado).
-
 model Instrument {
   id        Int           @id @default(autoincrement())
   symbol    String        @unique
   name      String
+  backtests BacktestRun[]
   candles   Candle[]
   trades    Trade[]
-  backtests BacktestRun[]
 }
 
 model Candle {
   id           Int              @id @default(autoincrement())
-  instrument   Instrument       @relation(fields: [instrumentId], references: [id])
   instrumentId Int
-  timeframe    String // 'M1' | 'M5' | 'M15' | 'M30' | 'H1'
+  timeframe    String
   time         DateTime
   open         Float
   high         Float
   low          Float
   close        Float
   volume       Float
+  instrument   Instrument       @relation(fields: [instrumentId], references: [id])
   indicators   IndicatorValue[]
   patterns     Pattern[]
   signals      Signal[]
 
-  @@unique([instrumentId, timeframe, time])
+  @@unique([instrumentId, timeframe, time], name: "instrument_time_tf_unique")
 }
 
 model IndicatorValue {
   id       Int    @id @default(autoincrement())
-  candle   Candle @relation(fields: [candleId], references: [id])
   candleId Int
   key      String
   value    Float
+  candle   Candle @relation(fields: [candleId], references: [id])
 }
 
 model Pattern {
   id       Int    @id @default(autoincrement())
-  candle   Candle @relation(fields: [candleId], references: [id])
   candleId Int
-  type     String // ex.: 'DOJI' | 'HAMMER' | ...
+  type     String
   strength Float
+  candle   Candle @relation(fields: [candleId], references: [id])
 }
 
 model Signal {
   id         Int     @id @default(autoincrement())
-  candle     Candle  @relation(fields: [candleId], references: [id])
   candleId   Int
-  signalType String // 'ENTRY' | 'EXIT' | 'EMA_CROSS' ...
-  side       String // 'BUY' | 'SELL' | 'FLAT'
-  score      Float? // opcional para evitar erro no create/update
-  reason     String? // opcional (o worker nem sempre envia)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @default(now()) @updatedAt
-
-  // back relations for Trade
-  entryOf Trade[] @relation("EntrySignal")
-  exitOf  Trade[] @relation("ExitSignal")
+  signalType String
+  side       String
+  score      Float?
+  reason     String?
+  candle     Candle  @relation(fields: [candleId], references: [id])
+  exitOf     Trade[] @relation("ExitSignal")
+  entryOf    Trade[] @relation("EntrySignal")
 
   @@unique([candleId, signalType, side], name: "candleId_signalType_side")
   @@index([candleId])
@@ -76,41 +67,39 @@ model Signal {
 
 model Trade {
   id            Int          @id @default(autoincrement())
-  instrument    Instrument   @relation(fields: [instrumentId], references: [id])
   instrumentId  Int
-  timeframe     String // 'M1' | 'M5' | ...
-  entrySignal   Signal       @relation("EntrySignal", fields: [entrySignalId], references: [id])
+  timeframe     String
   entrySignalId Int
-  exitSignal    Signal?      @relation("ExitSignal", fields: [exitSignalId], references: [id])
   exitSignalId  Int?
   qty           Int
   entryPrice    Float
   exitPrice     Float?
   pnlPoints     Float?
   pnlMoney      Float?
-  backtestRun   BacktestRun? @relation(fields: [backtestRunId], references: [id])
   backtestRunId Int?
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @default(now()) @updatedAt
+  backtestRun   BacktestRun? @relation(fields: [backtestRunId], references: [id])
+  exitSignal    Signal?      @relation("ExitSignal", fields: [exitSignalId], references: [id])
+  entrySignal   Signal       @relation("EntrySignal", fields: [entrySignalId], references: [id])
+  instrument    Instrument   @relation(fields: [instrumentId], references: [id])
 }
 
 model BacktestRun {
   id           Int        @id @default(autoincrement())
-  instrument   Instrument @relation(fields: [instrumentId], references: [id])
   instrumentId Int
   timeframe    String
   startedAt    DateTime   @default(now())
   finishedAt   DateTime?
-  params       String // JSON serializado
-  trades       Trade[]
+  params       String
   totalPnL     Float?
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  trades       Trade[]
 }
 
 model TrainingRun {
-  id         Int       @id @default(autoincrement())
-  startedAt  DateTime  @default(now())
+  id         Int              @id @default(autoincrement())
+  startedAt  DateTime         @default(now())
   finishedAt DateTime?
-  status     String // "RUNNING" | "OK" | "ERROR"
+  status     String
   symbol     String?
   timeframe  String?
   lookback   Int?
@@ -119,27 +108,23 @@ model TrainingRun {
   rr         Float?
   epochs     Int?
   batchSize  Int?
-
-  // métricas agregadas (se o micro-model retornar)
-  loss     Float?
-  accuracy Float?
-  evMean   Float? // expected value médio (pts) após treino/validação
-  winRate  Float? // [0..1]
-  notes    String?
-
-  // relacionamento 1->N com pontos de métrica (opcional)
-  metrics TrainingMetric[]
+  loss       Float?
+  accuracy   Float?
+  evMean     Float?
+  winRate    Float?
+  notes      String?
+  metrics    TrainingMetric[]
 }
 
 model TrainingMetric {
   id        Int         @id @default(autoincrement())
-  run       TrainingRun @relation(fields: [runId], references: [id])
   runId     Int
-  t         Int // passo/epoch/iter
+  t         Int
   loss      Float?
   accuracy  Float?
-  ev        Float? // expected value estimado no passo
+  ev        Float?
   createdAt DateTime    @default(now())
+  run       TrainingRun @relation(fields: [runId], references: [id])
 }
 
 model BrokerTask {

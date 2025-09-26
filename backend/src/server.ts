@@ -185,7 +185,9 @@ if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.us
   app.use("/notify", notifyRouter);
   logger.info("[SERVER] /notify montado com sucesso");
 } else {
-  logger.warn("[SERVER] notifyRoutes NÃO exportou um Router válido (default ou named). Rota /notify desabilitada.");
+  logger.warn(
+    "[SERVER] notifyRoutes NÃO exportou um Router válido (default ou named). Rota /notify desabilitada."
+  );
 }
 
 /* ========= ✅ AJUSTE: anexar broker no mesmo processo/porta ========= */
@@ -932,8 +934,8 @@ app.use(["/api/signals", "/api/signals/projected"], (req, _res, next) => {
           suggestedEntry: entry,
           stopSuggestion: sl,
           takeProfitSuggestion: tp,
-          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""}${requireMtf ? ` + MTF(${confirmTf})` : ""
-            }`,
+          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""
+            }${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
           probHit: Number(prob.toFixed(4)),
           probCalibrated: Number(prob.toFixed(4)),
           expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
@@ -973,7 +975,11 @@ app.get("/api/candles", async (req, res) => {
       t = now.endOf("day").toUTC().toJSDate();
     }
 
-    const rows = await loadCandlesAnyTF(symbol, timeframe, { gte: f, lte: t, /* @ts-ignore */ limit } as any);
+    const rows = await loadCandlesAnyTF(
+      symbol,
+      timeframe,
+      { gte: f, lte: t, /* @ts-ignore */ limit } as any
+    );
     const out = (rows || []).map((c) => ({
       time: c.time.toISOString(),
       open: Number(c.open),
@@ -1011,10 +1017,16 @@ app.get("/api/signals", async (req, res) => {
       t = now.endOf("day").toUTC().toJSDate();
     }
 
-    const rows = await loadCandlesAnyTF(symbol, timeframe, { gte: f, lte: t, /* @ts-ignore */ limit } as any);
+    const rows = await loadCandlesAnyTF(
+      symbol,
+      timeframe,
+      { gte: f, lte: t, /* @ts-ignore */ limit } as any
+    );
     if (!rows?.length) return res.json([]);
 
-    const closes = rows.map((c) => (Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0));
+    const closes = rows.map((c) =>
+      Number.isFinite(c.close) ? Number(c.close) : Number(c.open) || 0
+    );
     const EMA = (values: number[], period: number): (number | null)[] => {
       const out: (number | null)[] = [];
       const k = 2 / (period + 1);
@@ -1065,8 +1077,14 @@ app.get("/api/signals", async (req, res) => {
    ========================= */
 app.get("/api/debug/availability", async (_req, res) => {
   try {
-    const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
-    const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO")
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1")
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
     const now = DateTime.now().setZone(ZONE_BR);
     const from = now.minus({ days: 30 }).startOf("day").toUTC().toJSDate();
     const to = now.endOf("day").toUTC().toJSDate();
@@ -1074,7 +1092,11 @@ app.get("/api/debug/availability", async (_req, res) => {
     for (const s of syms) {
       for (const tf of tfs) {
         try {
-          const rows = await loadCandlesAnyTF(s, tf, { gte: from, lte: to, /* @ts-ignore */ limit: 5_000 } as any);
+          const rows = await loadCandlesAnyTF(
+            s,
+            tf,
+            { gte: from, lte: to, /* @ts-ignore */ limit: 5_000 } as any
+          );
           out.push({
             symbol: s,
             timeframe: tf,
@@ -1193,86 +1215,95 @@ app.get("/api/order-logs", async (req, res) => {
 /* =========================
    /api/trades
    ========================= */
+// GET /api/trades?symbol=WIN&timeframe=M1&from=2025-09-26T00:00:00-03:00&to=2025-09-26T23:59:59-03:00&limit=200&offset=0
 app.get("/api/trades", async (req, res) => {
-  noStore(res);
   try {
-    const symbol = String(req.query.symbol || "").trim().toUpperCase() || undefined;
-    const timeframe = String(req.query.timeframe || "").trim().toUpperCase() || undefined;
-    const limit = req.query.limit ? Math.max(1, Number(req.query.limit)) : 200;
+    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : undefined;
+    const timeframe = req.query.timeframe ? String(req.query.timeframe).toUpperCase() : undefined;
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
 
-    // período usa a data do candle do entrySignal
-    const norm = normalizeDayRange(req.query.from, req.query.to);
-    let f: Date | undefined, t: Date | undefined;
-    if (norm) {
-      f = norm.fromLocal.toUTC().toJSDate();
-      t = norm.toLocal.toUTC().toJSDate();
-    }
+    const parseDate = (v: any) => {
+      if (!v) return undefined;
+      const d = new Date(String(v));
+      return isNaN(d.getTime()) ? undefined : d;
+    };
+    const from = parseDate(req.query.from);
+    const to = parseDate(req.query.to);
 
-    // where base
-    const where: any = {};
-    if (timeframe) where.timeframe = timeframe;
-
-    // símbolo via relação instrument.symbol
-    const instrumentFilter = symbol ? { symbol } : undefined;
+    // where baseado no candle do sinal de entrada
+    const where: any = {
+      entrySignal: {
+        candle: {
+          ...(symbol ? { instrument: { symbol } } : {}),
+          ...(timeframe ? { timeframe } : {}),
+          ...(from || to
+            ? {
+              time: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+            : {}),
+        },
+      },
+    };
 
     const trades = await prisma.trade.findMany({
       where,
-      orderBy: { id: "desc" },
+      // Se preferir, troque por { id: "desc" }
+      orderBy: { entrySignal: { candle: { time: "desc" } } },
       take: limit,
-      include: {
-        instrument: { select: { id: true, symbol: true, name: true } },
-        entrySignal: { select: { id: true, side: true, candle: { select: { time: true } } } },
-        exitSignal: { select: { id: true, candle: { select: { time: true } } } },
+      skip: offset,
+      select: {
+        id: true,
+        timeframe: true,
+        qty: true,
+        entryPrice: true,
+        exitPrice: true,
+        pnlPoints: true,
+        entrySignalId: true,
+        exitSignalId: true,
+        entrySignal: {
+          select: {
+            side: true,
+            candle: {
+              select: {
+                time: true,
+                instrument: { select: { symbol: true } },
+              },
+            },
+          },
+        },
+        exitSignal: {
+          select: {
+            signalType: true,
+            reason: true,
+            candle: { select: { time: true } },
+          },
+        },
       },
     });
 
-    // filtros pós-query (por relação)
-    const filtered = trades.filter((tr) => {
-      if (instrumentFilter && tr.instrument.symbol.toUpperCase() !== instrumentFilter.symbol) return false;
-      if (f || t) {
-        const et = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time) : null;
-        if (et) {
-          if (f && et < f) return false;
-          if (t && et > t) return false;
-        }
-      }
-      return true;
-    });
+    const out = trades.map((t) => ({
+      id: t.id,
+      symbol: t.entrySignal?.candle?.instrument?.symbol ?? null,
+      timeframe: t.timeframe,
+      side: t.entrySignal?.side ?? null,
+      entryPrice: t.entryPrice,
+      exitPrice: t.exitPrice,
+      pnlPoints: t.pnlPoints,
+      entryTime: t.entrySignal?.candle?.time ?? null,
+      exitTime: t.exitSignal?.candle?.time ?? null,
+      exitSignalType: t.exitSignal?.signalType ?? null,
+      exitReason: t.exitSignal?.reason ?? null,
+      entrySignalId: t.entrySignalId,
+      exitSignalId: t.exitSignalId,
+    }));
 
-    const out = filtered.map((tr) => {
-      const entryTime = tr.entrySignal?.candle?.time ? new Date(tr.entrySignal.candle.time).toISOString() : null;
-      const exitTime = tr.exitSignal?.candle?.time ? new Date(tr.exitSignal.candle.time).toISOString() : null;
-
-      // tenta expor taskId se existir no schema (defensivo)
-      const taskId =
-        (tr as any).taskId ??
-        (tr as any).entryTaskId ??
-        (tr as any).orderTaskId ??
-        null;
-
-      return {
-        id: tr.id,
-        symbol: tr.instrument.symbol,
-        timeframe: tr.timeframe,
-        qty: tr.qty,
-        side: tr.entrySignal?.side || null,
-        entrySignalId: tr.entrySignalId,
-        exitSignalId: tr.exitSignalId,
-        taskId, // <<=== novo (opcional)
-        entryPrice: tr.entryPrice,
-        exitPrice: tr.exitPrice,
-        // ⬇ sua UI às vezes lê pnlMoney; aqui exponho os dois
-        pnlPoints: tr.pnlPoints,
-        pnlMoney: tr.pnlMoney,
-        entryTime,
-        exitTime,
-      };
-    });
-
-    return res.json(out);
-  } catch (e: any) {
-    console.error("[/api/trades] erro:", e?.message || e);
-    return res.status(200).json({ ok: false, error: e?.message || String(e) });
+    res.json(out);
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -1313,7 +1344,12 @@ app.post("/admin/signals/backfill", async (req, res) => {
   try {
     const q = { ...req.query, ...(req.body || {}) } as any;
     const symbol = String(q.symbol || "").trim().toUpperCase();
-    const timeframe = String(q.timeframe || "M5").trim().toUpperCase() as "M1" | "M5" | "M15" | "M30" | "H1";
+    const timeframe = String(q.timeframe || "M5").trim().toUpperCase() as
+      | "M1"
+      | "M5"
+      | "M15"
+      | "M30"
+      | "H1";
 
     if (!symbol) return res.status(200).json({ ok: false, error: "Faltou 'symbol'" });
 
@@ -1358,7 +1394,12 @@ app.post("/admin/rebuild/trades", async (req, res) => {
 
     const rTrades = await processImportedRange({ symbol, timeframe, from, to });
 
-    return res.json({ ok: true, input: { symbol, timeframe, from, to }, signals: rSignals, trades: rTrades });
+    return res.json({
+      ok: true,
+      input: { symbol, timeframe, from, to },
+      signals: rSignals,
+      trades: rTrades,
+    });
   } catch (e: any) {
     console.error("[/admin/rebuild/trades] erro:", e?.message || e);
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -1407,9 +1448,15 @@ app.get("/admin/config/effective", (_req, res) => {
     AUTO_TRAINER_PARTIAL_ENABLED: envBool(process.env.AUTO_TRAINER_PARTIAL_ENABLED, true),
     AUTO_TRAINER_PARTIAL_RATIO: envNum(process.env.AUTO_TRAINER_PARTIAL_RATIO, 0.5),
     AUTO_TRAINER_PARTIAL_ATR: envNum(process.env.AUTO_TRAINER_PARTIAL_ATR, 0.5),
-    AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER: envBool(process.env.AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER, true),
+    AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER: envBool(
+      process.env.AUTO_TRAINER_PARTIAL_BREAKEVEN_AFTER,
+      true
+    ),
     AUTO_TRAINER_PRIORITY: String(process.env.AUTO_TRAINER_PRIORITY || "TP_FIRST_AFTER_BE"),
-    AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE: envBool(process.env.AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE, true),
+    AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE: envBool(
+      process.env.AUTO_TRAINER_FORCE_NO_LOSS_AFTER_MFE,
+      true
+    ),
     AUTO_TRAINER_FORCE_MFE_POINTS: envNum(process.env.AUTO_TRAINER_FORCE_MFE_POINTS, 200),
     AUTO_TRAINER_FORCE_OFFSET_POINTS: envNum(
       process.env.AUTO_TRAINER_FORCE_OFFSET_POINTS,
@@ -1489,7 +1536,7 @@ app.get("/admin/trades/inspect", async (req, res) => {
 // ====== ROTAS LEGADAS ======
 app.use("/api", routes);
 
-app.use("/admin", routesAdminCompare);  // adiciona /admin/broker/compare-detailed
+app.use("/admin", routesAdminCompare); // adiciona /admin/broker/compare-detailed
 app.use("/admin", adminRoutes);
 
 // (opcional) dump da pilha de rotas p/ checar ordem real

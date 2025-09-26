@@ -69,32 +69,68 @@ async function getCandlesFromDB(
 }
 
 /**
- * Resolve o candleId no banco para um horário agregado (bucket).
- * Ordem nova (segura):
- *  1) instrumentId + time + timeframe candidato (ex.: "M5" ou "5")
- *  2) instrumentId + time
- *  (não usar lookup global só por time)
+ * Garante que exista um Candle persistido exatamente no TF solicitado.
+ * - Se existir (instrumentId + time + timeframe em candidatos), retorna o id (atualizando OHLCV se necessário).
+ * - Se não existir, cria com os valores do candle agregado.
  */
-async function findCandleIdByTime(
+async function upsertTfCandle(
   instrumentId: number,
   tf: keyof typeof TF_MINUTES,
-  t: Date
-) {
+  row: {
+    time: Date;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number | null;
+  }
+): Promise<number | null> {
   const candidates = tfCandidates(tf);
 
-  // 1) instrumentId + time + timeframe
-  let c = await prisma.candle.findFirst({
-    where: { instrumentId, time: t, timeframe: { in: candidates } },
-    select: { id: true },
+  const found = await prisma.candle.findFirst({
+    where: { instrumentId, time: row.time, timeframe: { in: candidates } },
+    select: { id: true, open: true, high: true, low: true, close: true, volume: true, timeframe: true },
   });
-  if (c?.id) return c.id;
 
-  // 2) instrumentId + time (sem timeframe)
-  c = await prisma.candle.findFirst({
-    where: { instrumentId, time: t },
+  if (found?.id) {
+    const needsUpdate =
+      Number(found.open) !== row.open ||
+      Number(found.high) !== row.high ||
+      Number(found.low) !== row.low ||
+      Number(found.close) !== row.close ||
+      ((found.volume ?? null) !== (row.volume ?? null));
+
+    if (needsUpdate) {
+      await prisma.candle.update({
+        where: { id: found.id },
+        data: {
+          open: row.open,
+          high: row.high,
+          low: row.low,
+          close: row.close,
+          volume: row.volume,
+        },
+      });
+    }
+    return found.id;
+  }
+
+  // cria no TF canônico (ex.: "M5", "M1", etc)
+  const tfStr = String(tf).toUpperCase();
+  const created = await prisma.candle.create({
+    data: {
+      instrumentId,
+      timeframe: tfStr,
+      time: row.time,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: row.volume,
+    },
     select: { id: true },
   });
-  return c?.id ?? null;
+  return created?.id ?? null;
 }
 
 function ema(values: number[], period: number): number[] {
@@ -138,14 +174,23 @@ export async function backfillCandlesAndSignals(
     const diff = e9[i] - e21[i];
 
     let side: "BUY" | "SELL" | null = null;
-    // comparações estritas para evitar duplo disparo
     if (prevDiff < 0 && diff > 0) side = "BUY";
     else if (prevDiff > 0 && diff < 0) side = "SELL";
     else continue;
 
+    // tempo “bucketizado” para o TF
     const bucketTime = floorToBucket(candles[i].time, tfMin);
 
-    const candleId = await findCandleIdByTime(instrumentId, tf, bucketTime);
+    // garante que exista um candle PERSISTIDO exatamente no TF solicitado
+    const candleId = await upsertTfCandle(instrumentId, tf, {
+      time: bucketTime,
+      open: candles[i].open,
+      high: candles[i].high,
+      low: candles[i].low,
+      close: candles[i].close,
+      volume: candles[i].volume ?? null,
+    });
+
     if (!candleId) continue;
 
     const reason =
