@@ -33,6 +33,9 @@ import {
 import { prisma } from "./prisma";
 import { backfillCandlesAndSignals } from "./workers/confirmedSignalsWorker";
 
+// ✅ AJUSTE: anexar o broker ao mesmo app/porta
+import attachBrokerToApp from "./services/brokerServer";
+
 const app = express();
 
 // ====== Timezone/base para normalização de filtros de data ======
@@ -184,6 +187,16 @@ if (notifyRouter && typeof notifyRouter === "function" && typeof notifyRouter.us
 } else {
   logger.warn("[SERVER] notifyRoutes NÃO exportou um Router válido (default ou named). Rota /notify desabilitada.");
 }
+
+/* ========= ✅ AJUSTE: anexar broker no mesmo processo/porta ========= */
+try {
+  const basePath = process.env.BROKER_BASE_PATH || "/broker";
+  attachBrokerToApp?.(app, basePath);
+  logger.info(`[SERVER] broker anexado em '${basePath}' (mesma porta do backend)`);
+} catch (e: any) {
+  logger.warn("[SERVER] broker não pôde ser anexado", { err: e?.message || e });
+}
+/* =================================================================== */
 
 /** =========================
  * TRACE de chamadas do EA/Front para sinais
@@ -417,7 +430,8 @@ app.use(["/api/signals", "/api/signals/projected"], (req, _res, next) => {
                 slPrice = bePrice;
               } else {
                 // BUY: stop não pode ficar abaixo do BE; SELL: não pode ficar acima do BE
-                slPrice = tradeSide === "BUY" ? Math.max(slPrice, bePrice) : Math.min(slPrice, bePrice);
+                slPrice =
+                  tradeSide === "BUY" ? Math.max(slPrice, bePrice) : Math.min(slPrice, bePrice);
               }
             }
           }
@@ -918,7 +932,8 @@ app.use(["/api/signals", "/api/signals/projected"], (req, _res, next) => {
           suggestedEntry: entry,
           stopSuggestion: sl,
           takeProfitSuggestion: tp,
-          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""}${requireMtf ? ` + MTF(${confirmTf})` : ""}`,
+          conditionText: `EMA9 vs EMA21 ${isBuy ? "UP" : "DOWN"}${vwapFilter ? " + VWAP" : ""}${requireMtf ? ` + MTF(${confirmTf})` : ""
+            }`,
           probHit: Number(prob.toFixed(4)),
           probCalibrated: Number(prob.toFixed(4)),
           expectedValuePoints: Number((isFinite(evPts) ? evPts : 0).toFixed(2)),
