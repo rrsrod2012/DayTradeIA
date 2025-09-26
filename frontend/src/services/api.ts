@@ -640,7 +640,7 @@ export async function enqueueMT5Order(
         timeframe: t.timeframe ?? null,
         time: t.time ?? null,
         price: t.price ?? 0,
-        volume: t.volume ?? 1,
+        volume: Math.max(1, Math.floor(Number(t.volume ?? 1))),
         slPoints: t.slPoints ?? null,
         tpPoints: t.tpPoints ?? null,
       })),
@@ -676,7 +676,7 @@ export async function enqueueMT5Order(
     timeframe: null,
     time: null,
     price: 0,
-    volume: Number(lots) || 1,
+    volume: Math.max(1, Math.floor(Number(lots) || 1)),
     slPoints: null,
     tpPoints: null,
   };

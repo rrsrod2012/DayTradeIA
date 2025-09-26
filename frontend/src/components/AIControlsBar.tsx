@@ -324,7 +324,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     const p = baseParams();
     const t = s.time ? new Date(s.time).toISOString() : "";
     const pr = s.price != null ? String(Math.round(Number(s.price) * 100) / 100) : "-";
-    return `${p.symbol}|${p.timeframe}|${s.side}|${t}|${pr}`;
+    return `${p.symbol}|${p.timeframe}|${s.side}|${t}`;
   }
 
   function clampSentKeys(keys: string[], max = 1000) {
@@ -1089,7 +1089,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     className="form-control"
                     value={execLots}
                     onChange={(e) =>
-                      setExecLots(Math.max(0.01, Number(e.target.value) || 1))
+                      setExecLots(Math.max(1, Math.round(Number(e.target.value) || 1)))
                     }
                   />
                 </div>
