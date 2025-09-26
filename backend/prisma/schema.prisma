@@ -12,81 +12,86 @@ generator client {
 // Usamos strings para representar enums e string para params (JSON serializado).
 
 model Instrument {
-  id           Int      @id @default(autoincrement())
-  symbol       String   @unique
-  name         String
-  candles      Candle[]
-  trades       Trade[]
-  backtests    BacktestRun[]
+  id        Int           @id @default(autoincrement())
+  symbol    String        @unique
+  name      String
+  candles   Candle[]
+  trades    Trade[]
+  backtests BacktestRun[]
 }
 
 model Candle {
-  id            Int        @id @default(autoincrement())
-  instrument    Instrument @relation(fields: [instrumentId], references: [id])
-  instrumentId  Int
-  timeframe     String     // 'M1' | 'M5' | 'M15' | 'M30' | 'H1'
-  time          DateTime
-  open          Float
-  high          Float
-  low           Float
-  close         Float
-  volume        Float
-  indicators    IndicatorValue[]
-  patterns      Pattern[]
-  signals       Signal[]
+  id           Int              @id @default(autoincrement())
+  instrument   Instrument       @relation(fields: [instrumentId], references: [id])
+  instrumentId Int
+  timeframe    String // 'M1' | 'M5' | 'M15' | 'M30' | 'H1'
+  time         DateTime
+  open         Float
+  high         Float
+  low          Float
+  close        Float
+  volume       Float
+  indicators   IndicatorValue[]
+  patterns     Pattern[]
+  signals      Signal[]
 
   @@unique([instrumentId, timeframe, time])
 }
 
 model IndicatorValue {
-  id        Int      @id @default(autoincrement())
-  candle    Candle   @relation(fields: [candleId], references: [id])
-  candleId  Int
-  key       String
-  value     Float
+  id       Int    @id @default(autoincrement())
+  candle   Candle @relation(fields: [candleId], references: [id])
+  candleId Int
+  key      String
+  value    Float
 }
 
 model Pattern {
-  id        Int      @id @default(autoincrement())
-  candle    Candle   @relation(fields: [candleId], references: [id])
-  candleId  Int
-  type      String   // ex.: 'DOJI' | 'HAMMER' | ...
-  strength  Float
+  id       Int    @id @default(autoincrement())
+  candle   Candle @relation(fields: [candleId], references: [id])
+  candleId Int
+  type     String // ex.: 'DOJI' | 'HAMMER' | ...
+  strength Float
 }
 
 model Signal {
-  id          Int      @id @default(autoincrement())
-  candle      Candle   @relation(fields: [candleId], references: [id])
-  candleId    Int
-  signalType  String   // 'ENTRY' | 'EXIT' | 'EMA_CROSS' ...
-  side        String   // 'BUY' | 'SELL' | 'FLAT'
-  score       Float?   // opcional para evitar erro no create/update
-  reason      String?  // opcional (o worker nem sempre envia)
+  id         Int     @id @default(autoincrement())
+  candle     Candle  @relation(fields: [candleId], references: [id])
+  candleId   Int
+  signalType String // 'ENTRY' | 'EXIT' | 'EMA_CROSS' ...
+  side       String // 'BUY' | 'SELL' | 'FLAT'
+  score      Float? // opcional para evitar erro no create/update
+  reason     String? // opcional (o worker nem sempre envia)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
 
   // back relations for Trade
-  entryOf     Trade[]  @relation("EntrySignal")
-  exitOf      Trade[]  @relation("ExitSignal")
+  entryOf Trade[] @relation("EntrySignal")
+  exitOf  Trade[] @relation("ExitSignal")
 
-  @@index([candleId])
   @@unique([candleId, signalType, side], name: "candleId_signalType_side")
+  @@index([candleId])
 }
 
 model Trade {
-  id             Int        @id @default(autoincrement())
-  instrument     Instrument @relation(fields: [instrumentId], references: [id])
-  instrumentId   Int
-  timeframe      String     // 'M1' | 'M5' | ...
-  entrySignal    Signal     @relation("EntrySignal", fields: [entrySignalId], references: [id])
-  entrySignalId  Int
-  exitSignal     Signal?    @relation("ExitSignal", fields: [exitSignalId], references: [id])
-  exitSignalId   Int?
-  qty            Int
-  entryPrice     Float
-  exitPrice      Float?
-  pnlPoints      Float?
-  pnlMoney       Float?
-  backtestRun    BacktestRun? @relation(fields: [backtestRunId], references: [id])
-  backtestRunId  Int?
+  id            Int          @id @default(autoincrement())
+  instrument    Instrument   @relation(fields: [instrumentId], references: [id])
+  instrumentId  Int
+  timeframe     String // 'M1' | 'M5' | ...
+  entrySignal   Signal       @relation("EntrySignal", fields: [entrySignalId], references: [id])
+  entrySignalId Int
+  exitSignal    Signal?      @relation("ExitSignal", fields: [exitSignalId], references: [id])
+  exitSignalId  Int?
+  qty           Int
+  entryPrice    Float
+  exitPrice     Float?
+  pnlPoints     Float?
+  pnlMoney      Float?
+  backtestRun   BacktestRun? @relation(fields: [backtestRunId], references: [id])
+  backtestRunId Int?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @default(now()) @updatedAt
 }
 
 model BacktestRun {
@@ -96,50 +101,49 @@ model BacktestRun {
   timeframe    String
   startedAt    DateTime   @default(now())
   finishedAt   DateTime?
-  params       String     // JSON serializado
+  params       String // JSON serializado
   trades       Trade[]
   totalPnL     Float?
 }
 
 model TrainingRun {
-  id           Int       @id @default(autoincrement())
-  startedAt    DateTime  @default(now())
-  finishedAt   DateTime?
-  status       String    // "RUNNING" | "OK" | "ERROR"
-  symbol       String?
-  timeframe    String?
-  lookback     Int?
-  horizon      Int?
-  slAtr        Float?
-  rr           Float?
-  epochs       Int?
-  batchSize    Int?
+  id         Int       @id @default(autoincrement())
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  status     String // "RUNNING" | "OK" | "ERROR"
+  symbol     String?
+  timeframe  String?
+  lookback   Int?
+  horizon    Int?
+  slAtr      Float?
+  rr         Float?
+  epochs     Int?
+  batchSize  Int?
 
   // métricas agregadas (se o micro-model retornar)
-  loss         Float?
-  accuracy     Float?
-  evMean       Float?    // expected value médio (pts) após treino/validação
-  winRate      Float?    // [0..1]
-  notes        String?
+  loss     Float?
+  accuracy Float?
+  evMean   Float? // expected value médio (pts) após treino/validação
+  winRate  Float? // [0..1]
+  notes    String?
 
   // relacionamento 1->N com pontos de métrica (opcional)
-  metrics      TrainingMetric[]
+  metrics TrainingMetric[]
 }
 
 model TrainingMetric {
-  id           Int       @id @default(autoincrement())
-  run          TrainingRun @relation(fields: [runId], references: [id])
-  runId        Int
-  t            Int        // passo/epoch/iter
-  loss         Float?
-  accuracy     Float?
-  ev           Float?     // expected value estimado no passo
-  createdAt    DateTime   @default(now())
+  id        Int         @id @default(autoincrement())
+  run       TrainingRun @relation(fields: [runId], references: [id])
+  runId     Int
+  t         Int // passo/epoch/iter
+  loss      Float?
+  accuracy  Float?
+  ev        Float? // expected value estimado no passo
+  createdAt DateTime    @default(now())
 }
 
-
 model BrokerTask {
-  id             String   @id
+  id             String    @id
   agentId        String
   side           String
   symbol         String?
@@ -152,11 +156,11 @@ model BrokerTask {
   beAtPoints     Int?
   beOffsetPoints Int?
   comment        String?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime  @default(now())
 }
 
 model BrokerExecution {
-  id        Int      @id @default(autoincrement())
+  id        Int       @id @default(autoincrement())
   taskId    String?
   agentId   String
   side      String
@@ -168,5 +172,5 @@ model BrokerExecution {
   volume    Int?
   pnlPoints Int?
   raw       String?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 }

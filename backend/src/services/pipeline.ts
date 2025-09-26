@@ -21,9 +21,9 @@ function numFromEnv(v: any, def: number) {
 
 const CFG = {
   LOOKBACK: numFromEnv(process.env.AUTO_TRAINER_LOOKBACK, 120), // barras para trás (ATR/EMAs)
-  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12),  // barras à frente para procurar saída
-  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0),  // k do SL em ATRs
-  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0),      // TP = RR * ATR
+  HORIZON: numFromEnv(process.env.AUTO_TRAINER_HORIZON, 12), // barras à frente para procurar saída
+  SL_ATR: numFromEnv(process.env.AUTO_TRAINER_SL_ATR, 1.0), // k do SL em ATRs
+  RR: numFromEnv(process.env.AUTO_TRAINER_RR, 2.0), // TP = RR * ATR
   DEFAULT_QTY: 1,
 
   // Breakeven por pontos: quando MFE (a favor) atingir X pontos, mover SL para preço de entrada (+ offset)
@@ -35,6 +35,7 @@ const CFG = {
 };
 
 const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60 };
+const ZONE_BR = "America/Sao_Paulo";
 
 function tfToMinutes(tf: string | null): number {
   if (!tf) return 5;
@@ -53,7 +54,10 @@ function ema(values: number[], period: number) {
   let cur: number | null = null;
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
-    if (!Number.isFinite(v)) { out.push(cur); continue; }
+    if (!Number.isFinite(v)) {
+      out.push(cur);
+      continue;
+    }
     cur = cur == null ? v : v * k + (cur as number) * (1 - k);
     out.push(cur);
   }
@@ -86,10 +90,20 @@ function atr14(rows: Candle[]) {
   return out;
 }
 
-function crossedUp(aPrev: number | null, aNow: number | null, bPrev: number | null, bNow: number | null) {
+function crossedUp(
+  aPrev: number | null,
+  aNow: number | null,
+  bPrev: number | null,
+  bNow: number | null
+) {
   return aPrev != null && bPrev != null && aNow != null && bNow != null && aPrev <= bPrev && aNow > bNow;
 }
-function crossedDown(aPrev: number | null, aNow: number | null, bPrev: number | null, bNow: number | null) {
+function crossedDown(
+  aPrev: number | null,
+  aNow: number | null,
+  bPrev: number | null,
+  bNow: number | null
+) {
   return aPrev != null && bPrev != null && aNow != null && bNow != null && aPrev >= bPrev && aNow < bNow;
 }
 
@@ -109,7 +123,8 @@ async function loadCandlesWindow(params: {
     where: { id: instrumentId },
     select: { id: true, symbol: true },
   });
-  if (!inst) return { win: [] as Candle[], candleIds: [] as (number | null)[], tf: (timeframe || "M5").toUpperCase(), symbol: "?" };
+  if (!inst)
+    return { win: [] as Candle[], candleIds: [] as (number | null)[], tf: (timeframe || "M5").toUpperCase(), symbol: "?" };
 
   const tf = (timeframe || "M5").toUpperCase();
   const tfMin = tfToMinutes(tf);
@@ -135,7 +150,10 @@ async function loadCandlesWindow(params: {
 
   const win: Candle[] = rows.map((r: any) => ({
     time: r.time instanceof Date ? r.time : new Date(r.time),
-    open: Number(r.open), high: Number(r.high), low: Number(r.low), close: Number(r.close),
+    open: Number(r.open),
+    high: Number(r.high),
+    low: Number(r.low),
+    close: Number(r.close),
   }));
 
   return { win, candleIds, tf, symbol: inst.symbol };
@@ -150,7 +168,7 @@ function resolveSignalIndex(win: Candle[], signalTime: Date, tf: string) {
   const target = signalTime.getTime();
 
   // 1) igualdade exata
-  let idx = win.findIndex(c => c.time.getTime() === target);
+  let idx = win.findIndex((c) => c.time.getTime() === target);
   if (idx >= 0) return idx;
 
   // 2) última barra <= signalTime
@@ -163,10 +181,14 @@ function resolveSignalIndex(win: Candle[], signalTime: Date, tf: string) {
   if (lastLE >= 0) return lastLE;
 
   // 3) barra mais próxima dentro de 1×TF
-  let best = -1, bestDiff = Number.POSITIVE_INFINITY;
+  let best = -1,
+    bestDiff = Number.POSITIVE_INFINITY;
   for (let i = 0; i < win.length; i++) {
     const d = Math.abs(win[i].time.getTime() - target);
-    if (d < bestDiff) { best = i; bestDiff = d; }
+    if (d < bestDiff) {
+      best = i;
+      bestDiff = d;
+    }
   }
   if (best >= 0 && bestDiff <= tfMs) return best;
 
@@ -210,7 +232,7 @@ async function consolidateSignalToTrade(signalId: number) {
   const entryPrice = Number(entryBar.open);
 
   const atrSeries = atr14(win);
-  const closes = win.map(c => Number(c.close));
+  const closes = win.map((c) => Number(c.close));
   const ema9 = ema(closes, 9);
   const ema21 = ema(closes, 21);
 
@@ -229,8 +251,13 @@ async function consolidateSignalToTrade(signalId: number) {
   let iExit: number | null = null;
 
   if (CFG.DEBUG) {
-    console.log(`[DBG] symbol=${symbol} tf=${tf} signal=${signalTime.toISOString()} iSignal=${iSignal} iEntry=${iEntry}`);
-    console.log(`[DBG] entry=${entryPrice} SLinit=${slInit ?? "-"} TP=${tpLevel ?? "-"} BE_AT=${CFG.BE_AT_PTS} BE_OFF=${CFG.BE_OFFSET_PTS}`);
+    console.log(
+      `[DBG] symbol=${symbol} tf=${tf} signal=${signalTime.toISOString()} iSignal=${iSignal} iEntry=${iEntry}`
+    );
+    console.log(
+      `[DBG] entry=${entryPrice} SLinit=${slInit ?? "-"} TP=${tpLevel ?? "-"} BE_AT=${CFG.BE_AT_PTS} BE_OFF=${CFG.BE_OFFSET_PTS
+      }`
+    );
   }
 
   for (let k = iEntry; k < Math.min(win.length, iEntry + CFG.HORIZON + 1); k++) {
@@ -240,14 +267,10 @@ async function consolidateSignalToTrade(signalId: number) {
 
     // 1) BE por pontos (usa MFE intrabar)
     if (!movedToBE && CFG.BE_AT_PTS > 0) {
-      const mfePts = isBuy ? (high - entryPrice) : (entryPrice - low);
+      const mfePts = isBuy ? high - entryPrice : entryPrice - low;
       if (mfePts >= CFG.BE_AT_PTS) {
-        const bePx = isBuy
-          ? (entryPrice + CFG.BE_OFFSET_PTS)
-          : (entryPrice - CFG.BE_OFFSET_PTS);
-        dynSL = dynSL == null
-          ? bePx
-          : (isBuy ? Math.max(dynSL, bePx) : Math.min(dynSL, bePx));
+        const bePx = isBuy ? entryPrice + CFG.BE_OFFSET_PTS : entryPrice - CFG.BE_OFFSET_PTS;
+        dynSL = dynSL == null ? bePx : isBuy ? Math.max(dynSL, bePx) : Math.min(dynSL, bePx);
         movedToBE = true;
         if (CFG.DEBUG) console.log(`[DBG] k=${k} MOVE->BE dynSL=${dynSL} (mfe=${mfePts.toFixed(1)})`);
       }
@@ -256,12 +279,16 @@ async function consolidateSignalToTrade(signalId: number) {
     // Prioridade: SL/BE
     if (dynSL != null) {
       if (isBuy && low <= dynSL) {
-        exitPrice = dynSL; outcome = "SL"; iExit = k;
+        exitPrice = dynSL;
+        outcome = "SL";
+        iExit = k;
         if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT SL/BE at ${dynSL}`);
         break;
       }
       if (!isBuy && high >= dynSL) {
-        exitPrice = dynSL; outcome = "SL"; iExit = k;
+        exitPrice = dynSL;
+        outcome = "SL";
+        iExit = k;
         if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT SL/BE at ${dynSL}`);
         break;
       }
@@ -270,12 +297,16 @@ async function consolidateSignalToTrade(signalId: number) {
     // TP
     if (tpLevel != null) {
       if (isBuy && high >= tpLevel) {
-        exitPrice = tpLevel; outcome = "TP"; iExit = k;
+        exitPrice = tpLevel;
+        outcome = "TP";
+        iExit = k;
         if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT TP at ${tpLevel}`);
         break;
       }
       if (!isBuy && low <= tpLevel) {
-        exitPrice = tpLevel; outcome = "TP"; iExit = k;
+        exitPrice = tpLevel;
+        outcome = "TP";
+        iExit = k;
         if (CFG.DEBUG) console.log(`[DBG] k=${k} HIT TP at ${tpLevel}`);
         break;
       }
@@ -290,21 +321,21 @@ async function consolidateSignalToTrade(signalId: number) {
     const revDown = crossedDown(e9Prev, e9Now, e21Prev, e21Now);
     const reversalAgainst = (isBuy && revDown) || (!isBuy && revUp);
     if (reversalAgainst) {
-      exitPrice = Number(bar.close); outcome = "REVERSAL"; iExit = k;
+      exitPrice = Number(bar.close);
+      outcome = "REVERSAL";
+      iExit = k;
       if (CFG.DEBUG) console.log(`[DBG] k=${k} REVERSAL close=${exitPrice}`);
       break;
     }
 
     if (CFG.DEBUG) {
-      const tStr = DateTime.fromJSDate(bar.time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss");
-      const mfePts = isBuy ? (high - entryPrice) : (entryPrice - low);
+      const tStr = DateTime.fromJSDate(bar.time).setZone(ZONE_BR).toFormat("HH:mm:ss");
+      const mfePts = isBuy ? high - entryPrice : entryPrice - low;
       console.log(`[DBG] k=${k} ${tStr} H=${high} L=${low} dynSL=${dynSL ?? "-"} mfe=${mfePts.toFixed(1)}`);
     }
   }
 
-  const pnlPoints = (exitPrice != null)
-    ? (isBuy ? (exitPrice - entryPrice) : (entryPrice - exitPrice))
-    : null;
+  const pnlPoints = exitPrice != null ? (isBuy ? exitPrice - entryPrice : entryPrice - exitPrice) : null;
 
   let exitSignalId: number | null = null;
   if (iExit != null) {
@@ -313,10 +344,7 @@ async function consolidateSignalToTrade(signalId: number) {
       select: { id: true },
     });
     const exitType =
-      outcome === "TP" ? "EXIT_TP" :
-        outcome === "SL" ? "EXIT_SL" :
-          outcome === "REVERSAL" ? "EXIT_REV" :
-            "EXIT_NONE";
+      outcome === "TP" ? "EXIT_TP" : outcome === "SL" ? "EXIT_SL" : outcome === "REVERSAL" ? "EXIT_REV" : "EXIT_NONE";
 
     if (exitCandle?.id) {
       const existingExit = await prisma.signal.findFirst({
@@ -332,7 +360,6 @@ async function consolidateSignalToTrade(signalId: number) {
             side,
             score: 1.0,
             reason: outcome,
-            createdAt: new Date(),
           },
           select: { id: true },
         });
@@ -352,8 +379,9 @@ async function consolidateSignalToTrade(signalId: number) {
   });
 
   if (CFG.DEBUG) {
-    const entStr = DateTime.fromJSDate(win[iEntry].time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss");
-    const exStr = (iExit != null) ? DateTime.fromJSDate(win[iExit].time).setZone("America/Sao_Paulo").toFormat("HH:mm:ss") : "-";
+    const entStr = DateTime.fromJSDate(win[iEntry].time).setZone(ZONE_BR).toFormat("HH:mm:ss");
+    const exStr =
+      iExit != null ? DateTime.fromJSDate(win[iExit].time).setZone(ZONE_BR).toFormat("HH:mm:ss") : "-";
     console.log(`[DBG] DONE entry@${entStr} exit@${exStr} outcome=${outcome} pnlPts=${pnlPoints ?? "-"}`);
   }
 }
@@ -386,7 +414,6 @@ async function upsertTrade(
         exitPrice: trade.exitPrice,
         pnlPoints: trade.pnlPoints,
         exitSignalId: trade.exitSignalId,
-        updatedAt: new Date(),
       },
     });
   } else {
@@ -400,11 +427,93 @@ async function upsertTrade(
         pnlPoints: trade.pnlPoints,
         entrySignalId: signal.id,
         exitSignalId: trade.exitSignalId,
-        createdAt: new Date(),
-        updatedAt: new Date(),
       },
     });
   }
+}
+
+// =========================
+// Util: parsing de datas
+// =========================
+function parseUserDate(raw: any): { ok: boolean; dt: DateTime; isDateOnly: boolean } {
+  if (raw == null) return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+  if (raw instanceof Date) {
+    const dt = DateTime.fromJSDate(raw, { zone: ZONE_BR });
+    return { ok: dt.isValid, dt, isDateOnly: false };
+  }
+  const s = String(raw).trim();
+  if (!s) return { ok: false, dt: DateTime.invalid("empty"), isDateOnly: false };
+
+  // BR: dd/MM/yyyy [HH:mm[:ss]]
+  const brFull = /^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+  const m = brFull.exec(s);
+  if (m) {
+    const fmt = m[4] ? (m[6] ? "dd/LL/yyyy HH:mm:ss" : "dd/LL/yyyy HH:mm") : "dd/LL/yyyy";
+    const dt = DateTime.fromFormat(s, fmt, { zone: ZONE_BR });
+    return { ok: dt.isValid, dt, isDateOnly: !m[4] };
+  }
+
+  // ISO (yyyy-MM-dd[THH:mm[:ss[.SSS]]][Z])
+  const dtISO = DateTime.fromISO(s, { zone: ZONE_BR });
+  if (dtISO.isValid) {
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
+    return { ok: true, dt: dtISO, isDateOnly };
+  }
+
+  // Epoch ms?
+  if (/^\d{10,13}$/.test(s)) {
+    const n = Number(s);
+    const dt = Number.isFinite(n) ? DateTime.fromMillis(n, { zone: ZONE_BR }) : DateTime.invalid("nan");
+    return { ok: dt.isValid, dt, isDateOnly: false };
+  }
+
+  return { ok: false, dt: DateTime.invalid("unparsed"), isDateOnly: false };
+}
+
+function normalizeRange(
+  fromRaw?: any,
+  toRaw?: any,
+  fallbackDays = 1
+): { fromUTC?: Date; toUTC?: Date } {
+  const pF = parseUserDate(fromRaw);
+  const pT = parseUserDate(toRaw);
+
+  // nada válido => usa [now - fallbackDays, endOfDay]
+  if (!pF.ok && !pT.ok) {
+    const now = DateTime.now().setZone(ZONE_BR);
+    const f = now.minus({ days: Math.max(1, fallbackDays) }).startOf("day").toUTC().toJSDate();
+    const t = now.endOf("day").toUTC().toJSDate();
+    return { fromUTC: f, toUTC: t };
+  }
+
+  let fromLocal: DateTime;
+  let toLocal: DateTime;
+
+  if (pF.ok && pT.ok) {
+    const sameDay = pF.dt.toFormat("yyyy-LL-dd") === pT.dt.toFormat("yyyy-LL-dd");
+    if (pF.isDateOnly || pT.isDateOnly || sameDay) {
+      const base = pF.dt;
+      fromLocal = base.startOf("day");
+      toLocal = pT.dt.endOf("day");
+    } else {
+      fromLocal = pF.dt;
+      toLocal = pT.dt;
+    }
+  } else if (pF.ok && !pT.ok) {
+    fromLocal = pF.isDateOnly ? pF.dt.startOf("day") : pF.dt;
+    toLocal = pF.isDateOnly ? pF.dt.endOf("day") : pF.dt.endOf("day");
+  } else {
+    toLocal = pT.isDateOnly ? pT.dt.endOf("day") : pT.dt;
+    fromLocal = pT.isDateOnly ? pT.dt.startOf("day") : pT.dt.startOf("day");
+  }
+
+  if (toLocal < fromLocal) {
+    const tmp = fromLocal;
+    fromLocal = toLocal.startOf("day");
+    toLocal = tmp.endOf("day");
+  }
+
+  return { fromUTC: fromLocal.toUTC().toJSDate(), toUTC: toLocal.toUTC().toJSDate() };
 }
 
 // =========================
@@ -412,42 +521,99 @@ async function upsertTrade(
 // =========================
 
 /**
- * Se timeframe:
- *   - string (ex.: "M1", "M5"): reprocessa só esse TF
- *   - "*" ou omitida: reprocessa TODOS os TFs do símbolo no dia
+ * Reprocessa sinais confirmados (EMA_CROSS) em trades, em uma janela.
+ *
+ * Parâmetros aceitos (compatível com chamadas existentes):
+ * - instrumentId?: number
+ * - symbol?: string
+ * - timeframe?: string | null | undefined   (ex.: "M1", "M5"; "*" ou omitido = todos)
+ * - day?: Date | string                     (reprocessa o DIA inteiro)
+ * - from?: Date | string                    (início da janela)
+ * - to?: Date | string                      (fim da janela)
+ * - days?: number                           (janela relativa: últimos N dias)
  */
 export async function processImportedRange(opts: {
   instrumentId?: number;
   symbol?: string;
   timeframe?: string | null | undefined;
-  day: Date;
+  day?: Date | string;
+  from?: Date | string;
+  to?: Date | string;
+  days?: number;
 }) {
   const { instrumentId, symbol } = opts;
 
+  // Resolve instrumento
   let instId = instrumentId ?? null;
   if (!instId && symbol) {
-    const inst = await prisma.instrument.findFirst({ where: { symbol: String(symbol).trim() }, select: { id: true } });
+    const inst = await prisma.instrument.findFirst({
+      where: { symbol: String(symbol).trim() },
+      select: { id: true },
+    });
     instId = inst?.id ?? null;
   }
   if (!instId) return;
 
-  const start = DateTime.fromJSDate(opts.day).startOf("day").toJSDate();
-  const end = DateTime.fromJSDate(opts.day).endOf("day").toJSDate();
+  // Resolve janela de tempo (UTC) com tolerância
+  let fromUTC: Date | undefined;
+  let toUTC: Date | undefined;
 
+  if (opts.day != null) {
+    // Dia inteiro
+    const p = parseUserDate(opts.day);
+    if (p.ok) {
+      fromUTC = p.dt.startOf("day").toUTC().toJSDate();
+      toUTC = p.dt.endOf("day").toUTC().toJSDate();
+    }
+  } else if (opts.from != null || opts.to != null) {
+    const r = normalizeRange(opts.from, opts.to);
+    fromUTC = r.fromUTC;
+    toUTC = r.toUTC;
+  } else if (opts.days != null) {
+    const days = Math.max(1, Number(opts.days) || 1);
+    const now = DateTime.now().setZone(ZONE_BR);
+    fromUTC = now.minus({ days }).startOf("day").toUTC().toJSDate();
+    toUTC = now.endOf("day").toUTC().toJSDate();
+  } else {
+    // fallback: 1 dia
+    const r = normalizeRange(undefined, undefined, 1);
+    fromUTC = r.fromUTC;
+    toUTC = r.toUTC;
+  }
+
+  // TF
   const tfRaw = (opts.timeframe ?? "").toString().trim().toUpperCase();
   const allTF = !tfRaw || tfRaw === "*";
 
-  const candleWhere: any = {
-    instrumentId: instId,
-    time: { gte: start, lte: end },
-    ...(allTF ? {} : { timeframe: tfRaw }),
-  };
+  // Monta where do candle com filtros válidos apenas
+  const candleWhere: any = { instrumentId: instId };
+  if (fromUTC || toUTC) {
+    const timeClause: any = {};
+    if (fromUTC instanceof Date && !isNaN(fromUTC.getTime())) timeClause.gte = fromUTC;
+    if (toUTC instanceof Date && !isNaN(toUTC.getTime())) timeClause.lte = toUTC;
+    if (Object.keys(timeClause).length) candleWhere.time = timeClause;
+  }
+  if (!allTF) candleWhere.timeframe = tfRaw;
 
+  // Busca sinais confirmados no intervalo
   const signals = await prisma.signal.findMany({
     where: { signalType: "EMA_CROSS", candle: candleWhere },
     select: { id: true },
     orderBy: { id: "asc" },
   });
+
+  if (CFG.DEBUG) {
+    console.log(
+      JSON.stringify({
+        msg: "[pipeline] processImportedRange",
+        instId,
+        tf: allTF ? "*" : tfRaw,
+        fromUTC,
+        toUTC,
+        countSignals: signals.length,
+      })
+    );
+  }
 
   for (const s of signals) {
     try {
