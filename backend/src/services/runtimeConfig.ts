@@ -2,6 +2,16 @@
 import fs from "fs";
 import path from "path";
 
+// polyfill leve para Node < 18 (ignorado se fetch já existir)
+let _fetch: typeof fetch;
+try {
+    // @ts-ignore
+    _fetch = fetch;
+} catch {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    _fetch = require("node-fetch");
+}
+
 // === Tipos ===
 export type RuntimeConfig = {
     /** timeframe sugerido pela UI (ex.: "M1","M5","M15","M30","H1") */
@@ -63,7 +73,7 @@ function writeJsonFile(file: string, data: any) {
 
 // === Onde está o MODEL_STORE do micro? (resolver de forma resiliente) ===
 function resolveModelStoreDir(): string {
-    // 1) honors envs explícitos
+    // 1) honors envs explícitos (prioridade)
     const envs = [
         process.env.MODEL_STORE,          // preferível: setar igual no backend e no micro
         process.env.AI_NODE_MODEL_STORE,  // opcional
@@ -92,19 +102,49 @@ function resolveModelStoreDir(): string {
 
 const MODEL_STORE = resolveModelStoreDir();
 const CONFIG_FILE = path.join(MODEL_STORE, "ui_runtime_config.json");
-const MICRO_URL = process.env.MICRO_MODEL_URL || "http://127.0.0.1:5001";
+
+// URL do AI-node (micro). Mantive compatibilidade e nomes comuns.
+const MICRO_URL =
+    process.env.MICRO_MODEL_URL ||
+    process.env.AI_NODE_URL ||
+    "http://127.0.0.1:5001";
 
 // === Defaults (ENV como fallback; arquivo tem prioridade) ===
+// Priorize UI_* (iguais ao ai-node) e mantenha aliases AUTO_TRAINER_* como fallback
 const defaults: RuntimeConfig = {
     uiTimeframe: toTF(process.env.UI_TIMEFRAME) || "M5",
-    uiLots: toNum(process.env.UI_DEFAULT_LOTS ?? process.env.AUTO_TRAINER_DEFAULT_QTY, 1),
 
-    slAtr: toNum(process.env.AUTO_TRAINER_SL_ATR, 1.0),
-    rr: toNum(process.env.AUTO_TRAINER_RR, 2.0),
-    beAtPts: toNum(process.env.AUTO_TRAINER_BE_AT_PTS, 0),
-    beOffsetPts: toNum(process.env.AUTO_TRAINER_BE_OFFSET_PTS, 0),
+    // lots
+    uiLots: Math.max(
+        1,
+        toNum(
+            // prioridade às variáveis lidas pelo ai-node
+            process.env.UI_LOTS ??
+            // seus nomes antigos
+            process.env.UI_DEFAULT_LOTS ??
+            process.env.AUTO_TRAINER_DEFAULT_QTY,
+            1
+        )
+    ),
+
+    // SL ATR
+    slAtr: toNum(process.env.UI_SL_ATR ?? process.env.AUTO_TRAINER_SL_ATR, 1.0),
+
+    // RR
+    rr: toNum(process.env.UI_RR ?? process.env.AUTO_TRAINER_RR, 2.0),
+
+    // Break-even
+    beAtPts: toNum(
+        process.env.UI_BE_AT_PTS ?? process.env.AUTO_TRAINER_BE_AT_PTS,
+        0
+    ),
+    beOffsetPts: toNum(
+        process.env.UI_BE_OFFSET_PTS ?? process.env.AUTO_TRAINER_BE_OFFSET_PTS,
+        0
+    ),
 
     entryDelayBars: toNum(process.env.UI_ENTRY_DELAY_BARS, 1),
+
     decisionThreshold: Number.isFinite(Number(process.env.UI_DECISION_THRESHOLD))
         ? Number(process.env.UI_DECISION_THRESHOLD)
         : 0.5,
@@ -115,23 +155,64 @@ const defaults: RuntimeConfig = {
 // === Estado atual + mtime do arquivo para hot-reload leve ===
 let current: RuntimeConfig = { ...defaults, ...(readJsonFile(CONFIG_FILE) || {}) };
 let lastMtimeMs = (() => {
-    try { return fs.statSync(CONFIG_FILE).mtimeMs; } catch { return 0; }
+    try {
+        return fs.statSync(CONFIG_FILE).mtimeMs;
+    } catch {
+        return 0;
+    }
 })();
 
 // normaliza aliases e faixas
 function normalize(c: Partial<RuntimeConfig>): RuntimeConfig {
     const lotsAlias = (c as any).lots ?? (c as any).uiLots;
     const out: RuntimeConfig = {
-        uiTimeframe: toTF(c.uiTimeframe ?? current.uiTimeframe ?? defaults.uiTimeframe),
-        uiLots: Math.max(1, toNum(lotsAlias ?? current.uiLots ?? defaults.uiLots, defaults.uiLots)),
+        uiTimeframe: toTF(
+            c.uiTimeframe ?? current.uiTimeframe ?? defaults.uiTimeframe
+        ),
+        uiLots: Math.max(
+            1,
+            toNum(lotsAlias ?? current.uiLots ?? defaults.uiLots, defaults.uiLots)
+        ),
 
-        slAtr: Math.max(0, toNum(c.slAtr ?? current.slAtr ?? defaults.slAtr, defaults.slAtr)),
-        rr: Math.max(0, toNum(c.rr ?? current.rr ?? defaults.rr, defaults.rr)),
-        beAtPts: Math.max(0, toNum(c.beAtPts ?? current.beAtPts ?? defaults.beAtPts, defaults.beAtPts)),
-        beOffsetPts: Math.max(0, toNum(c.beOffsetPts ?? current.beOffsetPts ?? defaults.beOffsetPts, defaults.beOffsetPts)),
+        slAtr: Math.max(
+            0,
+            toNum(c.slAtr ?? current.slAtr ?? defaults.slAtr, defaults.slAtr)
+        ),
+        rr: Math.max(
+            0,
+            toNum(c.rr ?? current.rr ?? defaults.rr, defaults.rr)
+        ),
+        beAtPts: Math.max(
+            0,
+            toNum(c.beAtPts ?? current.beAtPts ?? defaults.beAtPts, defaults.beAtPts)
+        ),
+        beOffsetPts: Math.max(
+            0,
+            toNum(
+                c.beOffsetPts ?? current.beOffsetPts ?? defaults.beOffsetPts,
+                defaults.beOffsetPts
+            )
+        ),
 
-        entryDelayBars: Math.max(0, toNum(c.entryDelayBars ?? current.entryDelayBars ?? defaults.entryDelayBars, defaults.entryDelayBars)),
-        decisionThreshold: Math.min(1, Math.max(0, toNum(c.decisionThreshold ?? current.decisionThreshold ?? defaults.decisionThreshold, defaults.decisionThreshold))),
+        entryDelayBars: Math.max(
+            0,
+            toNum(
+                c.entryDelayBars ?? current.entryDelayBars ?? defaults.entryDelayBars,
+                defaults.entryDelayBars
+            )
+        ),
+        decisionThreshold: Math.min(
+            1,
+            Math.max(
+                0,
+                toNum(
+                    c.decisionThreshold ??
+                    current.decisionThreshold ??
+                    defaults.decisionThreshold,
+                    defaults.decisionThreshold
+                )
+            )
+        ),
 
         debug: toBool(c.debug ?? current.debug ?? defaults.debug, defaults.debug),
     };
@@ -185,7 +266,7 @@ function backendToMicroPatch(r: Partial<RuntimeConfig>) {
 // tenta puxar do micro e fundir no estado
 async function refreshFromMicroOnce(): Promise<void> {
     try {
-        const resp = await fetch(`${MICRO_URL}/config`);
+        const resp = await _fetch(`${MICRO_URL}/config`);
         if (!resp.ok) return;
         const j = await resp.json().catch(() => null);
         const microCfg = j?.config ?? j;
@@ -196,7 +277,9 @@ async function refreshFromMicroOnce(): Promise<void> {
             if (JSON.stringify(next) !== JSON.stringify(current)) {
                 current = next;
                 writeJsonFile(CONFIG_FILE, current);
-                try { lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs; } catch { }
+                try {
+                    lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs;
+                } catch { }
             }
         }
     } catch {
@@ -209,7 +292,7 @@ async function pushToMicro(patch: Partial<RuntimeConfig>) {
     try {
         const payload = backendToMicroPatch(patch);
         if (Object.keys(payload).length === 0) return;
-        await fetch(`${MICRO_URL}/config`, {
+        await _fetch(`${MICRO_URL}/config`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -232,7 +315,9 @@ export function setRuntimeConfig(update: Partial<RuntimeConfig>): RuntimeConfig 
     // aplica update local + arquivo
     current = normalize({ ...current, ...update });
     writeJsonFile(CONFIG_FILE, current);
-    try { lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs; } catch { }
+    try {
+        lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs;
+    } catch { }
 
     // replica para o micro
     pushToMicro(update); // fire-and-forget
@@ -243,7 +328,9 @@ export function setRuntimeConfig(update: Partial<RuntimeConfig>): RuntimeConfig 
 export function resetRuntimeConfig(): RuntimeConfig {
     current = normalize({ ...defaults });
     writeJsonFile(CONFIG_FILE, current);
-    try { lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs; } catch { }
+    try {
+        lastMtimeMs = fs.statSync(CONFIG_FILE).mtimeMs;
+    } catch { }
     // também reseta no micro
     pushToMicro(current);
     return { ...current };

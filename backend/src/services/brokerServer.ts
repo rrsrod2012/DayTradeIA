@@ -5,6 +5,8 @@
 
 import express, { Application, Router } from "express";
 import http from "http";
+import fs from "fs";
+import path from "path";
 
 // ===== EXEC: persistência mínima em memória =====
 import { persistAck, persistTask } from "./brokerPrisma";
@@ -22,6 +24,76 @@ import {
 /* --------- Helpers globais --------- */
 const ok = (data: any = {}) => ({ ok: true, ...data });
 const bad = (error: string, extra?: any) => ({ ok: false, error, ...(extra ? { extra } : {}) });
+
+/* =========================================================================================
+   Leitura defensiva da configuração “compartilhada” (mesmo store do AI-node)
+   - Sem import fixo de módulos internos: lê o JSON gravado em MODEL_STORE/ui_runtime_config.json
+   - Permite usar RR e BE como fallback quando a UI não enviar sl/tp/be nos tasks
+   ========================================================================================= */
+const MODEL_STORE =
+    process.env.MODEL_STORE ||
+    path.resolve(process.cwd(), "model_store");
+
+const UI_CONFIG_FILE = path.join(MODEL_STORE, "ui_runtime_config.json");
+
+type UiRuntimeConfig = Partial<{
+    uiTimeframe: "M1" | "M5" | "M15" | "M30" | "H1";
+    uiLots: number;
+    rr: number;
+    slAtr: number;
+    beAtPts: number;
+    beOffsetPts: number;
+    entryDelayBars: number;
+    decisionThreshold: number;
+    debug: boolean;
+}>;
+
+function ensureDir(p: string) {
+    try { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); } catch { }
+}
+ensureDir(MODEL_STORE);
+
+function readJson<T>(file: string): T | null {
+    try {
+        const s = fs.readFileSync(file, "utf8");
+        return JSON.parse(s) as T;
+    } catch {
+        return null;
+    }
+}
+
+function readUiRuntimeConfig(): UiRuntimeConfig {
+    const cfg = readJson<UiRuntimeConfig>(UI_CONFIG_FILE) || {};
+    return cfg || {};
+}
+
+function applyTaskFallbacksFromConfig(task: any, cfg: UiRuntimeConfig) {
+    // BE (break-even) — aplica quando não vier da UI
+    if (task.beAtPoints == null && cfg.beAtPts != null) {
+        task.beAtPoints = Number(cfg.beAtPts) || 0;
+    }
+    if (task.beOffsetPoints == null && cfg.beOffsetPts != null) {
+        task.beOffsetPoints = Number(cfg.beOffsetPts) || 0;
+    }
+
+    // TP via RR como fallback: se SL>0 e TP não veio, tenta calcular TP = SL * RR
+    const rr = Number(cfg.rr);
+    const hasRR = Number.isFinite(rr) && rr > 0;
+    if ((task.tpPoints == null || task.tpPoints === 0) && hasRR) {
+        const sl = Number(task.slPoints);
+        if (Number.isFinite(sl) && sl > 0) {
+            task.tpPoints = Math.max(0, Math.round(sl * rr));
+        }
+    }
+
+    // volume/lots: só usa como fallback se não vier nada
+    if ((task.volume == null || task.volume <= 0) && cfg.uiLots != null) {
+        const lots = Math.max(1, Math.floor(Number(cfg.uiLots) || 1));
+        task.volume = lots;
+    }
+
+    return task;
+}
 
 /**
  * Cria e retorna um Router com todas as rotas do broker/backtest.
@@ -48,7 +120,7 @@ function createBrokerRouter(): Router {
         res.status(200).json(
             ok({
                 service: "exec-broker+backtest",
-                version: "brokerServer:v2.0 (attach-friendly)",
+                version: "brokerServer:v2.1 (attach-friendly + UI-fallbacks)",
                 enabled: isEnabled(),
                 now: new Date().toISOString(),
                 endpoints: [
@@ -78,7 +150,7 @@ function createBrokerRouter(): Router {
 
     // Healthcheck simples (útil p/ curl)
     router.get("/healthz", (_req, res) => {
-        res.status(200).json(ok({ service: "exec-broker", enabled: isEnabled() }));
+        res.status(200).json(ok({ service: "exec-broker", enabled: isEnabled(), modelStore: MODEL_STORE, uiConfigFile: UI_CONFIG_FILE }));
     });
 
     /* =======================
@@ -98,10 +170,20 @@ function createBrokerRouter(): Router {
             const tasks = Array.isArray(body.tasks) ? body.tasks : [];
             if (!agentId) return res.status(200).json(bad("faltou agentId"));
             if (!tasks.length) return res.status(200).json(bad("tasks vazio"));
-            const r = enqueue(agentId, tasks); // aceita mesmo com enabled=false
+
+            // ------- (NOVO) Fallbacks a partir do runtime compartilhado -------
+            // Só aplica quando o campo não vier da UI. Mantém o que veio.
+            const cfg = readUiRuntimeConfig();
+            const patchedTasks = tasks.map((t) => {
+                const copy = { ...t };
+                return applyTaskFallbacksFromConfig(copy, cfg);
+            });
+
+            const r = enqueue(agentId, patchedTasks); // aceita mesmo com enabled=false
+
             // persist each task
             try {
-                for (const t of tasks) {
+                for (const t of patchedTasks) {
                     await persistTask(agentId, t);
                 }
             } catch {
