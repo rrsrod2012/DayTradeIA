@@ -21,6 +21,12 @@ import {
     peek,
 } from "./brokerPersist";
 
+// >>> ADIÇÃO: importar rotas de admin (runtime-config)
+import adminRoutes from "../routes/admin";
+
+// >>> ADIÇÃO: CORS para /admin e para o app standalone
+import cors from "cors";
+
 /* --------- Helpers globais --------- */
 const ok = (data: any = {}) => ({ ok: true, ...data });
 const bad = (error: string, extra?: any) => ({ ok: false, error, ...(extra ? { extra } : {}) });
@@ -326,6 +332,14 @@ export function attachBrokerToApp(app: Application, basePath: string = "/broker"
     const router = createBrokerRouter();
     app.use(basePath, router);
     console.log(`[EXEC+BT] Broker anexado ao app principal em '${basePath}' (sem abrir porta própria).`);
+
+    // >>> ADIÇÃO: expor rotas de admin também quando anexado (em RAIZ /admin, não sob /broker)
+    const adminLayer = Router();
+    adminLayer.use(cors()); // CORS para /admin
+    adminLayer.use(express.json({ limit: "2mb" })); // body parser para POST
+    adminLayer.use(adminRoutes);
+    app.use("/admin", adminLayer);
+    console.log(`[EXEC+BT] Admin routes montadas em '/admin' (runtime-config disponível quando anexado).`);
 }
 
 /* =========================================================================================
@@ -336,7 +350,16 @@ if (process.env.BROKER_STANDALONE === "1") {
     // Ordem de precedência: BROKER_HTTP_PORT > EXEC_PORT > 3002 (default do broker)
     const PORT = Number(process.env.BROKER_HTTP_PORT || process.env.EXEC_PORT || 3002);
     const appStandalone = express();
+
+    // >>> ADIÇÃO: CORS e body parser no app standalone (vale para /admin)
+    appStandalone.use(cors());
+    appStandalone.use(express.json({ limit: "2mb" }));
+
     appStandalone.use("/", createBrokerRouter());
+
+    // >>> ADIÇÃO: expor rotas de admin no standalone (RAIZ /admin) com CORS/JSON
+    appStandalone.use("/admin", adminRoutes);
+
     const server = http.createServer(appStandalone);
 
     server.on("error", (err: any) => {
@@ -352,6 +375,7 @@ if (process.env.BROKER_STANDALONE === "1") {
         console.log(
             `[EXEC+BT] (standalone) listening on http://127.0.0.1:${PORT}  enabled=${isEnabled() ? "Y" : "N"}`
         );
+        console.log(`[EXEC+BT] Endpoints admin habilitados em: GET/POST http://127.0.0.1:${PORT}/admin/runtime-config`);
     });
 }
 
