@@ -42,6 +42,9 @@ const MODEL_STORE =
 
 const UI_CONFIG_FILE = path.join(MODEL_STORE, "ui_runtime_config.json");
 
+// >>> ARQUIVO de guarda do PnL diário (pontos) e estado do guard
+const DAILY_GUARD_FILE = path.join(MODEL_STORE, "daily_guard.json");
+
 type UiRuntimeConfig = Partial<{
     uiTimeframe: "M1" | "M5" | "M15" | "M30" | "H1";
     uiLots: number;
@@ -51,8 +54,19 @@ type UiRuntimeConfig = Partial<{
     beOffsetPts: number;
     entryDelayBars: number;
     decisionThreshold: number;
+    // Limites diários
+    dailyMaxLoss: number;        // ex.: -1000 (pontos)
+    dailyProfitTarget: number;   // ex.:  2000 (pontos)
+    limitMode: "block" | "conservative";
     debug: boolean;
 }>;
+
+type DailyGuard = {
+    date: string;      // YYYY-MM-DD (local)
+    pnlPoints: number; // acumulado do dia em pontos (positivo/negativo)
+    pontosGanhos: number;   // soma apenas dos positivos
+    pontosPerdidos: number; // soma apenas dos negativos (valor negativo)
+};
 
 function ensureDir(p: string) {
     try { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); } catch { }
@@ -68,9 +82,71 @@ function readJson<T>(file: string): T | null {
     }
 }
 
+function writeJson<T>(file: string, data: T) {
+    try {
+        fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function todayLocalISODate(): string {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+
 function readUiRuntimeConfig(): UiRuntimeConfig {
     const cfg = readJson<UiRuntimeConfig>(UI_CONFIG_FILE) || {};
     return cfg || {};
+}
+
+// ======== Guard diário (arquivo) ========
+function readDailyGuard(): DailyGuard {
+    const stored = readJson<DailyGuard>(DAILY_GUARD_FILE);
+    const today = todayLocalISODate();
+    if (!stored || stored.date !== today) {
+        const initial: DailyGuard = { date: today, pnlPoints: 0, pontosGanhos: 0, pontosPerdidos: 0 };
+        writeJson(DAILY_GUARD_FILE, initial);
+        return initial;
+    }
+    // Backward-compat: se vier sem campos novos
+    if (stored.pontosGanhos == null || stored.pontosPerdidos == null) {
+        const fixed: DailyGuard = {
+            date: stored.date,
+            pnlPoints: stored.pnlPoints || 0,
+            pontosGanhos: stored.pontosGanhos ?? Math.max(0, stored.pnlPoints || 0),
+            pontosPerdidos: stored.pontosPerdidos ?? Math.min(0, stored.pnlPoints || 0),
+        };
+        writeJson(DAILY_GUARD_FILE, fixed);
+        return fixed;
+    }
+    return stored;
+}
+
+function addPnLToDailyGuard(deltaPoints: number): DailyGuard {
+    const guard = readDailyGuard();
+    const nextPnL = (guard.pnlPoints || 0) + (Number(deltaPoints) || 0);
+    const ganhos = guard.pontosGanhos || 0;
+    const perdas = guard.pontosPerdidos || 0;
+
+    const updated: DailyGuard = {
+        date: guard.date,
+        pnlPoints: nextPnL,
+        pontosGanhos: deltaPoints > 0 ? ganhos + deltaPoints : ganhos,
+        pontosPerdidos: deltaPoints < 0 ? perdas + deltaPoints : perdas,
+    };
+    writeJson(DAILY_GUARD_FILE, updated);
+    return updated;
+}
+
+function resetDailyGuard(): DailyGuard {
+    const fresh: DailyGuard = { date: todayLocalISODate(), pnlPoints: 0, pontosGanhos: 0, pontosPerdidos: 0 };
+    writeJson(DAILY_GUARD_FILE, fresh);
+    return fresh;
 }
 
 function applyTaskFallbacksFromConfig(task: any, cfg: UiRuntimeConfig) {
@@ -101,6 +177,41 @@ function applyTaskFallbacksFromConfig(task: any, cfg: UiRuntimeConfig) {
     return task;
 }
 
+// Checagem dos limites diários
+function checkDailyLimits(cfg: UiRuntimeConfig) {
+    const daily = readDailyGuard();
+    const maxLoss = cfg.dailyMaxLoss;
+    const profitTarget = cfg.dailyProfitTarget;
+    const mode: "block" | "conservative" = (cfg.limitMode === "conservative" ? "conservative" : "block");
+
+    const hitLoss = Number.isFinite(maxLoss as number) && daily.pnlPoints <= (maxLoss as number);
+    const hitProfit = Number.isFinite(profitTarget as number) && daily.pnlPoints >= (profitTarget as number);
+
+    return {
+        mode,
+        dailyPnL: daily.pnlPoints,
+        pontosGanhos: daily.pontosGanhos,
+        pontosPerdidos: daily.pontosPerdidos,
+        hitLoss,
+        hitProfit,
+        maxLoss,
+        profitTarget,
+    };
+}
+
+// Extrai pontos de PnL de um item de ACK de forma resiliente
+function extractPnLPointsFromAckItem(item: any): number {
+    if (!item) return 0;
+    const direct = Number(item.pnlPoints ?? item.points ?? item.profitPoints);
+    if (Number.isFinite(direct)) return direct as number;
+
+    const nested = item.pnl || item.profit || item.result;
+    if (nested && Number.isFinite(Number(nested.points))) {
+        return Number(nested.points);
+    }
+    return 0;
+}
+
 /**
  * Cria e retorna um Router com todas as rotas do broker/backtest.
  * Esse Router pode ser montado em um app existente (ex.: app.use("/broker", router))
@@ -126,7 +237,7 @@ function createBrokerRouter(): Router {
         res.status(200).json(
             ok({
                 service: "exec-broker+backtest",
-                version: "brokerServer:v2.1 (attach-friendly + UI-fallbacks)",
+                version: "brokerServer:v2.3 (UI-fallbacks + daily-limits + ganhos/perdas)",
                 enabled: isEnabled(),
                 now: new Date().toISOString(),
                 endpoints: [
@@ -134,10 +245,13 @@ function createBrokerRouter(): Router {
                     "GET  /enable?on=1|0",
                     "POST /enqueue  {agentId, tasks:[...]}",
                     "POST /poll     {agentId, max}  | ?noop=1",
-                    "POST /ack      {agentId, done:[{id,ok,ticket?,error?}]}",
+                    "POST /ack      {agentId, done:[{id,ok,ticket?,error?,pnlPoints?}]}",
                     "GET  /debug/peek?agentId=...",
                     "GET  /debug/stats",
                     "GET  /debug/history?agentId=...&limit=100",
+                    // RISK
+                    "GET  /risk/state",
+                    "POST /risk/reset",
                     // BACKTEST (sob /api)
                     "GET  /api/backtest/ping",
                     "GET  /api/backtest/version",
@@ -160,6 +274,28 @@ function createBrokerRouter(): Router {
     });
 
     /* =======================
+       RISK (paradas e metas)
+       ======================= */
+    router.get("/risk/state", (_req, res) => {
+        try {
+            const cfg = readUiRuntimeConfig();
+            const state = checkDailyLimits(cfg);
+            return res.status(200).json(ok(state));
+        } catch (e: any) {
+            return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
+        }
+    });
+
+    router.post("/risk/reset", (_req, res) => {
+        try {
+            const fresh = resetDailyGuard();
+            return res.status(200).json(ok({ reset: true, state: fresh }));
+        } catch (e: any) {
+            return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
+        }
+    });
+
+    /* =======================
        EXEC (MT5 NodeBridgeEA)
        ======================= */
     router.get("/enable", (req, res) => {
@@ -177,12 +313,37 @@ function createBrokerRouter(): Router {
             if (!agentId) return res.status(200).json(bad("faltou agentId"));
             if (!tasks.length) return res.status(200).json(bad("tasks vazio"));
 
-            // ------- (NOVO) Fallbacks a partir do runtime compartilhado -------
-            // Só aplica quando o campo não vier da UI. Mantém o que veio.
+            // Fallbacks a partir do runtime compartilhado
             const cfg = readUiRuntimeConfig();
+
+            // Checar limites diários ANTES de aceitar novas tarefas
+            const risk = checkDailyLimits(cfg);
+            if (risk.hitLoss || risk.hitProfit) {
+                if (risk.mode === "block") {
+                    const reason = risk.hitLoss ? "daily loss limit reached" : "daily profit target reached";
+                    return res.status(200).json(
+                        bad(reason, {
+                            dailyPnL: risk.dailyPnL,
+                            pontosGanhos: risk.pontosGanhos,
+                            pontosPerdidos: risk.pontosPerdidos,
+                            dailyMaxLoss: risk.maxLoss,
+                            dailyProfitTarget: risk.profitTarget,
+                            mode: risk.mode,
+                        })
+                    );
+                }
+                // modo "conservative": permite a tarefa, mas marca flag nos tasks
+            }
+
             const patchedTasks = tasks.map((t) => {
-                const copy = { ...t };
-                return applyTaskFallbacksFromConfig(copy, cfg);
+                const copy: any = { ...t };
+                applyTaskFallbacksFromConfig(copy, cfg);
+
+                if (risk.hitLoss || risk.hitProfit) {
+                    copy.riskMode = "conservative";
+                    copy.riskNote = risk.hitLoss ? "dailyLossHit" : "dailyProfitHit";
+                }
+                return copy;
             });
 
             const r = enqueue(agentId, patchedTasks); // aceita mesmo com enabled=false
@@ -225,7 +386,28 @@ function createBrokerRouter(): Router {
             const done = Array.isArray(body.done) ? body.done : [];
             if (!agentId) return res.status(200).json(bad("faltou agentId"));
             if (!done.length) return res.status(200).json(bad("done vazio"));
+
+            // ACK na persistência em memória
             const r = ackPersist(agentId, done);
+
+            // Acumular PnL (pontos) a partir do payload "done"
+            try {
+                let deltaSum = 0;
+                for (const it of done) {
+                    const delta = extractPnLPointsFromAckItem(it);
+                    if (Number.isFinite(delta)) deltaSum += Number(delta);
+                }
+                if (deltaSum !== 0) {
+                    const state = addPnLToDailyGuard(deltaSum);
+                    if (process.env.NODE_ENV !== "test") {
+                        console.log(`[RISK] ACK dia: PnL=${state.pnlPoints}  ganhos=${state.pontosGanhos}  perdas=${state.pontosPerdidos}  (Δ=${deltaSum})`);
+                    }
+                }
+            } catch {
+                // ignore errors
+            }
+
+            // Persistência externa (Prisma)
             try {
                 await persistAck(agentId, done);
             } catch {
@@ -355,7 +537,10 @@ if (process.env.BROKER_STANDALONE === "1") {
     appStandalone.use(cors());
     appStandalone.use(express.json({ limit: "2mb" }));
 
-    appStandalone.use("/", createBrokerRouter());
+    // >>> ALTERAÇÃO: expor o router tanto em "/" quanto em "/broker"
+    const brokerRouter = createBrokerRouter();
+    appStandalone.use("/", brokerRouter);        // sem prefixo
+    appStandalone.use("/broker", brokerRouter);  // com prefixo (compat UI)
 
     // >>> ADIÇÃO: expor rotas de admin no standalone (RAIZ /admin) com CORS/JSON
     appStandalone.use("/admin", adminRoutes);
@@ -376,6 +561,7 @@ if (process.env.BROKER_STANDALONE === "1") {
             `[EXEC+BT] (standalone) listening on http://127.0.0.1:${PORT}  enabled=${isEnabled() ? "Y" : "N"}`
         );
         console.log(`[EXEC+BT] Endpoints admin habilitados em: GET/POST http://127.0.0.1:${PORT}/admin/runtime-config`);
+        console.log(`[EXEC+BT] Endpoints broker disponíveis em: / (sem prefixo) e /broker (compat UI).`);
     });
 }
 

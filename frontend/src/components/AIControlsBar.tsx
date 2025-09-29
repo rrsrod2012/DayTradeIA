@@ -22,10 +22,7 @@ function fmtDate(d: Date) {
    Helpers de persistência (LS)
    ============================ */
 const LS_FILTERS_KEY = "ai/controls/filters/v2";
-/** bump de versão pq adicionamos novos params (BB e patterns) */
 const LS_PARAMS_KEY = "ai/controls/params/v3";
-
-/** Auto-exec: memória de dedupe e “armado desde” */
 const LS_EXEC_SENT_KEYS = "ai/exec/sentKeys/v1";
 const LS_EXEC_ARMED_SINCE = "ai/exec/armedSince/v1";
 
@@ -64,8 +61,8 @@ type Props = {
 type FiltersState = {
   symbol: string;
   timeframe: string;
-  from: string | null; // "YYYY-MM-DD" ou null
-  to: string | null;   // "YYYY-MM-DD" ou null
+  from: string | null;
+  to: string | null;
 };
 type FiltersAPI = {
   get: () => FiltersState;
@@ -73,7 +70,6 @@ type FiltersAPI = {
   subscribe: (cb: () => void) => () => void;
 };
 
-// estado inicial de filtros com persistência
 const _today = new Date();
 const _filtersInitial: FiltersState = (() => {
   const fallback: FiltersState = {
@@ -85,10 +81,7 @@ const _filtersInitial: FiltersState = (() => {
   return lsGet<FiltersState>(LS_FILTERS_KEY, fallback);
 })();
 
-const _filtersStore: {
-  state: FiltersState;
-  listeners: Set<() => void>;
-} = {
+const _filtersStore: { state: FiltersState; listeners: Set<() => void> } = {
   state: _filtersInitial,
   listeners: new Set(),
 };
@@ -106,7 +99,6 @@ const FiltersAPIImpl: FiltersAPI = {
   },
 };
 
-/** Hook global exportado: outros componentes podem importar de AIControlsBar.tsx */
 export function useAIControls() {
   const snapshot = useSyncExternalStore(
     FiltersAPIImpl.subscribe,
@@ -121,7 +113,7 @@ export function useAIControls() {
 }
 
 /* ============================
-   Componente da barra de controles
+   Tipos auxiliares
    ============================ */
 type LastSent = {
   at: string;
@@ -136,9 +128,6 @@ type LastSent = {
   taskId: string;
 };
 
-/* ============================
-   Integração RuntimeConfig (NOVO)
-   ============================ */
 type BackendRuntimeConfig = {
   uiTimeframe?: "M1" | "M5" | "M15" | "M30" | "H1";
   uiLots?: number;
@@ -160,7 +149,6 @@ type AiNodeConfigResponse = {
   meta?: any;
 };
 
-/* ======== Bases e path do runtime-config (evita porta do front) ======== */
 function isLikelyFrontendDevBase(u: string | null | undefined) {
   if (!u) return false;
   try {
@@ -223,7 +211,6 @@ if (process.env.NODE_ENV !== "production") {
   console.info("[AIControlsBar] Bases resolvidas:", { API_BASE, ML_BASE });
 }
 
-/** Fetch JSON com base absoluta obrigatória */
 async function httpJson<T>(base: string, path: string, init?: RequestInit): Promise<T> {
   const safeBase = cleanBase(base || "http://localhost:3002");
   const safePath = path.startsWith("/") ? path : `/${path}`;
@@ -236,43 +223,92 @@ async function httpJson<T>(base: string, path: string, init?: RequestInit): Prom
     ...init,
   });
   const txt = await resp.text();
-  const data = txt ? JSON.parse(txt) : null;
+  const data = txt ? JSON.parse(txt) : null as any;
   if (!resp.ok) {
     const err: any = new Error(`HTTP ${resp.status} ${resp.statusText}`);
-    err.response = data ?? txt;
-    err.status = resp.status;
-    err.urlTried = full;
+    (err as any).response = data ?? txt;
+    (err as any).status = resp.status;
+    (err as any).urlTried = full;
     throw err;
   }
   return data as T;
 }
 
-/* Helpers para endpoint de runtime-config */
 function runtimeEndpointBaseLooksValid() {
   return !isLikelyFrontendDevBase(API_BASE);
 }
 
-async function loadBackendRuntime(path = RUNTIME_PATH): Promise<BackendRuntimeConfig | null> {
-  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(
-    API_BASE,
-    path,
-    { method: "GET" }
-  );
-  return (res as any)?.config ?? null;
+/* ============================
+   (NOVO) Estado de risco (ganhos/perdas) + Fallback
+   ============================ */
+type RiskState = {
+  ok?: boolean;
+  mode: "block" | "conservative";
+  dailyPnL: number;
+  pontosGanhos: number;
+  pontosPerdidos: number;
+  hitLoss: boolean;
+  hitProfit: boolean;
+  maxLoss?: number | null;
+  profitTarget?: number | null;
+};
+
+/** Tenta buscar o estado de risco, primeiro com prefixo '/broker', depois sem prefixo. */
+async function tryLoadRiskState(): Promise<RiskState | null> {
+  const tryPaths = ["/broker/risk/state", "/risk/state"];
+  for (const p of tryPaths) {
+    try {
+      const res = await httpJson<any>(API_BASE, p, { method: "GET" });
+      const payload = res?.ok ? res : res; // aceita com/sem "ok"
+      const dailyPnL = Number(payload?.dailyPnL ?? payload?.state?.dailyPnL ?? 0);
+      const pontosGanhos = Number(payload?.pontosGanhos ?? payload?.state?.pontosGanhos ?? 0);
+      const pontosPerdidos = Number(payload?.pontosPerdidos ?? payload?.state?.pontosPerdidos ?? 0);
+      const mode = (payload?.mode as any) || (payload?.state?.mode as any) || "conservative";
+      const hitLoss = !!(payload?.hitLoss ?? payload?.state?.hitLoss);
+      const hitProfit = !!(payload?.hitProfit ?? payload?.state?.hitProfit);
+      const maxLoss = payload?.maxLoss ?? payload?.state?.maxLoss ?? null;
+      const profitTarget = payload?.profitTarget ?? payload?.state?.profitTarget ?? null;
+
+      if (
+        Number.isFinite(dailyPnL) ||
+        Number.isFinite(pontosGanhos) ||
+        Number.isFinite(pontosPerdidos)
+      ) {
+        return {
+          ok: true,
+          mode,
+          dailyPnL,
+          pontosGanhos,
+          pontosPerdidos,
+          hitLoss,
+          hitProfit,
+          maxLoss,
+          profitTarget,
+        };
+      }
+    } catch {
+      // tenta próximo path
+    }
+  }
+  return null;
 }
 
+async function loadBackendRuntime(path = RUNTIME_PATH): Promise<BackendRuntimeConfig | null> {
+  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(API_BASE, path, {
+    method: "GET",
+  });
+  return (res as any)?.config ?? null;
+}
 async function applyBackendRuntime(
   patch: BackendRuntimeConfig,
   path = RUNTIME_PATH
 ): Promise<BackendRuntimeConfig | null> {
-  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(
-    API_BASE,
-    path,
-    { method: "POST", body: JSON.stringify(patch) }
-  );
+  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(API_BASE, path, {
+    method: "POST",
+    body: JSON.stringify(patch),
+  });
   return (res as any)?.config ?? null;
 }
-
 async function loadAiNodeConfig(): Promise<BackendRuntimeConfig | null> {
   try {
     const res = await httpJson<AiNodeConfigResponse>(ML_BASE, "/config", { method: "GET" });
@@ -285,10 +321,14 @@ async function loadAiNodeConfig(): Promise<BackendRuntimeConfig | null> {
 export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [collapsed, setCollapsed] = React.useState(!!collapsedByDefault);
 
-  // -------- Filtros globais --------
+  // Filtros globais
   const { symbol, timeframe, from, to, setFilters } = useAIControls();
 
-  // -------- Parâmetros (Projetados / Backtest / Exec MT5) --------
+  // SELETORES (fallback totals)
+  const pnlState = useAIStore((s: any) => s.pnl);
+  const tradesState = useAIStore((s: any) => s.trades);
+
+  // Parâmetros persistidos
   const {
     rr: rr0,
     minProb: minProb0,
@@ -305,14 +345,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId: execAgentId0,
     execLots: execLots0,
     execMaxAgeSec: execMaxAgeSec0,
-
-    // SL/TP da tela
     sendStops: sendStops0,
     slPts: slPts0,
     tpPts: tpPts0,
     tpViaRR: tpViaRR0,
-
-    // NOVOS: Bollinger + Candle patterns
     bbEnabled: bbEnabled0,
     bbPeriod: bbPeriod0,
     bbK: bbK0,
@@ -333,20 +369,17 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execAgentId: "mt5-ea-1",
     execLots: 1,
     execMaxAgeSec: 20,
-
-    // defaults SL/TP
     sendStops: false,
     slPts: 0,
     tpPts: 0,
     tpViaRR: true,
-
-    // defaults Bollinger/patterns
     bbEnabled: false,
     bbPeriod: 20,
     bbK: 2,
     candlePatterns: "engulfing,hammer,doji",
   });
 
+  // Estados de UI/Execução
   const [rr, setRr] = React.useState<number>(rr0);
   const [minProb, setMinProb] = React.useState<number>(minProb0);
   const [minEV, setMinEV] = React.useState<number>(minEV0);
@@ -355,59 +388,55 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [requireMtf, setRequireMtf] = React.useState<boolean>(requireMtf0);
   const [confirmTf, setConfirmTf] = React.useState<string>(confirmTf0);
 
-  // BE por pontos (para o backtest e envio)
   const [breakEvenAtPts, setBreakEvenAtPts] = React.useState<number>(breakEvenAtPts0);
   const [beOffsetPts, setBeOffsetPts] = React.useState<number>(beOffsetPts0);
 
-  // Execução MT5
   const [execEnabled, setExecEnabled] = React.useState<boolean>(!!execEnabled0);
   const [execAgentId, setExecAgentId] = React.useState<string>(execAgentId0 || "mt5-ea-1");
   const [execLots, setExecLots] = React.useState<number>(Number(execLots0) || 1);
   const [execMaxAgeSec, setExecMaxAgeSec] = React.useState<number>(Number(execMaxAgeSec0) || 20);
   const [execMsg, setExecMsg] = React.useState<string | null>(null);
 
-  // SL/TP
   const [sendStops, setSendStops] = React.useState<boolean>(!!sendStops0);
   const [slPts, setSlPts] = React.useState<number>(Number(slPts0) || 0);
   const [tpPts, setTpPts] = React.useState<number>(Number(tpPts0) || 0);
   const [tpViaRR, setTpViaRR] = React.useState<boolean>(!!tpViaRR0);
 
-  // NOVOS: Bollinger + Candle patterns
   const [bbEnabled, setBbEnabled] = React.useState<boolean>(!!bbEnabled0);
   const [bbPeriod, setBbPeriod] = React.useState<number>(Number(bbPeriod0) || 20);
   const [bbK, setBbK] = React.useState<number>(Number(bbK0) || 2);
   const [candlePatterns, setCandlePatterns] = React.useState<string>(String(candlePatterns0 || ""));
 
-  // Auto-refresh
   const [autoRefresh, setAutoRefresh] = React.useState<boolean>(autoRefresh0);
   const [refreshSec, setRefreshSec] = React.useState<number>(refreshSec0);
 
-  // Estado geral
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
-
-  // Painel Backtests
   const [showBacktests, setShowBacktests] = React.useState(false);
-
-  // Último envio efetivo ao EA (espelho do envelope)
   const [lastSent, setLastSent] = React.useState<LastSent | null>(null);
 
-  // ===== (NOVO) Estado de sincronização Backend/AI-node =====
+  // Runtime config
   const [serverCfg, setServerCfg] = React.useState<BackendRuntimeConfig | null>(null);
   const [aiCfg, setAiCfg] = React.useState<BackendRuntimeConfig | null>(null);
   const [cfgMsg, setCfgMsg] = React.useState<string | null>(null);
   const [showEffective, setShowEffective] = React.useState<boolean>(false);
-
-  // Descobre se o endpoint existe (evita 404 repetido)
-  // null => desconhecido; true => existe; false => não existe
   const [hasRuntimeCfg, setHasRuntimeCfg] = React.useState<boolean | null>(HAS_RUNTIME_CFG_ENV);
 
+  // Tabs
+  type TabKey = "filters" | "ia" | "stops_exec" | "indicators";
+  const [activeTab, setActiveTab] = React.useState<TabKey>("filters");
+
+  // Risco
+  const [riskState, setRiskState] = React.useState<RiskState | null>(null);
+  const [riskErr, setRiskErr] = React.useState<string | null>(null);
+
+  // Store global setters
   const setProjected = useAIStore((s) => s.setProjected);
   const setConfirmed = useAIStore((s) => s.setConfirmed);
   const setPnL = useAIStore((s) => s.setPnL);
   const setTrades = useAIStore((s) => s.setTrades);
 
-  // Persiste parâmetros no LS sempre que mudarem
+  // Persistência de parâmetros
   React.useEffect(() => {
     lsSet(LS_PARAMS_KEY, {
       rr,
@@ -425,14 +454,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       execAgentId,
       execLots,
       execMaxAgeSec,
-
-      // stops
       sendStops,
       slPts,
       tpPts,
       tpViaRR,
-
-      // bb/patterns
       bbEnabled,
       bbPeriod,
       bbK,
@@ -474,11 +499,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     [symbol, timeframe, from, to]
   );
 
-  /* ---------- Probe único do endpoint de runtime (com cache) ---------- */
+  // Probe runtime endpoint (cache)
   React.useEffect(() => {
     let cancelled = false;
-
-    // Se o usuário explicitou true/false via env/window, respeitamos e não probamos
     if (HAS_RUNTIME_CFG_ENV === true) {
       setHasRuntimeCfg(true);
       return;
@@ -487,13 +510,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       setHasRuntimeCfg(false);
       return;
     }
-
-    // Se a base é claramente inválida (porta do front), não probe
     if (!runtimeEndpointBaseLooksValid()) {
       setHasRuntimeCfg(false);
       return;
     }
-
     const CACHE_KEY = "daytrade_runtime_probe";
     const cached = sessionStorage.getItem(CACHE_KEY);
     if (cached === "true") {
@@ -504,7 +524,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       setHasRuntimeCfg(false);
       return;
     }
-
     (async () => {
       try {
         await httpJson(API_BASE, RUNTIME_PATH, { method: "GET" });
@@ -516,27 +535,24 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         sessionStorage.setItem(CACHE_KEY, is404 ? "false" : "null");
       }
     })();
-
     return () => {
       cancelled = true;
     };
   }, []);
 
-  /** ============= RuntimeConfig: carregar/aplicar (NOVO) ============= */
+  const runtimeButtonsDisabled = hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid();
+
   async function onLoadServerConfig() {
     setCfgMsg(null);
-
     if (hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid()) {
       setServerCfg(null);
       setCfgMsg(
-        `Endpoint de runtime não disponível (${API_BASE}${RUNTIME_PATH}). ` +
-        `Defina VITE_RUNTIME_PATH/VITE_API_BASE ou window.DAYTRADE_CFG.{apiBase,runtimePath} para apontar ao backend correto.`
+        `Endpoint de runtime não disponível (${API_BASE}${RUNTIME_PATH}). Ajuste VITE_RUNTIME_PATH/VITE_API_BASE ou window.DAYTRADE_CFG.{apiBase,runtimePath}.`
       );
       const ai = await loadAiNodeConfig();
       setAiCfg(ai);
       return;
     }
-
     try {
       const cfg = await loadBackendRuntime();
       setServerCfg(cfg);
@@ -548,22 +564,18 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       setCfgMsg(`Backend respondeu ${status} em ${url}. Dica: ajuste VITE_RUNTIME_PATH ou implemente este endpoint.`);
       if (e?.status === 404) setHasRuntimeCfg(false);
     }
-
     const ai = await loadAiNodeConfig();
     setAiCfg(ai);
   }
 
   async function onApplyServerConfig() {
     setCfgMsg(null);
-
     if (hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid()) {
       setCfgMsg(
-        `Não é possível aplicar: ${API_BASE}${RUNTIME_PATH} não existe neste backend. ` +
-        `Ou habilite este endpoint no servidor ou aponte para um backend que o possua.`
+        `Não é possível aplicar: ${API_BASE}${RUNTIME_PATH} não existe neste backend. Habilite o endpoint no servidor ou aponte para um backend que o possua.`
       );
       return;
     }
-
     const patch: BackendRuntimeConfig = {
       uiTimeframe: String(timeframe || "M5").toUpperCase() as any,
       uiLots: Number(execLots) || 1,
@@ -573,32 +585,23 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       decisionThreshold: Number(minProb),
       debug: false,
     };
-
     try {
       const res = await applyBackendRuntime(patch);
       setServerCfg(res);
-      setCfgMsg(
-        res
-          ? "Config aplicada no Backend. (O Backend deve propagar ao AI-node)"
-          : "Falha ao aplicar no Backend."
-      );
+      setCfgMsg(res ? "Config aplicada no Backend. (O Backend deve propagar ao AI-node)" : "Falha ao aplicar no Backend.");
     } catch (e: any) {
       const status = e?.status ?? "erro";
       const url = e?.urlTried ?? `${API_BASE}${RUNTIME_PATH}`;
       setCfgMsg(`Falha ao aplicar (${status}) em ${url}.`);
       if (e?.status === 404) setHasRuntimeCfg(false);
     }
-
     const ai = await loadAiNodeConfig();
     setAiCfg(ai);
   }
 
-  /** ------------- AUTO-EXEC HELPERS ------------- */
-
   function execKeyForConfirm(s: { side: string; time: string | undefined; price?: number | null }) {
     const p = baseParams();
     const t = s.time ? new Date(s.time).toISOString() : "";
-    const pr = s.price != null ? String(Math.round(Number(s.price) * 100) / 100) : "-";
     return `${p.symbol}|${p.timeframe}|${s.side}|${t}`;
   }
 
@@ -621,15 +624,12 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     return true;
   }
 
-  // calcula SL/TP a partir dos controles de tela
   function computeStops() {
     let slPtsToSend: number | null = null;
     let tpPtsToSend: number | null = null;
-
     if (sendStops) {
       const sl = Math.max(0, Math.floor(Number(slPts) || 0));
       if (sl > 0) slPtsToSend = sl;
-
       if (tpViaRR) {
         if (slPtsToSend && rr > 0) {
           tpPtsToSend = Math.max(0, Math.round(slPtsToSend * Number(rr)));
@@ -639,26 +639,18 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         if (tp > 0) tpPtsToSend = tp;
       }
     }
-
     return { slPtsToSend, tpPtsToSend };
   }
 
   async function autoExecFromConfirmed(confirms: Array<{ side: any; time: any; price?: any }>) {
     if (!execEnabled) return;
-
     const armedSince = lsGetString(LS_EXEC_ARMED_SINCE, null);
-
     const sentArr = lsGet<string[]>(LS_EXEC_SENT_KEYS, []);
     const sent = new Set(sentArr);
-
     const candidates = (confirms || [])
-      .filter((s) => {
-        const side = String(s.side || "").toUpperCase();
-        return side === "BUY" || side === "SELL";
-      })
+      .filter((s) => ["BUY", "SELL"].includes(String(s.side || "").toUpperCase()))
       .filter((s) => isFreshEnough(String(s.time || ""), execMaxAgeSec, armedSince))
       .filter((s) => !sent.has(execKeyForConfirm(s)));
-
     if (candidates.length === 0) return;
 
     const { slPtsToSend, tpPtsToSend } = computeStops();
@@ -679,12 +671,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         slPoints: slPtsToSend,
         tpPoints: tpPtsToSend,
       };
-
-      const body = {
-        agentId: (execAgentId || "mt5-ea-1").trim(),
-        tasks: [task],
-      };
-
+      const body = { agentId: (execAgentId || "mt5-ea-1").trim(), tasks: [task] };
       try {
         const res = await enqueueMT5Order(body);
         setExecMsg(`AUTO ${side}: ${JSON.stringify(res)}`);
@@ -700,44 +687,31 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
           comment: task.comment,
           taskId,
         });
-        window.dispatchEvent(
-          new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
-        );
+        window.dispatchEvent(new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } }));
         sent.add(execKeyForConfirm(s));
       } catch (e: any) {
-        const msg =
-          (e?.message || "Falha no enqueue") +
-          (e?.urlTried ? ` @ ${e.urlTried}` : "") +
-          (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
+        const msg = (e?.message || "Falha no enqueue") + (e?.urlTried ? ` @ ${e.urlTried}` : "") + (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
         setExecMsg(`ERRO AUTO ${side}: ${msg}`);
       }
     }
-
     const newArr = clampSentKeys(Array.from(sent), 1000);
     lsSet(LS_EXEC_SENT_KEYS, newArr);
   }
 
-  // quando liga o toggle, “arma” a referência de tempo (salva ISO/UTC, mostra local)
   React.useEffect(() => {
     if (execEnabled) {
       const now = new Date();
-      const nowIso = now.toISOString();      // comparações (UTC)
-      const nowLocal = now.toLocaleString(); // exibição (fuso local)
-      lsSet(LS_EXEC_ARMED_SINCE, nowIso);
-      setExecMsg(`AUTO armado às ${nowLocal} (local)`);
+      lsSet(LS_EXEC_ARMED_SINCE, now.toISOString());
+      setExecMsg(`AUTO armado às ${now.toLocaleString()} (local)`);
     }
   }, [execEnabled]);
 
-  /** ----------------------------------------------------------- */
-
-  /** Busca PROJETADOS + CONFIRMADOS + PnL + Trades */
   async function fetchAllOnce() {
     setLoading(true);
     setErr(null);
     try {
       const params = baseParams();
-
-      const { slPtsToSend, tpPtsToSend } = computeStops(); // <<< SL/TP para confirmados e backtest
+      const { slPtsToSend, tpPtsToSend } = computeStops();
 
       (window as any).__dbgLastParams = {
         ...params,
@@ -754,27 +728,18 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         execAgentId,
         execLots,
         execMaxAgeSec,
-
-        // bb/patterns
         bbEnabled,
         bbPeriod,
         bbK,
         candlePatterns,
-
-        // visuais
         sendStops,
         slPts,
         tpPts,
         tpViaRR,
-
-        // efetivamente aplicados neste ciclo
-        stopsApplied: {
-          slPoints: slPtsToSend ?? 0,
-          tpPoints: tpPtsToSend ?? 0,
-        },
+        stopsApplied: { slPoints: slPtsToSend ?? 0, tpPoints: tpPtsToSend ?? 0 },
       };
 
-      // 1) Projetados — agora enviamos os filtros/gates como estão
+      // 1) Projetados
       const payload: any = {
         ...params,
         rr,
@@ -784,28 +749,13 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         vwapFilter,
         requireMtf,
         confirmTf: String(confirmTf || "").trim().toUpperCase(),
-        // novos
         bbEnabled,
         bbPeriod,
         bbK,
         candlePatterns,
       };
       if (payload.minEV === 0) delete payload.minEV;
-
       const proj = await projectedSignals(payload);
-
-      if (process.env.NODE_ENV !== "production") {
-        const buy = (proj || []).filter((r) => r.side === "BUY").length;
-        const sell = (proj || []).filter((r) => r.side === "SELL").length;
-        console.log("[AIControlsBar] projected fetched", {
-          sent: payload,
-          received: (proj || []).length,
-          buy,
-          sell,
-          exampleSELL: (proj || []).find((r) => r.side === "SELL") || null,
-        });
-      }
-
       setProjected(proj || [], {
         ...params,
         rr,
@@ -821,15 +771,13 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         candlePatterns,
       });
 
-      // 2) Confirmados — (se backend suportar) SL/TP também segue
+      // 2) Confirmados
       const confRaw = await fetchConfirmedSignals({
         ...params,
         limit: 2000,
         slPoints: slPtsToSend ?? 0,
         tpPoints: tpPtsToSend ?? 0,
       });
-      (window as any).__dbgConfirmedRaw = confRaw;
-
       setConfirmed(confRaw || [], {
         ...params,
         slPoints: slPtsToSend ?? null,
@@ -838,10 +786,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         rr,
       });
 
-      // 2.1) AUTO-EXEC
+      // 2.1) Auto-exec
       await autoExecFromConfirmed(confRaw || []);
 
-      // 3) Backtest — inclui BE + SL/TP + BB/patterns/VWAP/MTF
+      // 3) Backtest
       const bt = await runBacktest({
         ...params,
         breakEvenAtPts,
@@ -850,8 +798,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         tpPoints: tpPtsToSend ?? 0,
         tpViaRR,
         rr,
-
-        // gates/indicadores
         vwapFilter,
         bbEnabled,
         bbPeriod,
@@ -865,10 +811,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         (Array.isArray(bt?.items) && bt?.items) ||
         (Array.isArray(bt?.data) && bt?.data) ||
         [];
-
-      (window as any).__dbgTradesRaw = rawTrades;
-
       const sum = bt?.summary || null;
+
       setPnL(
         sum
           ? {
@@ -876,7 +820,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
             wins: sum.wins ?? 0,
             losses: sum.losses ?? 0,
             ties: sum.ties ?? 0,
-            winRate: sum.winRate ?? 0,
             pnlPoints: sum.pnlPoints ?? bt?.pnlPoints ?? 0,
             pnlMoney: bt?.pnlMoney ?? undefined,
             avgPnL: sum.avgPnL ?? 0,
@@ -886,7 +829,6 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
           : null
       );
 
-      // meta inclui quais stops foram aplicados para render/legenda
       setTrades(rawTrades, {
         ...(bt?.meta || {}),
         slPointsApplied: slPtsToSend ?? 0,
@@ -901,6 +843,19 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         vwapApplied: !!vwapFilter,
         patternsApplied: candlePatterns || "",
       });
+
+      // 4) Estado de risco (opcional, MT5 real)
+      try {
+        const rs = await tryLoadRiskState();
+        if (rs) {
+          setRiskState(rs);
+          setRiskErr(null);
+        } else {
+          setRiskState(null); // fallback assume
+        }
+      } catch (e: any) {
+        setRiskErr(e?.message || "Falha ao ler estado de risco");
+      }
     } catch (e: any) {
       setErr(e?.message || "Erro ao atualizar dados");
     } finally {
@@ -908,12 +863,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     }
   }
 
-  // Botão manual
   async function onBuscarAgora() {
     await fetchAllOnce();
   }
 
-  // --- helper: monta task no formato que o EA/NodeBridge consome ---
   function makeMt5Task(side: "BUY" | "SELL") {
     const { slPtsToSend, tpPtsToSend } = computeStops();
     return {
@@ -931,25 +884,17 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     };
   }
 
-  // Enfileirar ordem de teste no MT5 (payload { agentId, tasks: [...] })
   async function onExecTest(side: "BUY" | "SELL") {
     setExecMsg(null);
     if (!execEnabled) {
       setExecMsg("Execução desativada (ligue o toggle).");
       return;
     }
-
-    // Alerta amigável se TP via RR estiver ligado mas SL==0 ou sendStops==false
     if (tpViaRR && (!sendStops || Math.max(0, Math.floor(Number(slPts) || 0)) === 0)) {
       setExecMsg("Aviso: TP via RR requer SL>0 e 'Enviar SL/TP' ligado. Ajuste os controles.");
     }
-
     const task = makeMt5Task(side);
-    const body = {
-      agentId: (execAgentId || "mt5-ea-1").trim(),
-      tasks: [task],
-    };
-
+    const body = { agentId: (execAgentId || "mt5-ea-1").trim(), tasks: [task] };
     try {
       const res = await enqueueMT5Order(body);
       setExecMsg(`OK ${side}: ${JSON.stringify(res)}`);
@@ -965,31 +910,25 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
         comment: task.comment,
         taskId: task.id,
       });
-      window.dispatchEvent(
-        new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } })
-      );
+      window.dispatchEvent(new CustomEvent("daytrade:mt5-enqueue", { detail: { when: Date.now(), body, res } }));
     } catch (e: any) {
       const msg =
-        (e?.message || "Falha no enqueue") +
-        (e?.urlTried ? ` @ ${e.urlTried}` : "") +
-        (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
+        (e?.message || "Falha no enqueue") + (e?.urlTried ? ` @ ${e.urlTried}` : "") + (e?.response ? ` | resp=${JSON.stringify(e.response)}` : "");
       setExecMsg(`ERRO ${side}: ${msg}`);
     }
   }
 
-  // Loop de auto-refresh (dispara imediatamente ao ligar)
+  // Auto refresh principal
   React.useEffect(() => {
     if (!autoRefresh) return;
     let alive = true;
     let timer: any = null;
-
     async function tick() {
       if (!alive) return;
       await fetchAllOnce();
       if (!alive) return;
       timer = setTimeout(tick, Math.max(5, refreshSec) * 1000);
     }
-
     tick();
     return () => {
       alive = false;
@@ -1026,7 +965,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     candlePatterns,
   ]);
 
-  // Invalidação por evento vindo do backend/WS
+  // Invalidação externa
   React.useEffect(() => {
     function onInvalidate() {
       fetchAllOnce();
@@ -1064,16 +1003,75 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     candlePatterns,
   ]);
 
-  // Desabilita botões se endpoint ainda desconhecido OU ausente OU base inválida
-  const runtimeButtonsDisabled =
-    hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid();
+  // Poll leve do risco (5s). Agora tolerante a prefixo também (via tryLoadRiskState).
+  React.useEffect(() => {
+    let alive = true;
+    let timer: any = null;
+    async function tickRisk() {
+      if (!alive) return;
+      try {
+        const rs = await tryLoadRiskState();
+        setRiskState(rs);
+        setRiskErr(null);
+      } catch (e: any) {
+        setRiskErr(e?.message || "Falha ao ler estado de risco");
+      }
+      if (!alive) return;
+      timer = setTimeout(tickRisk, 5000);
+    }
+    tickRisk();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
 
+  // ======= Fallback local para totais do dia =======
+  const uiDaily = React.useMemo(() => {
+    // 1) Se o backend de risco respondeu, use-o.
+    if (riskState) {
+      return {
+        ganhos: Number(riskState.pontosGanhos || 0),
+        perdas: Number(riskState.pontosPerdidos || 0),
+        pnl: Number(riskState.dailyPnL || 0),
+        hitLoss: !!riskState.hitLoss,
+        hitProfit: !!riskState.hitProfit,
+      };
+    }
+
+    // 2) Senão, tenta calcular dos trades do backtest atual (com filtros do dia).
+    let ganhos = 0;
+    let perdasAbs = 0;
+    if (Array.isArray(tradesState) && tradesState.length > 0) {
+      for (const t of tradesState) {
+        const pts =
+          typeof t?.pnlPoints === "number"
+            ? t.pnlPoints
+            : typeof t?.pnl === "number"
+              ? t.pnl
+              : 0;
+        if (pts > 0) ganhos += pts;
+        if (pts < 0) perdasAbs += Math.abs(pts);
+      }
+    }
+
+    // 3) PnL líquido: prefere summary.pnlPoints quando existir.
+    const pnl =
+      (pnlState && typeof pnlState.pnlPoints === "number" && pnlState.pnlPoints) ||
+      (ganhos - perdasAbs) ||
+      0;
+
+    return { ganhos, perdas: perdasAbs, pnl, hitLoss: false, hitProfit: false };
+  }, [riskState, tradesState, pnlState]);
+
+  // ====== Render ======
   return (
     <>
+      {/* HEADER STICKY: título, totais do dia, ações rápidas */}
       <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>
         <div className="bg-body-tertiary border-bottom">
           <div className="container py-2">
-            <div className="d-flex align-items-center gap-2">
+            <div className="d-flex align-items-center gap-2 flex-wrap">
               <button
                 className="btn btn-sm btn-outline-secondary"
                 onClick={() => setCollapsed((c) => !c)}
@@ -1081,9 +1079,41 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               >
                 {collapsed ? "▸" : "▾"}
               </button>
-              <strong>IA</strong>
+              <strong className="me-2">IA</strong>
 
-              {/* Botão painel Backtests */}
+              {/* Totais do dia (com fallback) */}
+              <div className="d-flex align-items-center gap-2">
+                <span className="badge text-bg-light border">
+                  Ganhos:{" "}
+                  <span className="fw-bold text-success ms-1">
+                    {`+${Number(uiDaily.ganhos || 0).toLocaleString("pt-BR")}`}
+                  </span>
+                </span>
+                <span className="badge text-bg-light border">
+                  Perdas:{" "}
+                  <span className="fw-bold text-danger ms-1">
+                    {`${Number(uiDaily.perdas || 0).toLocaleString("pt-BR")}`}
+                  </span>
+                </span>
+                <span className="badge text-bg-light border">
+                  PnL:{" "}
+                  <span
+                    className={`fw-bold ms-1 ${(uiDaily.pnl || 0) >= 0 ? "text-success" : "text-danger"
+                      }`}
+                  >
+                    {`${(uiDaily.pnl || 0) >= 0 ? "+" : ""}${Number(uiDaily.pnl || 0).toLocaleString("pt-BR")}`}
+                  </span>
+                </span>
+                {uiDaily.hitLoss && <span className="badge text-bg-danger">Stop diário atingido</span>}
+                {uiDaily.hitProfit && <span className="badge text-bg-success">Meta diária atingida</span>}
+                {riskErr && (
+                  <span className="text-danger">
+                    <small>({riskErr})</small>
+                  </span>
+                )}
+              </div>
+
+              {/* Backtests toggle */}
               <button
                 className="btn btn-sm btn-outline-primary ms-2"
                 onClick={() => setShowBacktests((v) => !v)}
@@ -1092,7 +1122,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                 {showBacktests ? "Ocultar Backtests" : "Backtests"}
               </button>
 
-              {/* ===== NOVO: Painel Parâmetros Efetivos / Runtime ===== */}
+              {/* Parâmetros efetivos (painel expansível) */}
               <button
                 className="btn btn-sm btn-outline-dark ms-2"
                 onClick={() => setShowEffective((v) => !v)}
@@ -1100,6 +1130,8 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               >
                 {showEffective ? "Ocultar parâmetros" : "Parâmetros efetivos"}
               </button>
+
+              {/* Carregar/Aplicar runtime */}
               <div className="btn-group btn-group-sm ms-1" role="group" aria-label="cfg-actions">
                 <button
                   className="btn btn-outline-secondary"
@@ -1124,210 +1156,9 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                 </span>
               )}
 
-              <div className="vr mx-2" />
-
-              <div className="d-flex flex-wrap align-items-end gap-2">
-                {/* filtros principais */}
-                <div className="input-group input-group-sm" style={{ width: 140 }}>
-                  <span className="input-group-text">Símbolo</span>
-                  <input
-                    className="form-control"
-                    value={symbol}
-                    onChange={(e) => setFilters({ symbol: e.target.value })}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 120 }}>
-                  <span className="input-group-text">TF</span>
-                  <input
-                    className="form-control"
-                    value={timeframe}
-                    onChange={(e) => setFilters({ timeframe: e.target.value })}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 210 }}>
-                  <span className="input-group-text">De</span>
-                  <input
-                    type="date"
-                    className="form-control"
-                    value={from ?? ""}
-                    onChange={(e) => setFilters({ from: e.target.value || null })}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 210 }}>
-                  <span className="input-group-text">Até</span>
-                  <input
-                    type="date"
-                    className="form-control"
-                    value={to ?? ""}
-                    onChange={(e) => setFilters({ to: e.target.value || null })}
-                  />
-                </div>
-
-                {/* parâmetros — Projetados / Backtest */}
-                <div className="input-group input-group-sm" style={{ width: 110 }}>
-                  <span className="input-group-text">RR</span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    className="form-control"
-                    value={rr}
-                    onChange={(e) => setRr(Number(e.target.value))}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 150 }}>
-                  <span className="input-group-text">minProb</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min={0}
-                    max={1}
-                    className="form-control"
-                    value={minProb}
-                    onChange={(e) => setMinProb(Number(e.target.value))}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 140 }}>
-                  <span className="input-group-text">minEV</span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    className="form-control"
-                    value={minEV}
-                    onChange={(e) => setMinEV(Number(e.target.value))}
-                  />
-                </div>
-
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="ai-toggle"
-                    checked={useMicroModel}
-                    onChange={(e) => setUseMicroModel(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="ai-toggle">
-                    Usar IA
-                  </label>
-                </div>
-
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="vwap-toggle"
-                    checked={vwapFilter}
-                    onChange={(e) => setVwapFilter(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="vwap-toggle">
-                    VWAP
-                  </label>
-                </div>
-
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="mtf-toggle"
-                    checked={requireMtf}
-                    onChange={(e) => setRequireMtf(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="mtf-toggle">
-                    MTF
-                  </label>
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 150 }}>
-                  <span className="input-group-text">TF Conf.</span>
-                  <input
-                    className="form-control"
-                    value={confirmTf}
-                    onChange={(e) => setConfirmTf(e.target.value)}
-                  />
-                </div>
-
-                {/* >>> BE por pontos */}
-                <div className="input-group input-group-sm" style={{ width: 140 }}>
-                  <span className="input-group-text">BE (pts)</span>
-                  <input
-                    type="number"
-                    step={1}
-                    className="form-control"
-                    value={breakEvenAtPts}
-                    onChange={(e) => setBreakEvenAtPts(Number(e.target.value) || 0)}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 150 }}>
-                  <span className="input-group-text">Offset (pts)</span>
-                  <input
-                    type="number"
-                    step={1}
-                    className="form-control"
-                    value={beOffsetPts}
-                    onChange={(e) => setBeOffsetPts(Number(e.target.value) || 0)}
-                  />
-                </div>
-
-                {/* --------- Bollinger & Patterns --------- */}
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="bb-toggle"
-                    checked={bbEnabled}
-                    onChange={(e) => setBbEnabled(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="bb-toggle">
-                    Bollinger
-                  </label>
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 120 }}>
-                  <span className="input-group-text">BB P</span>
-                  <input
-                    type="number"
-                    min={5}
-                    step={1}
-                    className="form-control"
-                    value={bbPeriod}
-                    onChange={(e) => setBbPeriod(Math.max(5, Number(e.target.value) || 20))}
-                    disabled={!bbEnabled}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 120 }}>
-                  <span className="input-group-text">BB k</span>
-                  <input
-                    type="number"
-                    min={0.5}
-                    step={0.1}
-                    className="form-control"
-                    value={bbK}
-                    onChange={(e) => setBbK(Math.max(0.1, Number(e.target.value) || 2))}
-                    disabled={!bbEnabled}
-                  />
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 260 }}>
-                  <span className="input-group-text">Patterns</span>
-                  <input
-                    className="form-control"
-                    placeholder="engulfing,hammer,doji"
-                    value={candlePatterns}
-                    onChange={(e) => setCandlePatterns(e.target.value)}
-                  />
-                </div>
-                {/* --------------------------------------- */}
-
-                <div className="vr mx-1" />
-
-                {/* Auto refresh */}
-                <div className="form-check form-switch">
+              {/* Ações gerais */}
+              <div className="ms-auto d-flex align-items-center gap-2">
+                <div className="form-check form-switch m-0">
                   <input
                     className="form-check-input"
                     type="checkbox"
@@ -1335,11 +1166,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     checked={autoRefresh}
                     onChange={(e) => setAutoRefresh(e.target.checked)}
                   />
-                  <label className="form-check-label" htmlFor="auto-toggle">
-                    Atualizar auto
+                  <label className="form-check-label ms-1" htmlFor="auto-toggle">
+                    Auto
                   </label>
                 </div>
-
                 <div className="input-group input-group-sm" style={{ width: 130 }}>
                   <span className="input-group-text">a cada</span>
                   <input
@@ -1348,217 +1178,430 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                     step={5}
                     className="form-control"
                     value={refreshSec}
-                    onChange={(e) =>
-                      setRefreshSec(Math.max(5, Number(e.target.value)))
-                    }
+                    onChange={(e) => setRefreshSec(Math.max(5, Number(e.target.value)))}
                   />
                   <span className="input-group-text">s</span>
                 </div>
-
-                <button
-                  className="btn btn-sm btn-primary ms-2"
-                  onClick={onBuscarAgora}
-                  disabled={loading}
-                >
+                <button className="btn btn-sm btn-primary" onClick={onBuscarAgora} disabled={loading}>
                   {loading ? "Atualizando..." : "Buscar agora"}
                 </button>
-
                 {err && (
-                  <span className="text-danger small ms-2">
+                  <span className="text-danger small">
                     <strong>Erro:</strong> {err}
                   </span>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
 
-              {/* ===== Execução MT5 ===== */}
-              <div className="vr mx-2" />
-              <div className="d-flex flex-wrap align-items-end gap-2">
-                <div className="form-check form-switch">
+      {/* ====== TABS SEÇÃO (não-sticky): separa filtros e parâmetros ====== */}
+      {!collapsed && (
+        <div className="container my-3">
+          <ul className="nav nav-tabs">
+            <li className="nav-item">
+              <button
+                className={`nav-link ${activeTab === "filters" ? "active" : ""}`}
+                onClick={() => setActiveTab("filters")}
+              >
+                Filtros
+              </button>
+            </li>
+            <li className="nav-item">
+              <button
+                className={`nav-link ${activeTab === "ia" ? "active" : ""}`}
+                onClick={() => setActiveTab("ia")}
+              >
+                IA & Gates
+              </button>
+            </li>
+            <li className="nav-item">
+              <button
+                className={`nav-link ${activeTab === "stops_exec" ? "active" : ""}`}
+                onClick={() => setActiveTab("stops_exec")}
+              >
+                Stops & Execução
+              </button>
+            </li>
+            <li className="nav-item">
+              <button
+                className={`nav-link ${activeTab === "indicators" ? "active" : ""}`}
+                onClick={() => setActiveTab("indicators")}
+              >
+                Indicadores
+              </button>
+            </li>
+          </ul>
+
+          <div className="tab-content border-start border-end border-bottom p-3 rounded-bottom">
+            {/* TAB: FILTROS */}
+            <div className={`tab-pane fade ${activeTab === "filters" ? "show active" : ""}`}>
+              <div className="row g-3">
+                <div className="col-12 col-sm-6 col-md-3">
+                  <label className="form-label mb-1">Símbolo</label>
                   <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="exec-toggle"
-                    checked={execEnabled}
-                    onChange={(e) => setExecEnabled(e.target.checked)}
+                    className="form-control form-control-sm"
+                    value={symbol}
+                    onChange={(e) => setFilters({ symbol: e.target.value })}
                   />
                 </div>
-                <label className="form-check-label me-2" htmlFor="exec-toggle">
-                  Executar no MT5 (auto)
-                </label>
-
-                <div className="input-group input-group-sm" style={{ width: 180 }}>
-                  <span className="input-group-text">AgentId</span>
+                <div className="col-12 col-sm-6 col-md-3">
+                  <label className="form-label mb-1">Timeframe</label>
                   <input
-                    className="form-control"
-                    value={execAgentId}
-                    onChange={(e) => setExecAgentId(e.target.value)}
-                    placeholder="mt5-ea-1"
+                    className="form-control form-control-sm"
+                    value={timeframe}
+                    onChange={(e) => setFilters({ timeframe: e.target.value })}
                   />
                 </div>
+                <div className="col-12 col-md-3">
+                  <label className="form-label mb-1">De</label>
+                  <input
+                    type="date"
+                    className="form-control form-control-sm"
+                    value={from ?? ""}
+                    onChange={(e) => setFilters({ from: e.target.value || null })}
+                  />
+                </div>
+                <div className="col-12 col-md-3">
+                  <label className="form-label mb-1">Até</label>
+                  <input
+                    type="date"
+                    className="form-control form-control-sm"
+                    value={to ?? ""}
+                    onChange={(e) => setFilters({ to: e.target.value || null })}
+                  />
+                </div>
+              </div>
+            </div>
 
-                <div className="input-group input-group-sm" style={{ width: 120 }}>
-                  <span className="input-group-text">Lots</span>
+            {/* TAB: IA & GATES */}
+            <div className={`tab-pane fade ${activeTab === "ia" ? "show active" : ""}`}>
+              <div className="row g-3">
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">RR</label>
                   <input
                     type="number"
-                    step={0.1}
-                    min={0.1}
-                    className="form-control"
-                    value={execLots}
-                    onChange={(e) =>
-                      setExecLots(Math.max(1, Math.round(Number(e.target.value) || 1)))
-                    }
+                    step="0.1"
+                    className="form-control form-control-sm"
+                    value={rr}
+                    onChange={(e) => setRr(Number(e.target.value))}
+                  />
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">minProb</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={1}
+                    className="form-control form-control-sm"
+                    value={minProb}
+                    onChange={(e) => setMinProb(Number(e.target.value))}
+                  />
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">minEV</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="form-control form-control-sm"
+                    value={minEV}
+                    onChange={(e) => setMinEV(Number(e.target.value))}
+                  />
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">TF Confirmação</label>
+                  <input
+                    className="form-control form-control-sm"
+                    value={confirmTf}
+                    onChange={(e) => setConfirmTf(e.target.value)}
                   />
                 </div>
 
-                {/* Janela de frescor (anti-histórico) */}
-                <div className="input-group input-group-sm" style={{ width: 160 }}>
-                  <span className="input-group-text">MaxAge</span>
+                <div className="col-12 col-md-4 d-flex align-items-center gap-3">
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="ai-toggle"
+                      checked={useMicroModel}
+                      onChange={(e) => setUseMicroModel(e.target.checked)}
+                    />
+                    <label className="form-check-label" htmlFor="ai-toggle">
+                      Usar IA
+                    </label>
+                  </div>
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="vwap-toggle"
+                      checked={vwapFilter}
+                      onChange={(e) => setVwapFilter(e.target.checked)}
+                    />
+                    <label className="form-check-label" htmlFor="vwap-toggle">
+                      VWAP
+                    </label>
+                  </div>
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="mtf-toggle"
+                      checked={requireMtf}
+                      onChange={(e) => setRequireMtf(e.target.checked)}
+                    />
+                    <label className="form-check-label" htmlFor="mtf-toggle">
+                      MTF
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* TAB: STOPS & EXECUÇÃO */}
+            <div className={`tab-pane fade ${activeTab === "stops_exec" ? "show active" : ""}`}>
+              <div className="row g-3">
+                {/* BE */}
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">BE (pts)</label>
+                  <input
+                    type="number"
+                    step={1}
+                    className="form-control form-control-sm"
+                    value={breakEvenAtPts}
+                    onChange={(e) => setBreakEvenAtPts(Number(e.target.value) || 0)}
+                  />
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">Offset (pts)</label>
+                  <input
+                    type="number"
+                    step={1}
+                    className="form-control form-control-sm"
+                    value={beOffsetPts}
+                    onChange={(e) => setBeOffsetPts(Number(e.target.value) || 0)}
+                  />
+                </div>
+
+                {/* SL/TP */}
+                <div className="col-12 col-md-8 d-flex align-items-end gap-3 flex-wrap">
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="stops-toggle"
+                      checked={sendStops}
+                      onChange={(e) => setSendStops(e.target.checked)}
+                    />
+                    <label className="form-check-label" htmlFor="stops-toggle">
+                      Enviar SL/TP
+                    </label>
+                  </div>
+
+                  <div className="input-group input-group-sm" style={{ width: 160 }}>
+                    <span className="input-group-text">SL (pts)</span>
+                    <input
+                      type="number"
+                      step={1}
+                      min={0}
+                      className="form-control"
+                      value={slPts}
+                      onChange={(e) => setSlPts(Math.max(0, Number(e.target.value) || 0))}
+                      disabled={!sendStops}
+                    />
+                  </div>
+
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="tp-rr-toggle"
+                      checked={tpViaRR}
+                      onChange={(e) => setTpViaRR(e.target.checked)}
+                      disabled={!sendStops}
+                    />
+                    <label className="form-check-label" htmlFor="tp-rr-toggle">
+                      TP via RR
+                    </label>
+                  </div>
+
+                  <div className="input-group input-group-sm" style={{ width: 160 }}>
+                    <span className="input-group-text">TP (pts)</span>
+                    <input
+                      type="number"
+                      step={1}
+                      min={0}
+                      className="form-control"
+                      value={tpPts}
+                      onChange={(e) => setTpPts(Math.max(0, Number(e.target.value) || 0))}
+                      disabled={!sendStops || tpViaRR}
+                    />
+                  </div>
+                </div>
+
+                {/* Execução */}
+                <div className="col-12">
+                  <div className="border-top pt-3 mt-2 d-flex align-items-end gap-3 flex-wrap">
+                    <div className="form-check form-switch">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        id="exec-toggle"
+                        checked={execEnabled}
+                        onChange={(e) => setExecEnabled(e.target.checked)}
+                      />
+                      <label className="form-check-label ms-1" htmlFor="exec-toggle">
+                        Executar no MT5 (auto)
+                      </label>
+                    </div>
+
+                    <div className="input-group input-group-sm" style={{ width: 200 }}>
+                      <span className="input-group-text">AgentId</span>
+                      <input
+                        className="form-control"
+                        value={execAgentId}
+                        onChange={(e) => setExecAgentId(e.target.value)}
+                        placeholder="mt5-ea-1"
+                      />
+                    </div>
+
+                    <div className="input-group input-group-sm" style={{ width: 140 }}>
+                      <span className="input-group-text">Lots</span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        min={0.1}
+                        className="form-control"
+                        value={execLots}
+                        onChange={(e) => setExecLots(Math.max(1, Math.round(Number(e.target.value) || 1)))}
+                      />
+                    </div>
+
+                    <div className="input-group input-group-sm" style={{ width: 180 }}>
+                      <span className="input-group-text">MaxAge</span>
+                      <input
+                        type="number"
+                        min={5}
+                        step={5}
+                        className="form-control"
+                        value={execMaxAgeSec}
+                        onChange={(e) => setExecMaxAgeSec(Math.max(5, Number(e.target.value) || 20))}
+                      />
+                      <span className="input-group-text">s</span>
+                    </div>
+
+                    <button
+                      className="btn btn-sm btn-success"
+                      disabled={!execEnabled}
+                      onClick={() => onExecTest("BUY")}
+                      title="Enviar ordem de teste BUY para o MT5"
+                    >
+                      BUY (teste)
+                    </button>
+                    <button
+                      className="btn btn-sm btn-danger"
+                      disabled={!execEnabled}
+                      onClick={() => onExecTest("SELL")}
+                      title="Enviar ordem de teste SELL para o MT5"
+                    >
+                      SELL (teste)
+                    </button>
+
+                    {execMsg && (
+                      <span
+                        className="small"
+                        style={{
+                          maxWidth: 600,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        <code>{execMsg}</code>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* TAB: INDICADORES */}
+            <div className={`tab-pane fade ${activeTab === "indicators" ? "show active" : ""}`}>
+              <div className="row g-3">
+                <div className="col-12 col-md-4 d-flex align-items-center gap-3">
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="bb-toggle"
+                      checked={bbEnabled}
+                      onChange={(e) => setBbEnabled(e.target.checked)}
+                    />
+                    <label className="form-check-label" htmlFor="bb-toggle">
+                      Bollinger
+                    </label>
+                  </div>
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">BB Period</label>
                   <input
                     type="number"
                     min={5}
-                    step={5}
-                    className="form-control"
-                    value={execMaxAgeSec}
-                    onChange={(e) =>
-                      setExecMaxAgeSec(Math.max(5, Number(e.target.value) || 20))
-                    }
+                    step={1}
+                    className="form-control form-control-sm"
+                    value={bbPeriod}
+                    onChange={(e) => setBbPeriod(Math.max(5, Number(e.target.value) || 20))}
+                    disabled={!bbEnabled}
                   />
-                  <span className="input-group-text">s</span>
                 </div>
-
-                {/* SL/TP da tela */}
-                <div className="form-check form-switch">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="stops-toggle"
-                    checked={sendStops}
-                    onChange={(e) => setSendStops(e.target.checked)}
-                  />
-                  <label className="form-check-label" htmlFor="stops-toggle">
-                    Enviar SL/TP
-                  </label>
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 130 }}>
-                  <span className="input-group-text">SL (pts)</span>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">BB k</label>
                   <input
                     type="number"
-                    step={1}
-                    min={0}
-                    className="form-control"
-                    value={slPts}
-                    onChange={(e) => setSlPts(Math.max(0, Number(e.target.value) || 0))}
-                    disabled={!sendStops}
+                    min={0.1}
+                    step={0.1}
+                    className="form-control form-control-sm"
+                    value={bbK}
+                    onChange={(e) => setBbK(Math.max(0.1, Number(e.target.value) || 2))}
+                    disabled={!bbEnabled}
                   />
                 </div>
-
-                <div className="form-check form-switch">
+                <div className="col-12 col-md-4">
+                  <label className="form-label mb-1">Patterns de Candle</label>
                   <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="tp-rr-toggle"
-                    checked={tpViaRR}
-                    onChange={(e) => setTpViaRR(e.target.checked)}
-                    disabled={!sendStops}
-                  />
-                  <label className="form-check-label" htmlFor="tp-rr-toggle">
-                    TP via RR
-                  </label>
-                </div>
-
-                <div className="input-group input-group-sm" style={{ width: 130 }}>
-                  <span className="input-group-text">TP (pts)</span>
-                  <input
-                    type="number"
-                    step={1}
-                    min={0}
-                    className="form-control"
-                    value={tpPts}
-                    onChange={(e) => setTpPts(Math.max(0, Number(e.target.value) || 0))}
-                    disabled={!sendStops || tpViaRR}
+                    className="form-control form-control-sm"
+                    placeholder="engulfing,hammer,doji"
+                    value={candlePatterns}
+                    onChange={(e) => setCandlePatterns(e.target.value)}
                   />
                 </div>
-
-                <button
-                  className="btn btn-sm btn-success"
-                  disabled={!execEnabled}
-                  onClick={() => onExecTest("BUY")}
-                  title="Enviar ordem de teste BUY para o MT5"
-                >
-                  BUY (teste)
-                </button>
-                <button
-                  className="btn btn-sm btn-danger"
-                  disabled={!execEnabled}
-                  onClick={() => onExecTest("SELL")}
-                  title="Enviar ordem de teste SELL para o MT5"
-                >
-                  SELL (teste)
-                </button>
-
-                {execMsg && (
-                  <span
-                    className="small ms-2"
-                    style={{
-                      maxWidth: 600,
-                      whiteSpace: "nowrap",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                  >
-                    <code>{execMsg}</code>
-                  </span>
-                )}
               </div>
-              {/* ======================== */}
             </div>
+          </div>
 
-            {/* ===== Último envio refletido na UI ===== */}
-            {lastSent && (
-              <div className="mt-2">
-                <div className="small text-muted">Último envio ao MT5 (espelho do envelope):</div>
-                <div className="p-2 rounded border bg-light-subtle">
-                  <div className="d-flex flex-wrap gap-2 align-items-center">
-                    <span className={`badge ${lastSent.side === "BUY" ? "bg-success" : "bg-danger"}`}>
-                      {lastSent.side}
-                    </span>
-                    <code className="me-1">ag:{lastSent.agentId}</code>
-                    <code className="me-1">vol:{lastSent.volume}</code>
-                    <code className="me-1">BE:{lastSent.beAtPoints ?? 0}</code>
-                    <code className="me-1">OFF:{lastSent.beOffsetPoints ?? 0}</code>
-                    <code className="me-1">SLp:{lastSent.slPoints ?? "-"}</code>
-                    <code className="me-1">TPp:{lastSent.tpPoints ?? "-"}</code>
-                    <code className="me-1">id:{lastSent.taskId}</code>
-                    <code className="me-1">at:{new Date(lastSent.at).toLocaleTimeString()}</code>
-                  </div>
-                  <div className="mt-1">
-                    <div className="small">Comentário:</div>
-                    <div className="text-break">
-                      <code>{lastSent.comment}</code>
-                    </div>
+          {/* Painel: Parâmetros Efetivos */}
+          {showEffective && (
+            <div className="mt-3">
+              <div className="p-2 rounded border bg-light">
+                <div className="d-flex align-items-center justify-content-between">
+                  <strong>Parâmetros efetivos (UI vs Backend vs AI-node)</strong>
+                  <div className="btn-group btn-group-sm">
+                    <button className="btn btn-outline-secondary" onClick={onLoadServerConfig} disabled={runtimeButtonsDisabled}>
+                      Recarregar
+                    </button>
+                    <button className="btn btn-outline-success" onClick={onApplyServerConfig} disabled={runtimeButtonsDisabled}>
+                      Aplicar no servidor
+                    </button>
                   </div>
                 </div>
-              </div>
-            )}
-            {/* ======================================== */}
-
-            {/* ===== NOVO: Painel Parâmetros Efetivos ===== */}
-            {showEffective && (
-              <div className="mt-3">
-                <div className="p-2 rounded border bg-light">
-                  <div className="d-flex align-items-center justify-content-between">
-                    <strong>Parâmetros efetivos (UI vs Backend vs AI-node)</strong>
-                    <div className="btn-group btn-group-sm">
-                      <button className="btn btn-outline-secondary" onClick={onLoadServerConfig} disabled={runtimeButtonsDisabled}>Recarregar</button>
-                      <button className="btn btn-outline-success" onClick={onApplyServerConfig} disabled={runtimeButtonsDisabled}>Aplicar no servidor</button>
-                    </div>
-                  </div>
-                  <div className="row mt-2">
-                    <div className="col-12 col-md-4">
-                      <div className="small text-muted mb-1">UI (local)</div>
-                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
-                        {JSON.stringify({
+                <div className="row mt-2">
+                  <div className="col-12 col-md-4">
+                    <div className="small text-muted mb-1">UI (local)</div>
+                    <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                      {JSON.stringify(
+                        {
                           timeframe,
                           lots: execLots,
                           rr,
@@ -1569,34 +1612,67 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
                           slPts,
                           tpPts,
                           tpViaRR,
-                        }, null, 2)}
-                      </pre>
-                    </div>
-                    <div className="col-12 col-md-4">
-                      <div className="small text-muted mb-1">Backend ({RUNTIME_PATH})</div>
-                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
-                        {serverCfg ? JSON.stringify(serverCfg, null, 2) : "(indisponível)"}
-                      </pre>
-                    </div>
-                    <div className="col-12 col-md-4">
-                      <div className="small text-muted mb-1">AI-node ({ML_BASE || "não configurado"})</div>
-                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
-                        {aiCfg ? JSON.stringify(aiCfg, null, 2) : "(indisponível)"}
-                      </pre>
-                    </div>
+                        },
+                        null,
+                        2
+                      )}
+                    </pre>
                   </div>
-                  {hasRuntimeCfg === false && (
-                    <div className="alert alert-warning mt-2 mb-0 py-2">
-                      Endpoint <code>{API_BASE}{RUNTIME_PATH}</code> não encontrado (desabilitado no backend atual). Ajuste suas variáveis (<code>VITE_API_BASE</code>, <code>VITE_RUNTIME_PATH</code>, <code>VITE_HAS_RUNTIME_CFG</code>) ou <code>window.DAYTRADE_CFG</code>.
-                    </div>
-                  )}
+                  <div className="col-12 col-md-4">
+                    <div className="small text-muted mb-1">Backend ({RUNTIME_PATH})</div>
+                    <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                      {serverCfg ? JSON.stringify(serverCfg, null, 2) : "(indisponível)"}
+                    </pre>
+                  </div>
+                  <div className="col-12 col-md-4">
+                    <div className="small text-muted mb-1">AI-node ({ML_BASE || "não configurado"})</div>
+                    <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                      {aiCfg ? JSON.stringify(aiCfg, null, 2) : "(indisponível)"}
+                    </pre>
+                  </div>
+                </div>
+                {hasRuntimeCfg === false && (
+                  <div className="alert alert-warning mt-2 mb-0 py-2">
+                    Endpoint <code>{API_BASE}{RUNTIME_PATH}</code> não encontrado (desabilitado no backend atual). Ajuste suas variáveis (<code>VITE_API_BASE</code>,{" "}
+                    <code>VITE_RUNTIME_PATH</code>, <code>VITE_HAS_RUNTIME_CFG</code>) ou <code>window.DAYTRADE_CFG</code>.
+                  </div>
+                )}
+                {cfgMsg && (
+                  <div className="mt-2">
+                    <code>{cfgMsg}</code>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Último envio (espelho) */}
+          {lastSent && (
+            <div className="mt-3">
+              <div className="small text-muted">Último envio ao MT5 (espelho do envelope):</div>
+              <div className="p-2 rounded border bg-light-subtle">
+                <div className="d-flex flex-wrap gap-2 align-items-center">
+                  <span className={`badge ${lastSent.side === "BUY" ? "bg-success" : "bg-danger"}`}>{lastSent.side}</span>
+                  <code className="me-1">ag:{lastSent.agentId}</code>
+                  <code className="me-1">vol:{lastSent.volume}</code>
+                  <code className="me-1">BE:{lastSent.beAtPoints ?? 0}</code>
+                  <code className="me-1">OFF:{lastSent.beOffsetPoints ?? 0}</code>
+                  <code className="me-1">SLp:{lastSent.slPoints ?? "-"}</code>
+                  <code className="me-1">TPp:{lastSent.tpPoints ?? "-"}</code>
+                  <code className="me-1">id:{lastSent.taskId}</code>
+                  <code className="me-1">at:{new Date(lastSent.at).toLocaleTimeString()}</code>
+                </div>
+                <div className="mt-1">
+                  <div className="small">Comentário:</div>
+                  <div className="text-break">
+                    <code>{lastSent.comment}</code>
+                  </div>
                 </div>
               </div>
-            )}
-            {/* ========================================== */}
-          </div>
+            </div>
+          )}
         </div>
-      </div>
+      )}
 
       {/* Painel Backtests (fora do header sticky) */}
       {showBacktests && <BacktestRunsPanel />}

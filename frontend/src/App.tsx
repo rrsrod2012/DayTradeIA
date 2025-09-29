@@ -32,12 +32,12 @@ function TradesValidation() {
           setInputId(String(n));
         }
       }
-    } catch {}
+    } catch { }
   }, []);
 
   const adminUrl = useMemo(() =>
     selectedId ? `/admin/broker/compare-detailed?tradeId=${selectedId}` : "#",
-  [selectedId]);
+    [selectedId]);
 
   return (
     <div className="mx-auto max-w-6xl w-full px-4 sm:px-6 lg:px-8 mt-8">
@@ -107,6 +107,7 @@ export default function App() {
 
       {/* Tabelas */}
       <AIProjectedPanel />
+
       <AIConfirmedPanel />
 
 

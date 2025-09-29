@@ -1,8 +1,8 @@
 {
   "uiTimeframe": "M1",
   "uiLots": 5,
-  "rr": 2,
   "slAtr": 1,
+  "rr": 2,
   "beAtPts": 10,
   "beOffsetPts": 50,
   "entryDelayBars": 1,
