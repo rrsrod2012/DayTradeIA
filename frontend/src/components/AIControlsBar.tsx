@@ -223,7 +223,7 @@ async function httpJson<T>(base: string, path: string, init?: RequestInit): Prom
     ...init,
   });
   const txt = await resp.text();
-  const data = txt ? JSON.parse(txt) : null as any;
+  const data = txt ? JSON.parse(txt) : (null as any);
   if (!resp.ok) {
     const err: any = new Error(`HTTP ${resp.status} ${resp.statusText}`);
     (err as any).response = data ?? txt;
@@ -246,7 +246,7 @@ type RiskState = {
   mode: "block" | "conservative";
   dailyPnL: number;
   pontosGanhos: number;
-  pontosPerdidos: number;
+  pontosPerdidos: number; // pode vir negativo do backend
   hitLoss: boolean;
   hitProfit: boolean;
   maxLoss?: number | null;
@@ -293,6 +293,7 @@ async function tryLoadRiskState(): Promise<RiskState | null> {
   return null;
 }
 
+/* ===== Runtime config helpers ===== */
 async function loadBackendRuntime(path = RUNTIME_PATH): Promise<BackendRuntimeConfig | null> {
   const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(API_BASE, path, {
     method: "GET",
@@ -1019,7 +1020,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       if (!alive) return;
       timer = setTimeout(tickRisk, 5000);
     }
-    tickRisk();
+    tickRisk(); // primeira leitura imediata
     return () => {
       alive = false;
       if (timer) clearTimeout(timer);
@@ -1030,9 +1031,11 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
   const uiDaily = React.useMemo(() => {
     // 1) Se o backend de risco respondeu, use-o.
     if (riskState) {
+      // pontosPerdidos pode vir negativo do backend; para exibir absoluto na badge, normalizamos abaixo
+      const perdasAbs = Math.abs(Number(riskState.pontosPerdidos || 0));
       return {
         ganhos: Number(riskState.pontosGanhos || 0),
-        perdas: Number(riskState.pontosPerdidos || 0),
+        perdas: perdasAbs,
         pnl: Number(riskState.dailyPnL || 0),
         hitLoss: !!riskState.hitLoss,
         hitProfit: !!riskState.hitProfit,

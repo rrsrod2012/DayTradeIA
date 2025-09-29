@@ -62,7 +62,7 @@ type UiRuntimeConfig = Partial<{
 }>;
 
 type DailyGuard = {
-    date: string;      // YYYY-MM-DD (local)
+    date: string;      // YYYY-MM-DD (fuso configurável)
     pnlPoints: number; // acumulado do dia em pontos (positivo/negativo)
     pontosGanhos: number;   // soma apenas dos positivos
     pontosPerdidos: number; // soma apenas dos negativos (valor negativo)
@@ -91,12 +91,17 @@ function writeJson<T>(file: string, data: T) {
     }
 }
 
+/** Data local por timezone configurável (default BRT) */
 function todayLocalISODate(): string {
-    const d = new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
+    const tz = process.env.DAILY_TZ || "America/Sao_Paulo";
+    const fmt = new Intl.DateTimeFormat("pt-BR", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    });
+    const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function readUiRuntimeConfig(): UiRuntimeConfig {
@@ -199,16 +204,45 @@ function checkDailyLimits(cfg: UiRuntimeConfig) {
     };
 }
 
-// Extrai pontos de PnL de um item de ACK de forma resiliente
+/** Extrai pontos de PnL de um item de ACK (mais resiliente) */
 function extractPnLPointsFromAckItem(item: any): number {
     if (!item) return 0;
-    const direct = Number(item.pnlPoints ?? item.points ?? item.profitPoints);
-    if (Number.isFinite(direct)) return direct as number;
 
-    const nested = item.pnl || item.profit || item.result;
-    if (nested && Number.isFinite(Number(nested.points))) {
-        return Number(nested.points);
+    const asNum = (v: any) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : NaN;
+    };
+
+    // 1) campos diretos
+    const directKeys = ["pnlPoints", "points", "profitPoints"];
+    for (const k of directKeys) {
+        const v = asNum(item?.[k]);
+        if (!Number.isNaN(v)) return v;
     }
+
+    // 2) aninhados comuns
+    const nested1 = asNum(item?.pnl?.points);
+    if (!Number.isNaN(nested1)) return nested1;
+
+    const nested2 = asNum(item?.result?.points);
+    if (!Number.isNaN(nested2)) return nested2;
+
+    const nested3 = asNum(item?.closed?.points);
+    if (!Number.isNaN(nested3)) return nested3;
+
+    // 3) fallback: se vier somente dinheiro, converter para pontos (opcional)
+    // Defina PTS_PER_CURRENCY (ex.: 1.0) para converter automaticamente.
+    const money =
+        asNum(item?.profit?.money) ??
+        asNum(item?.pnl?.money) ??
+        asNum(item?.result?.money);
+    if (!Number.isNaN(money)) {
+        const factor = asNum(process.env.PTS_PER_CURRENCY) || NaN;
+        if (!Number.isNaN(factor) && factor !== 0) {
+            return money * factor;
+        }
+    }
+
     return 0;
 }
 
@@ -237,7 +271,7 @@ function createBrokerRouter(): Router {
         res.status(200).json(
             ok({
                 service: "exec-broker+backtest",
-                version: "brokerServer:v2.3 (UI-fallbacks + daily-limits + ganhos/perdas)",
+                version: "brokerServer:v2.4 (UI-fallbacks + daily-limits + ganhos/perdas + mock-add)",
                 enabled: isEnabled(),
                 now: new Date().toISOString(),
                 endpoints: [
@@ -252,6 +286,7 @@ function createBrokerRouter(): Router {
                     // RISK
                     "GET  /risk/state",
                     "POST /risk/reset",
+                    "POST /risk/mock-add?pts=80",
                     // BACKTEST (sob /api)
                     "GET  /api/backtest/ping",
                     "GET  /api/backtest/version",
@@ -290,6 +325,20 @@ function createBrokerRouter(): Router {
         try {
             const fresh = resetDailyGuard();
             return res.status(200).json(ok({ reset: true, state: fresh }));
+        } catch (e: any) {
+            return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
+        }
+    });
+
+    // >>> Endpoint de teste para somar/abater pontos manualmente
+    router.post("/risk/mock-add", (req, res) => {
+        try {
+            const pts = Number((req.query?.pts as any) ?? (req.body as any)?.pts ?? 0);
+            if (!Number.isFinite(pts) || pts === 0) {
+                return res.status(200).json(bad("use ?pts=80 ou ?pts=-50"));
+            }
+            const state = addPnLToDailyGuard(pts);
+            return res.status(200).json(ok({ added: pts, state }));
         } catch (e: any) {
             return res.status(200).json(bad("unexpected", { message: e?.message || String(e) }));
         }
@@ -537,10 +586,11 @@ if (process.env.BROKER_STANDALONE === "1") {
     appStandalone.use(cors());
     appStandalone.use(express.json({ limit: "2mb" }));
 
-    // >>> ALTERAÇÃO: expor o router tanto em "/" quanto em "/broker"
     const brokerRouter = createBrokerRouter();
-    appStandalone.use("/", brokerRouter);        // sem prefixo
-    appStandalone.use("/broker", brokerRouter);  // com prefixo (compat UI)
+
+    // Monta tanto em "/" quanto em "/broker" para facilitar o front
+    appStandalone.use("/", brokerRouter);
+    appStandalone.use("/broker", brokerRouter);
 
     // >>> ADIÇÃO: expor rotas de admin no standalone (RAIZ /admin) com CORS/JSON
     appStandalone.use("/admin", adminRoutes);
@@ -561,7 +611,6 @@ if (process.env.BROKER_STANDALONE === "1") {
             `[EXEC+BT] (standalone) listening on http://127.0.0.1:${PORT}  enabled=${isEnabled() ? "Y" : "N"}`
         );
         console.log(`[EXEC+BT] Endpoints admin habilitados em: GET/POST http://127.0.0.1:${PORT}/admin/runtime-config`);
-        console.log(`[EXEC+BT] Endpoints broker disponíveis em: / (sem prefixo) e /broker (compat UI).`);
     });
 }
 
