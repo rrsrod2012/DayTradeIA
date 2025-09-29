@@ -136,6 +136,152 @@ type LastSent = {
   taskId: string;
 };
 
+/* ============================
+   Integração RuntimeConfig (NOVO)
+   ============================ */
+type BackendRuntimeConfig = {
+  uiTimeframe?: "M1" | "M5" | "M15" | "M30" | "H1";
+  uiLots?: number;
+  rr?: number;
+  slAtr?: number;
+  beAtPts?: number;
+  beOffsetPts?: number;
+  entryDelayBars?: number;
+  decisionThreshold?: number;
+  debug?: boolean;
+  [k: string]: any;
+};
+
+type AiNodeConfigResponse = {
+  ok?: boolean;
+  config?: BackendRuntimeConfig;
+  modelStore?: string;
+  configFile?: string;
+  meta?: any;
+};
+
+/* ======== Bases e path do runtime-config (evita porta do front) ======== */
+function isLikelyFrontendDevBase(u: string | null | undefined) {
+  if (!u) return false;
+  try {
+    const url = new URL(u);
+    return url.port === "3000" || url.port === "5173";
+  } catch {
+    return false;
+  }
+}
+function cleanBase(u: string) {
+  return String(u || "").replace(/\/$/, "");
+}
+function resolveAPIBase() {
+  const env: any = (import.meta as any).env || {};
+  const fromEnv = env.VITE_API_BASE || env.VITE_API_URL;
+  const fromWin = (window as any)?.DAYTRADE_CFG?.apiBase;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  let candidate = cleanBase(String(fromEnv || fromWin || ""));
+  if (!candidate && origin && !isLikelyFrontendDevBase(origin)) {
+    candidate = cleanBase(origin);
+  }
+  if (!candidate || isLikelyFrontendDevBase(candidate)) {
+    candidate = "http://localhost:3002";
+  }
+  return cleanBase(candidate);
+}
+function resolveMLBase() {
+  const env: any = (import.meta as any).env || {};
+  const fromEnv = env.VITE_ML_URL;
+  const fromWin = (window as any)?.DAYTRADE_CFG?.mlBase;
+  const candidate = cleanBase(String(fromEnv || fromWin || "http://127.0.0.1:5001"));
+  return cleanBase(candidate);
+}
+function resolveRuntimePath() {
+  const env: any = (import.meta as any).env || {};
+  const fromEnv = env.VITE_RUNTIME_PATH;
+  const fromWin = (window as any)?.DAYTRADE_CFG?.runtimePath;
+  const raw = String(fromEnv || fromWin || "/admin/runtime-config");
+  return raw.startsWith("/") ? raw : `/${raw}`;
+}
+function readHasRuntimeCfgFlag(): boolean | null {
+  const env: any = (import.meta as any).env || {};
+  const fromEnv = env.VITE_HAS_RUNTIME_CFG;
+  const fromWin = (window as any)?.DAYTRADE_CFG?.hasRuntimeConfig;
+  const v = fromEnv ?? fromWin;
+  if (v === undefined || v === null || v === "") return null;
+  if (typeof v === "boolean") return v;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(s)) return true;
+  if (["0", "false", "no", "off"].includes(s)) return false;
+  return null;
+}
+
+const API_BASE = resolveAPIBase();
+const ML_BASE = resolveMLBase();
+const RUNTIME_PATH = resolveRuntimePath();
+const HAS_RUNTIME_CFG_ENV = readHasRuntimeCfgFlag();
+
+if (process.env.NODE_ENV !== "production") {
+  console.info("[AIControlsBar] Bases resolvidas:", { API_BASE, ML_BASE });
+}
+
+/** Fetch JSON com base absoluta obrigatória */
+async function httpJson<T>(base: string, path: string, init?: RequestInit): Promise<T> {
+  const safeBase = cleanBase(base || "http://localhost:3002");
+  const safePath = path.startsWith("/") ? path : `/${path}`;
+  const full = `${safeBase}${safePath}`;
+  const resp = await fetch(full, {
+    headers: { "content-type": "application/json", ...(init?.headers || {}) },
+    credentials: "omit",
+    mode: "cors",
+    cache: "no-cache",
+    ...init,
+  });
+  const txt = await resp.text();
+  const data = txt ? JSON.parse(txt) : null;
+  if (!resp.ok) {
+    const err: any = new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    err.response = data ?? txt;
+    err.status = resp.status;
+    err.urlTried = full;
+    throw err;
+  }
+  return data as T;
+}
+
+/* Helpers para endpoint de runtime-config */
+function runtimeEndpointBaseLooksValid() {
+  return !isLikelyFrontendDevBase(API_BASE);
+}
+
+async function loadBackendRuntime(path = RUNTIME_PATH): Promise<BackendRuntimeConfig | null> {
+  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(
+    API_BASE,
+    path,
+    { method: "GET" }
+  );
+  return (res as any)?.config ?? null;
+}
+
+async function applyBackendRuntime(
+  patch: BackendRuntimeConfig,
+  path = RUNTIME_PATH
+): Promise<BackendRuntimeConfig | null> {
+  const res = await httpJson<{ ok: boolean; config?: BackendRuntimeConfig }>(
+    API_BASE,
+    path,
+    { method: "POST", body: JSON.stringify(patch) }
+  );
+  return (res as any)?.config ?? null;
+}
+
+async function loadAiNodeConfig(): Promise<BackendRuntimeConfig | null> {
+  try {
+    const res = await httpJson<AiNodeConfigResponse>(ML_BASE, "/config", { method: "GET" });
+    return (res?.config as BackendRuntimeConfig) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export default function AIControlsBar({ collapsedByDefault }: Props) {
   const [collapsed, setCollapsed] = React.useState(!!collapsedByDefault);
 
@@ -186,7 +332,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     execEnabled: false,
     execAgentId: "mt5-ea-1",
     execLots: 1,
-    execMaxAgeSec: 20, // janela de frescor padrão (seg)
+    execMaxAgeSec: 20,
 
     // defaults SL/TP
     sendStops: false,
@@ -245,6 +391,16 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
 
   // Último envio efetivo ao EA (espelho do envelope)
   const [lastSent, setLastSent] = React.useState<LastSent | null>(null);
+
+  // ===== (NOVO) Estado de sincronização Backend/AI-node =====
+  const [serverCfg, setServerCfg] = React.useState<BackendRuntimeConfig | null>(null);
+  const [aiCfg, setAiCfg] = React.useState<BackendRuntimeConfig | null>(null);
+  const [cfgMsg, setCfgMsg] = React.useState<string | null>(null);
+  const [showEffective, setShowEffective] = React.useState<boolean>(false);
+
+  // Descobre se o endpoint existe (evita 404 repetido)
+  // null => desconhecido; true => existe; false => não existe
+  const [hasRuntimeCfg, setHasRuntimeCfg] = React.useState<boolean | null>(HAS_RUNTIME_CFG_ENV);
 
   const setProjected = useAIStore((s) => s.setProjected);
   const setConfirmed = useAIStore((s) => s.setConfirmed);
@@ -317,6 +473,125 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     }),
     [symbol, timeframe, from, to]
   );
+
+  /* ---------- Probe único do endpoint de runtime (com cache) ---------- */
+  React.useEffect(() => {
+    let cancelled = false;
+
+    // Se o usuário explicitou true/false via env/window, respeitamos e não probamos
+    if (HAS_RUNTIME_CFG_ENV === true) {
+      setHasRuntimeCfg(true);
+      return;
+    }
+    if (HAS_RUNTIME_CFG_ENV === false) {
+      setHasRuntimeCfg(false);
+      return;
+    }
+
+    // Se a base é claramente inválida (porta do front), não probe
+    if (!runtimeEndpointBaseLooksValid()) {
+      setHasRuntimeCfg(false);
+      return;
+    }
+
+    const CACHE_KEY = "daytrade_runtime_probe";
+    const cached = sessionStorage.getItem(CACHE_KEY);
+    if (cached === "true") {
+      setHasRuntimeCfg(true);
+      return;
+    }
+    if (cached === "false") {
+      setHasRuntimeCfg(false);
+      return;
+    }
+
+    (async () => {
+      try {
+        await httpJson(API_BASE, RUNTIME_PATH, { method: "GET" });
+        if (!cancelled) setHasRuntimeCfg(true);
+        sessionStorage.setItem(CACHE_KEY, "true");
+      } catch (e: any) {
+        const is404 = e?.status === 404;
+        if (!cancelled) setHasRuntimeCfg(is404 ? false : null);
+        sessionStorage.setItem(CACHE_KEY, is404 ? "false" : "null");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** ============= RuntimeConfig: carregar/aplicar (NOVO) ============= */
+  async function onLoadServerConfig() {
+    setCfgMsg(null);
+
+    if (hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid()) {
+      setServerCfg(null);
+      setCfgMsg(
+        `Endpoint de runtime não disponível (${API_BASE}${RUNTIME_PATH}). ` +
+        `Defina VITE_RUNTIME_PATH/VITE_API_BASE ou window.DAYTRADE_CFG.{apiBase,runtimePath} para apontar ao backend correto.`
+      );
+      const ai = await loadAiNodeConfig();
+      setAiCfg(ai);
+      return;
+    }
+
+    try {
+      const cfg = await loadBackendRuntime();
+      setServerCfg(cfg);
+      setCfgMsg(cfg ? "Config do Backend carregada." : "Não foi possível carregar a config do Backend.");
+    } catch (e: any) {
+      const status = e?.status ?? "erro";
+      const url = e?.urlTried ?? `${API_BASE}${RUNTIME_PATH}`;
+      setServerCfg(null);
+      setCfgMsg(`Backend respondeu ${status} em ${url}. Dica: ajuste VITE_RUNTIME_PATH ou implemente este endpoint.`);
+      if (e?.status === 404) setHasRuntimeCfg(false);
+    }
+
+    const ai = await loadAiNodeConfig();
+    setAiCfg(ai);
+  }
+
+  async function onApplyServerConfig() {
+    setCfgMsg(null);
+
+    if (hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid()) {
+      setCfgMsg(
+        `Não é possível aplicar: ${API_BASE}${RUNTIME_PATH} não existe neste backend. ` +
+        `Ou habilite este endpoint no servidor ou aponte para um backend que o possua.`
+      );
+      return;
+    }
+
+    const patch: BackendRuntimeConfig = {
+      uiTimeframe: String(timeframe || "M5").toUpperCase() as any,
+      uiLots: Number(execLots) || 1,
+      rr: Number(rr),
+      beAtPts: Number(breakEvenAtPts) || 0,
+      beOffsetPts: Number(beOffsetPts) || 0,
+      decisionThreshold: Number(minProb),
+      debug: false,
+    };
+
+    try {
+      const res = await applyBackendRuntime(patch);
+      setServerCfg(res);
+      setCfgMsg(
+        res
+          ? "Config aplicada no Backend. (O Backend deve propagar ao AI-node)"
+          : "Falha ao aplicar no Backend."
+      );
+    } catch (e: any) {
+      const status = e?.status ?? "erro";
+      const url = e?.urlTried ?? `${API_BASE}${RUNTIME_PATH}`;
+      setCfgMsg(`Falha ao aplicar (${status}) em ${url}.`);
+      if (e?.status === 404) setHasRuntimeCfg(false);
+    }
+
+    const ai = await loadAiNodeConfig();
+    setAiCfg(ai);
+  }
 
   /** ------------- AUTO-EXEC HELPERS ------------- */
 
@@ -664,6 +939,11 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       return;
     }
 
+    // Alerta amigável se TP via RR estiver ligado mas SL==0 ou sendStops==false
+    if (tpViaRR && (!sendStops || Math.max(0, Math.floor(Number(slPts) || 0)) === 0)) {
+      setExecMsg("Aviso: TP via RR requer SL>0 e 'Enviar SL/TP' ligado. Ajuste os controles.");
+    }
+
     const task = makeMt5Task(side);
     const body = {
       agentId: (execAgentId || "mt5-ea-1").trim(),
@@ -784,6 +1064,10 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
     candlePatterns,
   ]);
 
+  // Desabilita botões se endpoint ainda desconhecido OU ausente OU base inválida
+  const runtimeButtonsDisabled =
+    hasRuntimeCfg !== true || !runtimeEndpointBaseLooksValid();
+
   return (
     <>
       <div style={{ position: "sticky", top: 0, zIndex: 1030 }}>
@@ -807,6 +1091,38 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               >
                 {showBacktests ? "Ocultar Backtests" : "Backtests"}
               </button>
+
+              {/* ===== NOVO: Painel Parâmetros Efetivos / Runtime ===== */}
+              <button
+                className="btn btn-sm btn-outline-dark ms-2"
+                onClick={() => setShowEffective((v) => !v)}
+                title="Mostrar/ocultar parâmetros efetivos"
+              >
+                {showEffective ? "Ocultar parâmetros" : "Parâmetros efetivos"}
+              </button>
+              <div className="btn-group btn-group-sm ms-1" role="group" aria-label="cfg-actions">
+                <button
+                  className="btn btn-outline-secondary"
+                  onClick={onLoadServerConfig}
+                  title={`Carregar do servidor (${RUNTIME_PATH})`}
+                  disabled={runtimeButtonsDisabled}
+                >
+                  Carregar do servidor
+                </button>
+                <button
+                  className="btn btn-outline-success"
+                  onClick={onApplyServerConfig}
+                  title="Aplicar no servidor (Backend→AI-node)"
+                  disabled={runtimeButtonsDisabled}
+                >
+                  Aplicar no servidor
+                </button>
+              </div>
+              {cfgMsg && (
+                <span className="small ms-2">
+                  <code>{cfgMsg}</code>
+                </span>
+              )}
 
               <div className="vr mx-2" />
 
@@ -1226,6 +1542,58 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
               </div>
             )}
             {/* ======================================== */}
+
+            {/* ===== NOVO: Painel Parâmetros Efetivos ===== */}
+            {showEffective && (
+              <div className="mt-3">
+                <div className="p-2 rounded border bg-light">
+                  <div className="d-flex align-items-center justify-content-between">
+                    <strong>Parâmetros efetivos (UI vs Backend vs AI-node)</strong>
+                    <div className="btn-group btn-group-sm">
+                      <button className="btn btn-outline-secondary" onClick={onLoadServerConfig} disabled={runtimeButtonsDisabled}>Recarregar</button>
+                      <button className="btn btn-outline-success" onClick={onApplyServerConfig} disabled={runtimeButtonsDisabled}>Aplicar no servidor</button>
+                    </div>
+                  </div>
+                  <div className="row mt-2">
+                    <div className="col-12 col-md-4">
+                      <div className="small text-muted mb-1">UI (local)</div>
+                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                        {JSON.stringify({
+                          timeframe,
+                          lots: execLots,
+                          rr,
+                          beAtPts: breakEvenAtPts,
+                          beOffsetPts: beOffsetPts,
+                          decisionThreshold: minProb,
+                          sendStops,
+                          slPts,
+                          tpPts,
+                          tpViaRR,
+                        }, null, 2)}
+                      </pre>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="small text-muted mb-1">Backend ({RUNTIME_PATH})</div>
+                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                        {serverCfg ? JSON.stringify(serverCfg, null, 2) : "(indisponível)"}
+                      </pre>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="small text-muted mb-1">AI-node ({ML_BASE || "não configurado"})</div>
+                      <pre className="small p-2 bg-body border rounded" style={{ maxHeight: 240, overflow: "auto" }}>
+                        {aiCfg ? JSON.stringify(aiCfg, null, 2) : "(indisponível)"}
+                      </pre>
+                    </div>
+                  </div>
+                  {hasRuntimeCfg === false && (
+                    <div className="alert alert-warning mt-2 mb-0 py-2">
+                      Endpoint <code>{API_BASE}{RUNTIME_PATH}</code> não encontrado (desabilitado no backend atual). Ajuste suas variáveis (<code>VITE_API_BASE</code>, <code>VITE_RUNTIME_PATH</code>, <code>VITE_HAS_RUNTIME_CFG</code>) ou <code>window.DAYTRADE_CFG</code>.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            {/* ========================================== */}
           </div>
         </div>
       </div>

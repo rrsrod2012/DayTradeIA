@@ -1,16 +1,16 @@
 // Frontend API client — daytrade-ia
 // frontend/src/services/api.ts
 
-import axios from "axios";
+// import axios from "axios"; // (removido — padronizamos no jsonFetch)
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3002";
 
 // Comparação detalhada: Simulado vs Real
 export async function getBrokerComparison(tradeId: number) {
-  const { data } = await axios.get(`/admin/broker/compare-detailed?tradeId=${tradeId}`);
-  return data;
+  return jsonFetchBase<any>(API_BASE, `/admin/broker/compare-detailed?tradeId=${tradeId}`, {
+    method: "GET",
+  });
 }
-
 
 export type Candle = {
   time: string; // ISO
@@ -149,10 +149,12 @@ export type BacktestDTO = {
 /* ===============================
    Bases/URLs
    =============================== */
-const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
+const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? API_URL;  // <<< fallback corrigido
 const API_BASE = String(RAW_API_BASE || "").replace(/\/$/, "");
 const RAW_EXEC_BASE = (import.meta as any).env?.VITE_EXEC_BASE ?? API_BASE;
 const EXEC_BASE = String(RAW_EXEC_BASE || "").replace(/\/$/, "");
+
+const ML_BASE = String(((import.meta as any).env?.VITE_ML_URL ?? "") || "").replace(/\/$/, "");
 
 /** --------- Helpers --------- */
 function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
@@ -246,6 +248,42 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 
 export type { ProjectedSignalsParams };
 
+/* =========================
+   Runtime Config (NOVO)
+   ========================= */
+export type RuntimeConfigPayload = Partial<{
+  uiTimeframe: "M1" | "M5" | "M15" | "M30" | "H1";
+  uiLots: number;
+  rr: number;
+  slAtr: number;
+  beAtPts: number;
+  beOffsetPts: number;
+  entryDelayBars: number;
+  decisionThreshold: number;
+  debug: boolean;
+}>;
+
+export async function getRuntimeConfig(): Promise<{ ok: boolean; config: RuntimeConfigPayload }> {
+  return jsonFetch<{ ok: boolean; config: RuntimeConfigPayload }>("/admin/runtime-config", {
+    method: "GET",
+  });
+}
+
+export async function saveRuntimeConfig(patch: RuntimeConfigPayload): Promise<{ ok: boolean; config: RuntimeConfigPayload }> {
+  return jsonFetch<{ ok: boolean; config: RuntimeConfigPayload }>("/admin/runtime-config", {
+    method: "POST",
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function getAiNodeConfig(): Promise<{ ok?: boolean; config?: RuntimeConfigPayload }> {
+  if (!ML_BASE) return { ok: false, config: undefined };
+  return jsonFetchBase<{ ok?: boolean; config?: RuntimeConfigPayload }>(ML_BASE, "/config", { method: "GET" });
+}
+
+/* =========================
+   Signals
+   ========================= */
 export async function projectedSignals(
   params: ProjectedSignalsParams
 ): Promise<ProjectedSignal[]> {
@@ -343,7 +381,13 @@ export async function fetchConfirmedSignals(params: {
 /* =========================================
    Backtest — normalização de payload
    ========================================= */
-function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeDTO & { pnlPoints: number; note: string | null; id: number | string } {
+export type BacktestTradeNormalized = BacktestTradeDTO & {
+  pnlPoints: number;
+  note: string | null;
+  id: number | string;
+};
+
+function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeNormalized {
   const pnlPoints =
     Number.isFinite(t.pnlPoints as any)
       ? Number(t.pnlPoints)
@@ -367,7 +411,7 @@ function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeDTO & 
     note: noteRaw && String(noteRaw).trim() !== "" ? String(noteRaw).trim() : null,
     movedToBE: !!t.movedToBE,
     trailEvents: t.trailEvents ?? 0,
-    // mantemos campos originais para compatibilidade
+    // campos originais mantidos:
     pnl: t.pnl ?? pnlPoints,
     reason: t.reason ?? null,
     conditionText: t.conditionText ?? null,
@@ -376,7 +420,6 @@ function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeDTO & 
 }
 
 function normalizeBacktestPayload(raw: any): BacktestDTO {
-  // alguns backends podem embutir retorno em {ok:true, ...}, outros em {data:{...}}
   const dto: any =
     (raw && raw.data && typeof raw.data === "object" && raw.data) ||
     raw;
@@ -389,7 +432,6 @@ function normalizeBacktestPayload(raw: any): BacktestDTO {
 
   const trades = tradesArr.map(mapBacktestTrade);
 
-  // garante campos numéricos
   const pnlPointsTop = Number(dto?.pnlPoints ?? dto?.summary?.pnlPoints ?? 0);
   const pnlMoneyTop = Number(dto?.pnlMoney ?? 0);
 

@@ -1,0 +1,11 @@
+{
+  "uiTimeframe": "M1",
+  "uiLots": 5,
+  "rr": 2,
+  "slAtr": 1,
+  "beAtPts": 10,
+  "beOffsetPts": 50,
+  "entryDelayBars": 1,
+  "decisionThreshold": 0.52,
+  "debug": false
+}

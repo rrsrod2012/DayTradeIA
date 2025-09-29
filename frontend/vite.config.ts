@@ -31,6 +31,10 @@ export default defineConfig({
         secure: false,
         ws: false,
       },
+      '^/broker': {
+        target: 'http://localhost:3002',
+        changeOrigin: true,
+      },
     },
   },
 });
