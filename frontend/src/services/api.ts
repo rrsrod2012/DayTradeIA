@@ -755,6 +755,21 @@ export type TradeRow = {
   exitTime: string | null;  // ISO
 };
 
+
+// Helper: expand date-only (YYYY-MM-DD) to ISO with local timezone (-03:00)
+// kind = 'start' => 00:00:00, 'end' => 23:59:59.999
+function expandLocalDate(dateStr: string | undefined, kind: 'start' | 'end'): string | undefined {
+  if (!dateStr) return undefined;
+  const s = String(dateStr).trim();
+  // if already contains 'T', assume it's full ISO
+  if (s.includes("T")) return s;
+  // match YYYY-MM-DD
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return s;
+  const [_, y, mm, dd] = m;
+  if (kind === 'start') return `${y}-${mm}-${dd}T00:00:00.000-03:00`;
+  return `${y}-${mm}-${dd}T23:59:59.999-03:00`;
+}
 export async function fetchTrades(params: {
   symbol?: string;
   timeframe?: string;
@@ -765,8 +780,8 @@ export async function fetchTrades(params: {
   const q = new URLSearchParams();
   if (params.symbol) q.set("symbol", params.symbol.toUpperCase());
   if (params.timeframe) q.set("timeframe", params.timeframe.toUpperCase());
-  if (params.from) q.set("from", params.from);
-  if (params.to) q.set("to", params.to);
+  if (params.from) q.set("from", expandLocalDate(params.from, "start") as string);
+  if (params.to) q.set("to", expandLocalDate(params.to, "end") as string);
   if (params.limit) q.set("limit", String(params.limit));
   const raw = await jsonFetch<any>(`/api/trades?${q.toString()}`, { method: "GET" });
   const arr: any[] = Array.isArray(raw) ? raw : (raw?.data || raw?.rows || []);

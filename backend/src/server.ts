@@ -1223,14 +1223,21 @@ app.get("/api/trades", async (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
     const offset = Math.max(0, Number(req.query.offset) || 0);
 
-    const parseDate = (v: any) => {
-      if (!v) return undefined;
-      const d = new Date(String(v));
+    const expandLocalDate = (s: any, kind: "start" | "end") => {
+      if (!s) return undefined;
+      const str = String(s).trim();
+      if (str.includes("T")) { const d = new Date(str); return isNaN(d.getTime()) ? undefined : d; }
+      const m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) { const d = new Date(str); return isNaN(d.getTime()) ? undefined : d; }
+      const [_, y, mm, dd] = m;
+      const iso = kind === "start"
+        ? `${y}-${mm}-${dd}T00:00:00.000-03:00`
+        : `${y}-${mm}-${dd}T23:59:59.999-03:00`;
+      const d = new Date(iso);
       return isNaN(d.getTime()) ? undefined : d;
     };
-    const from = parseDate(req.query.from);
-    const to = parseDate(req.query.to);
-
+    const from = expandLocalDate(req.query.from, "start");
+    const to = expandLocalDate(req.query.to, "end");
     // where baseado no candle do sinal de entrada
     const where: any = {
       entrySignal: {
