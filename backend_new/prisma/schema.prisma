@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Instrument {
+  id        Int      @id @default(autoincrement())
+  symbol    String   @unique
+  name      String
+  candles   Candle[]
+  trades    Trade[]
+}
+
+model Candle {
+  id           Int      @id @default(autoincrement())
+  instrumentId Int
+  timeframe    String
+  time         DateTime
+  open         Float
+  high         Float
+  low          Float
+  close        Float
+  volume       Float
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  signals      Signal[]
+
+  @@unique([instrumentId, timeframe, time], name: "instrument_time_tf_unique")
+}
+
+model Signal {
+  id         Int     @id @default(autoincrement())
+  candleId   Int
+  signalType String  // Ex: "EMA_CROSS", "AI_CONFIRMED"
+  side       String  // "BUY" ou "SELL"
+  score      Float?
+  reason     String?
+  candle     Candle  @relation(fields: [candleId], references: [id])
+  exitOf     Trade[] @relation("ExitSignal")
+  entryOf    Trade[] @relation("EntrySignal")
+
+  @@unique([candleId, signalType, side], name: "candleId_signalType_side")
+  @@index([candleId])
+}
+
+model Trade {
+  id            Int        @id @default(autoincrement())
+  instrumentId  Int
+  timeframe     String
+  entrySignalId Int
+  exitSignalId  Int?
+  qty           Int
+  entryPrice    Float
+  exitPrice     Float?
+  pnlPoints     Float?
+  exitSignal    Signal?    @relation("ExitSignal", fields: [exitSignalId], references: [id])
+  entrySignal   Signal     @relation("EntrySignal", fields: [entrySignalId], references: [id])
+  instrument    Instrument @relation(fields: [instrumentId], references: [id])
+}
