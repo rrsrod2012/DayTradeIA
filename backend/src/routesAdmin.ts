@@ -1,6 +1,9 @@
 // backend/src/routesAdmin.ts
 import { Router } from "express";
 import { prisma } from "./prisma";
+import { DateTime } from "luxon";
+import { enqueue as brokerEnqueue } from "./services/brokerPersist";
+import { loadCandlesAnyTF } from "./lib/aggregation";
 
 const router = Router();
 
@@ -14,21 +17,29 @@ function parseRange(from: string, to: string) {
 }
 
 /**
- * Agrega candles M1 -> M5 (ou outro TF múltiplo de 1 minuto)
+ * Agrega candles M1 -> TF (M5/M15/M30/H1). Se timeframe for M1, retorna os próprios M1.
  */
 async function ensureAggregatedCandles(
   instrumentId: number,
-  timeframe: "M5" | "M15" | "M30" | "H1",
+  timeframe: "M1" | "M5" | "M15" | "M30" | "H1",
   gte: Date,
   lte: Date
 ) {
-  const tfToMinutes: Record<typeof timeframe, number> = {
+  if (timeframe === "M1") {
+    const m1 = await prisma.candle.findMany({
+      where: { instrumentId, timeframe: "M1", time: { gte, lte } },
+      orderBy: { time: "asc" },
+    });
+    return { aggregated: 0, candles: m1 };
+  }
+
+  const tfToMinutes: Record<Exclude<typeof timeframe, "M1">, number> = {
     M5: 5,
     M15: 15,
     M30: 30,
     H1: 60,
   };
-  const step = tfToMinutes[timeframe];
+  const step = tfToMinutes[timeframe as Exclude<typeof timeframe, "M1">];
 
   // Já existem candles agregados?
   const existing = await prisma.candle.findMany({
@@ -37,7 +48,7 @@ async function ensureAggregatedCandles(
     take: 1,
   });
   if (existing.length) {
-    // Já tem — ainda assim vamos retornar os candles para usar no cálculo das EMAs
+    // Já tem — ainda assim vamos retornar candles para uso adiante
   }
 
   // Busca base M1 no período
@@ -53,7 +64,7 @@ async function ensureAggregatedCandles(
     };
   }
 
-  // Função para "floor" no múltiplo de step minutos
+  // Floor para múltiplo de step
   const floorToStep = (d: Date) => {
     const t = new Date(d);
     t.setUTCSeconds(0, 0);
@@ -94,7 +105,7 @@ async function ensureAggregatedCandles(
     }
   }
 
-  // Persiste via upsert (temos @@unique([instrumentId, timeframe, time]) em Candle)
+  // Persiste via upsert (@@unique[instrumentId,timeframe,time] em Candle)
   const aggCandles = [] as Awaited<ReturnType<typeof prisma.candle.upsert>>[];
   for (const b of [...buckets.values()].sort(
     (a, b) => a.time.getTime() - b.time.getTime()
@@ -132,8 +143,7 @@ async function ensureAggregatedCandles(
 }
 
 /**
- * EMA simples (retorna array alinhado com 'values'; posições iniciais
- * sem janela cheia usam recursiva padrão: ema = alpha*v + (1-alpha)*emaPrev)
+ * EMA simples
  */
 function ema(values: number[], period: number) {
   const k = 2 / (period + 1);
@@ -163,6 +173,7 @@ router.post("/api/admin/reset", async (_req, res) => {
       "BacktestRun",
       "Candle",
       "Instrument",
+      "BrokerExecution",
     ];
 
     for (const t of tables) {
@@ -182,8 +193,7 @@ router.post("/api/admin/reset", async (_req, res) => {
 
 /**
  * Backfill de sinais confirmados base EMA(9/21) para um período.
- * Uso: POST /api/admin/signals/backfill
- * Body: { symbol: "WIN", timeframe: "M5", from: "YYYY-MM-DD", to: "YYYY-MM-DD" }
+ * Body: { symbol: "WIN", timeframe: "M1"|"M5"|"M15"|"M30"|"H1", from: "YYYY-MM-DD", to: "YYYY-MM-DD" }
  */
 router.post("/api/admin/signals/backfill", async (req, res) => {
   const { symbol, timeframe, from, to } = req.body || {};
@@ -194,7 +204,7 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
     });
   }
 
-  if (!["M5", "M15", "M30", "H1"].includes(timeframe)) {
+  if (!["M1", "M5", "M15", "M30", "H1"].includes(timeframe)) {
     return res.status(400).json({ ok: false, error: "timeframe inválido" });
   }
 
@@ -208,7 +218,7 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
       create: { symbol, name: symbol },
     });
 
-    // Garante candles agregados (e devolve os candles)
+    // Garante candles para o TF (M1 retorna os próprios, TF>1 agrega)
     const { aggregated, candles } = await ensureAggregatedCandles(
       instrument.id,
       timeframe,
@@ -216,7 +226,7 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
       lte
     );
 
-    // Se não encontrar candles TF, tenta ler do banco mesmo assim (podem já existir)
+    // Busca candles do TF (se ensure já devolveu, usa; senão lê do banco)
     const tfCandles =
       candles.length > 0
         ? candles
@@ -238,7 +248,7 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
         aggregatedCandles: aggregated,
         signalsCreated: 0,
         signalsExisting: 0,
-        note: "Sem candles agregados no período.",
+        note: "Sem candles no período.",
       });
     }
 
@@ -262,11 +272,9 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
 
       const signalType = "EMA_CROSS";
       const candleId = tfCandles[i].id;
-      const time = tfCandles[i].time;
-      const score = Math.abs(curDiff); // simples: magnitude do cruzamento
+      const score = Math.abs(curDiff);
       const reason = `EMA9/EMA21 ${side === "BUY" ? "golden" : "death"} cross`;
 
-      // Evita duplicar (não usamos createMany/skipDuplicates para manter compatibilidade com SQLite e Prisma antigo)
       const already = await prisma.signal.findFirst({
         where: { candleId, signalType, side },
         select: { id: true },
@@ -282,20 +290,6 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
       }
     }
 
-    console.info(
-      JSON.stringify({
-        level: "info",
-        msg: "[admin/backfill] concluído",
-        symbol,
-        timeframe,
-        from,
-        to,
-        aggregatedCandles: aggregated,
-        signalsCreated: created,
-        signalsExisting: existing,
-      })
-    );
-
     res.json({
       ok: true,
       symbol,
@@ -306,29 +300,254 @@ router.post("/api/admin/signals/backfill", async (req, res) => {
       signalsExisting: existing,
     });
   } catch (err: any) {
-    console.error(
-      JSON.stringify({
-        level: "error",
-        msg: "[admin/backfill] falha",
-        error: err?.message || String(err),
-      })
-    );
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
-export default router;
+/* =========================================================================
+ * Rebuild de Trades a partir dos Sinais confirmados (pairing simples)
+ * ========================================================================= */
+router.post("/api/admin/trades/rebuild", async (req, res) => {
+  try {
+    const { symbol, timeframe, from, to, dry = "0", sample = 5 } = (req.query as any) || {};
+    if (!symbol) return res.status(400).json({ ok: false, error: "faltou symbol" });
+    const sym = String(symbol).toUpperCase().trim();
+    const tf = timeframe ? String(timeframe).toUpperCase().trim() : undefined;
+    const isDry = String(dry) === "1";
 
+    if (!from || !to) {
+      return res.status(400).json({ ok: false, error: "faltou from/to" });
+    }
+    const { gte, lte } = parseRange(String(from), String(to));
+
+    const instrument = await prisma.instrument.findUnique({ where: { symbol: sym } });
+    if (!instrument) return res.status(200).json({ ok: false, error: `instrumento não encontrado para ${sym}` });
+
+    const whereSignal: any = {
+      candle: {
+        instrumentId: instrument.id,
+        time: { gte, lte },
+      },
+    };
+    if (tf) whereSignal.candle.timeframe = tf;
+
+    const signals = await prisma.signal.findMany({
+      where: whereSignal,
+      include: { candle: true },
+      orderBy: [{ candle: { timeframe: "asc" } }, { candle: { time: "asc" } }, { id: "asc" }],
+    });
+
+    if (!signals.length) {
+      return res.status(200).json({ ok: true, rebuilt: 0, deleted: 0, trades: [] });
+    }
+
+    const byTF = new Map<string, any[]>();
+    for (const s of signals) {
+      const tframe = s.candle.timeframe.toUpperCase();
+      if (tf && tframe !== tf) continue;
+      if (!byTF.has(tframe)) byTF.set(tframe, []);
+      byTF.get(tframe)!.push(s);
+    }
+
+    let totalDeleted = 0;
+    let totalCreated = 0;
+    const sampleTrades: any[] = [];
+
+    for (const [tframe, list] of byTF.entries()) {
+      // apaga trades existentes da janela/TF
+      const existing = await prisma.trade.findMany({
+        where: {
+          instrumentId: instrument.id,
+          timeframe: tframe,
+          entrySignal: {
+            is: {
+              candle: { time: { gte, lte } },
+            },
+          },
+        },
+        select: { id: true },
+      });
+      const existingIds = existing.map((r) => r.id);
+
+      if (!isDry && existingIds.length) {
+        await prisma.trade.deleteMany({ where: { id: { in: existingIds } } });
+        totalDeleted += existingIds.length;
+      }
+
+      // pairing: abre com o primeiro sinal; fecha no primeiro oposto
+      let position: null | { entry: any } = null;
+      const creations: any[] = [];
+
+      for (const s of list) {
+        if (!position) {
+          position = { entry: s };
+          continue;
+        } else {
+          const entrySide = String(position.entry.side).toUpperCase();
+          const thisSide = String(s.side).toUpperCase();
+          if (entrySide !== thisSide) {
+            const entryC = position.entry.candle;
+            const exitC = s.candle;
+            const entryPrice = Number(entryC.close);
+            const exitPrice = Number(exitC.close);
+            const pnlPoints = entrySide === "BUY" ? (exitPrice - entryPrice) : (entryPrice - exitPrice);
+
+            creations.push({
+              instrumentId: instrument.id,
+              timeframe: tframe,
+              entrySignalId: position.entry.id,
+              exitSignalId: s.id,
+              qty: 1,
+              entryPrice,
+              exitPrice,
+              pnlPoints,
+            });
+            position = null;
+          }
+        }
+      }
+
+      if (!isDry && creations.length) {
+        const batchSize = 500;
+        for (let i = 0; i < creations.length; i += batchSize) {
+          const slice = creations.slice(i, i + batchSize);
+          await prisma.trade.createMany({ data: slice, skipDuplicates: true });
+        }
+      }
+
+      totalCreated += creations.length;
+
+      for (const c of creations.slice(0, Number(sample) || 5)) {
+        sampleTrades.push({
+          ...c,
+          symbol: sym,
+          entryTime: list.find((x) => x.id === c.entrySignalId)?.candle?.time ?? null,
+          exitTime: list.find((x) => x.id === c.exitSignalId)?.candle?.time ?? null,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      dryRun: isDry,
+      deleted: totalDeleted,
+      rebuilt: totalCreated,
+      sample: sampleTrades,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* =========================================================================
+ * Diagnóstico consolidado (execuções/confirmados/projetados/trades/PNL)
+ * ========================================================================= */
+router.get("/api/admin/diag/recap", async (req, res) => {
+  try {
+    const symbol = String((req.query.symbol as any) || "").toUpperCase();
+    const timeframe = String((req.query.timeframe as any) || "").toUpperCase();
+    const from = String((req.query.from as any) || "");
+    const to = String((req.query.to as any) || "");
+    if (!symbol) return res.status(400).json({ ok: false, error: "missing_symbol" });
+
+    const today = DateTime.now().toUTC().toISODate()!;
+    const rng = from && to ? parseRange(from, to) : parseRange(today, today);
+
+    const instr = await prisma.instrument.findUnique({ where: { symbol } });
+    if (!instr) return res.status(200).json({ ok: true, data: { note: "instrument_not_found", symbol } });
+
+    // Execuções do MT5 por lado (taskId únicos)
+    const execRows = await prisma.brokerExecution.findMany({
+      where: { symbol, time: { gte: rng.gte, lte: rng.lte } },
+      select: { taskId: true, side: true },
+    });
+    const execBySide: Record<string, number> = {};
+    const seenTask: Record<string, string> = {};
+    for (const r of execRows) {
+      const tid = r.taskId || "";
+      if (!tid) continue;
+      if (!seenTask[tid]) {
+        seenTask[tid] = r.side || "";
+        const s = (r.side || "").toUpperCase();
+        execBySide[s] = (execBySide[s] || 0) + 1;
+      }
+    }
+
+    // Confirmados por lado (M1)
+    const sigRows = await prisma.signal.findMany({
+      where: {
+        side: { in: ["BUY", "SELL"] },
+        candle: {
+          instrumentId: instr.id,
+          timeframe: timeframe || "M1",
+          time: { gte: rng.gte, lte: rng.lte },
+        },
+      },
+      select: { side: true },
+    });
+    const confirmedBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    for (const s of sigRows) {
+      const sd = (s.side || "").toUpperCase();
+      if (sd === "BUY" || sd === "SELL") confirmedBySide[sd]++;
+    }
+
+    // Trades por lado e PnL
+    const trades = await prisma.trade.findMany({
+      where: {
+        timeframe: timeframe || "M1",
+        instrumentId: instr.id,
+        entrySignal: { time: { gte: rng.gte, lte: rng.lte } },
+      },
+      include: { entrySignal: true },
+    });
+    const tradesBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    let pnlPoints = 0;
+    for (const t of trades) {
+      const sd = (t.entrySignal as any)?.side || "";
+      const S = String(sd).toUpperCase();
+      if (S === "BUY" || S === "SELL") tradesBySide[S] = (tradesBySide[S] || 0) + 1;
+      if (Number.isFinite(t.pnlPoints as any)) pnlPoints += Number(t.pnlPoints);
+    }
+
+    // Projetados por lado (se o motor estiver exposto)
+    let projectedBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    try {
+      const { generateProjectedSignals } = await import("./services/engine");
+      const items = await generateProjectedSignals({
+        symbol,
+        timeframe: timeframe || "M1",
+        range: { gte: rng.gte, lte: rng.lte },
+        limit: 2000,
+      } as any);
+      for (const it of items || []) {
+        const sd = String((it as any).side || "").toUpperCase();
+        if (sd === "BUY" || sd === "SELL") projectedBySide[sd] = (projectedBySide[sd] || 0) + 1;
+      }
+    } catch {
+      projectedBySide = { BUY: -1, SELL: -1 };
+    }
+
+    return res.status(200).json({
+      ok: true,
+      data: {
+        symbol,
+        timeframe: timeframe || "M1",
+        range: { from: rng.gte, to: rng.lte },
+        mt5_executions_by_side: execBySide,
+        confirmed_by_side: confirmedBySide,
+        projected_by_side: projectedBySide,
+        trades_by_side: tradesBySide,
+        pnl_points_sum: pnlPoints,
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 /**
- * Gera task de execução real (EA/MT5) a partir de um Trade existente,
- * replicando parâmetros do pipeline para SL/TP/BE e usando o agregador para ATR.
- * POST /exec/trigger-from-trade/:id?agentId=MT5
+ * Gera task (EA/MT5) a partir de um Trade existente
  */
-import { enqueue as brokerEnqueue } from "./services/brokerPersist";
-import { loadCandlesAnyTF } from "./lib/aggregation";
-import { DateTime } from "luxon";
-
 router.post("/exec/trigger-from-trade/:id", async (req, res) => {
   try {
     const id = Number(req.params?.id || 0);
@@ -344,14 +563,14 @@ router.post("/exec/trigger-from-trade/:id", async (req, res) => {
     });
     if (!trade) return res.status(200).json({ ok: false, error: "trade não encontrado" });
     const symbol = trade.instrument?.symbol || "WIN";
-    const timeframe = trade.entrySignal?.timeframe || "M5";
-    const entryTime = trade.entrySignal?.time || trade.entryAt || trade.createdAt;
+    const timeframe = (trade.entrySignal as any)?.timeframe || "M1";
+    const entryTime = (trade.entrySignal as any)?.time || (trade as any).entryAt || trade.createdAt;
 
     // ATR14 no mesmo TF/instante
     const to = DateTime.fromJSDate(entryTime).toUTC();
     const from = to.minus({ hours: 24 });
     const candles = await loadCandlesAnyTF(symbol, timeframe, { gte: from.toJSDate(), lte: to.toJSDate() });
-    // cálculo simples ATR14 (true range em pontos)
+
     function atr14(cs: any[]) {
       const n = 14;
       if (cs.length < n + 1) return 100;
@@ -374,7 +593,7 @@ router.post("/exec/trigger-from-trade/:id", async (req, res) => {
     const slPoints = Math.round(atr * SL_ATR);
     const tpPoints = Math.round(atr * RR);
 
-    const side = trade.side as any; // "BUY" | "SELL"
+    const side = (trade as any).side as "BUY" | "SELL";
     const volume = Number(trade.qty || 1);
 
     const task = {
@@ -382,7 +601,7 @@ router.post("/exec/trigger-from-trade/:id", async (req, res) => {
       side,
       symbol,
       timeframe,
-      time: entryTime,
+      time: entryTime as Date,
       price: trade.entryPrice || undefined,
       volume,
       slPoints,
@@ -398,3 +617,5 @@ router.post("/exec/trigger-from-trade/:id", async (req, res) => {
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
   }
 });
+
+export default router;

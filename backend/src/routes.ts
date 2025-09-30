@@ -178,7 +178,7 @@ router.get("/candles", async (req, res) => {
   try {
     const {
       symbol = "WIN",
-      timeframe = "M5",
+      timeframe = "M1",
       from,
       to,
       limit = "1000",
@@ -238,7 +238,7 @@ router.get("/signals", async (req, res) => {
       vwapMinDistAtr,
 
       // Anti-whipsaw de pares
-      oppMinBars,                // barras mínimas entre lados opostos (default M1=4, M5+=3)
+      oppMinBars,                // barras mínimas entre lados opostos (default M1=4, M1+=3)
       pairPrefer,                // stronger|older (default stronger)
 
       // NOVO: modo de “somente entradas”
@@ -601,7 +601,7 @@ router.get("/signals", async (req, res) => {
 /* -------------------- /ml/projected (SINAIS PROJETADOS) -------------------- */
 router.get("/ml/projected", async (req, res) => {
   try {
-    const { symbol = "WIN", timeframe = "M5", ...rest } = req.query as any;
+    const { symbol = "WIN", timeframe = "M1", ...rest } = req.query as any;
     const range = toUtcRange(rest?.from, rest?.to);
     const effLimit = (range ? undefined : Number(rest?.limit || 500)) as
       | number
@@ -666,6 +666,9 @@ router.get("/ml/auto/status", async (_req, res) => {
 
 
 /* -------------------- /trades (TABELA DE TRADES CONSOLIDADOS) -------------------- */
+/* Agora com modo timeframe=auto (ou ausência do parâmetro):
+   - Se timeframe não vier ou vier "AUTO", tentamos resolver um TF existente na janela.
+   - A resposta inclui `resolvedTimeframe` para a UI exibir o TF efetivo. */
 router.get("/trades", async (req, res) => {
   try {
     const { symbol, timeframe, from, to, limit = 500, offset = 0 } = req.query as any;
@@ -673,8 +676,12 @@ router.get("/trades", async (req, res) => {
     // Constrói filtros relacionais sobre Instrument e Signals
     const where: any = {};
 
-    if (timeframe) {
-      where.timeframe = String(timeframe).toUpperCase();
+    let resolvedTimeframe: string | null = null;
+    const tfRaw = (timeframe ? String(timeframe) : "").trim().toUpperCase();
+    const autoTF = !tfRaw || tfRaw === "AUTO";
+    if (!autoTF && tfRaw) {
+      where.timeframe = tfRaw;
+      resolvedTimeframe = tfRaw;
     }
 
     // Filtro por símbolo (relacional via Instrument.symbol)
@@ -684,10 +691,8 @@ router.get("/trades", async (req, res) => {
     }
 
     // Filtro por intervalo de tempo baseado no entrySignal.time
-    // Usa util local toUtcRange se existir; caso contrário parse básico
     let range: { from?: Date; to?: Date } = {};
     try {
-      // @ts-ignore - função util definida acima neste arquivo
       range = toUtcRange(from as any, to as any) || {};
     } catch {
       const fromD = from ? new Date(String(from)) : undefined;
@@ -698,9 +703,7 @@ router.get("/trades", async (req, res) => {
     if (range.from || range.to) {
       where.entrySignal = { is: {} as any };
       if (range.from) (where.entrySignal.is as any).time = { ...((where.entrySignal.is as any).time || {}), gte: range.from };
-      if (range.to) {
-        (where.entrySignal.is as any).time = { ...((where.entrySignal.is as any).time || {}), lt: range.to };
-      }
+      if (range.to) (where.entrySignal.is as any).time = { ...((where.entrySignal.is as any).time || {}), lt: range.to };
     }
 
     const takeNum = Math.min(1000, Math.max(1, Number(limit) || 500));
@@ -718,7 +721,41 @@ router.get("/trades", async (req, res) => {
       skip: skipNum,
     });
 
-    const items = rows.map((r: any) => ({
+    let finalRows = rows;
+
+    // Auto-resolve timeframe: se pediram AUTO ou omitiram e veio vazio, procurar TF disponível
+    if (autoTF) {
+      if (finalRows.length === 0) {
+        const tfCandidate = await prisma.trade.findFirst({
+          where: {
+            ...where,
+            timeframe: undefined as any, // ignora tf para achar qualquer um
+          },
+          select: { timeframe: true },
+          orderBy: { id: "desc" },
+        });
+        if (tfCandidate?.timeframe) {
+          resolvedTimeframe = tfCandidate.timeframe;
+          finalRows = await prisma.trade.findMany({
+            where: { ...where, timeframe: resolvedTimeframe },
+            include: {
+              entrySignal: true,
+              exitSignal: true,
+              instrument: true,
+            },
+            orderBy: { id: "desc" },
+            take: takeNum,
+            skip: skipNum,
+          });
+        }
+      } else {
+        resolvedTimeframe = finalRows[0]?.timeframe ?? null;
+      }
+    } else {
+      finalRows = rows;
+    }
+
+    const items = finalRows.map((r: any) => ({
       id: r.id,
       symbol: r.instrument?.symbol || null,
       timeframe: r.timeframe,
@@ -734,7 +771,7 @@ router.get("/trades", async (req, res) => {
       exitTime: r.exitSignal?.time ? new Date(r.exitSignal.time).toISOString() : null,
     }));
 
-    return res.status(200).json({ ok: true, count: items.length, trades: items });
+    return res.status(200).json({ ok: true, count: items.length, trades: items, resolvedTimeframe });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
@@ -749,12 +786,11 @@ router.get("/order-logs", async (req, res) => {
     if (taskId) where.taskId = String(taskId);
     if (symbol) where.symbol = String(symbol).toUpperCase();
 
-    const fromD = from ? new Date(String(from)) : undefined;
-    const toD = to ? new Date(String(to)) : undefined;
-    if (fromD || toD) {
-      where.time = {};
-      if (fromD) where.time.gte = fromD;
-      if (toD) where.time.lt = toD;
+    const baseRange = toUtcRange(String(from || ""), String(to || ""));
+    if (baseRange?.gte || baseRange?.lte) {
+      (where as any).time = {};
+      if (baseRange.gte) (where as any).time.gte = baseRange.gte;
+      if (baseRange.lte) (where as any).time.lt = baseRange.lte;
     }
 
     const takeNum = Math.min(1000, Math.max(1, Number(limit) || 300));
@@ -793,7 +829,7 @@ router.get("/order-logs", async (req, res) => {
 /**
  * Reconsolida trades a partir de sinais (entry = primeiro sinal quando flat; exit = primeiro sinal do lado oposto).
  * - symbol: obrigatório (ex.: WIN, WDO)
- * - timeframe: opcional (ex.: M5). Se omitido, reconstrói todos os TFs existentes na janela.
+ * - timeframe: opcional (ex.: M1). Se omitido, reconstrói todos os TFs existentes na janela.
  * - from/to: janela (ISO). Se omitidos, usa todo o histórico.
  * - dry: se 1, não grava; apenas simula e retorna amostra.
  *
@@ -843,7 +879,6 @@ router.post("/admin/trades/rebuild", async (req, res) => {
     // Local util para range
     let range: { from?: Date; to?: Date } = {};
     try {
-      // @ts-ignore
       range = toUtcRange(from as any, to as any) || {};
     } catch {
       const fD = from ? new Date(String(from)) : undefined;
@@ -992,18 +1027,21 @@ router.post("/admin/trades/rebuild", async (req, res) => {
 
 export default router;
 
-
 /* ===== Broker: execuções reais e comparativo ===== */
+/* Corrigido: agora usa toUtcRange para from/to */
 router.get("/api/broker/executions", async (req, res) => {
   try {
     const { symbol, from, to } = req.query as any;
     const where: any = {};
-    if (symbol) where.symbol = String(symbol);
-    if (from || to) {
+    if (symbol) where.symbol = String(symbol).toUpperCase();
+
+    const baseRange = toUtcRange(String(from || ""), String(to || ""));
+    if (baseRange?.gte || baseRange?.lte) {
       where.time = {};
-      if (from) where.time.gte = parse(String(from));
-      if (to) where.time.lte = parse(String(to), true);
+      if (baseRange.gte) where.time.gte = baseRange.gte;
+      if (baseRange.lte) where.time.lt = baseRange.lte;
     }
+
     const rows = await prisma.brokerExecution.findMany({
       where,
       orderBy: { time: "asc" },
@@ -1027,5 +1065,110 @@ router.get("/api/broker/compare", async (req, res) => {
     return res.status(200).json({ ok: true, trade, executions: rows });
   } catch (e: any) {
     return res.status(200).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* ===== Diagnóstico consolidado para bater números (novo) =====
+   GET /admin/diag/recap?symbol=WIN&timeframe=M1&from=2025-09-30&to=2025-09-30
+   Retorna: execuções MT5 por lado, confirmados, projetados, trades e PnL total. */
+router.get("/admin/diag/recap", async (req, res) => {
+  try {
+    const symbol = String((req.query.symbol as any) || "").toUpperCase();
+    const timeframe = String((req.query.timeframe as any) || "").toUpperCase();
+    const from = String((req.query.from as any) || "");
+    const to = String((req.query.to as any) || "");
+    if (!symbol) return res.status(400).json({ ok: false, error: "missing_symbol" });
+
+    const r = from && to ? toUtcRange(from, to) : undefined;
+    const today = DateTime.now().toUTC().toISODate()!;
+    const range = r ?? toUtcRange(today, today)!;
+
+    const instr = await prisma.instrument.findUnique({ where: { symbol } });
+    if (!instr) return res.status(200).json({ ok: true, data: { note: "instrument_not_found", symbol } });
+
+    // MT5 execuções por lado (conta taskId únicos no intervalo)
+    const execRows = await prisma.brokerExecution.findMany({
+      where: { symbol, time: { gte: range.gte!, lte: range.lte! } },
+      select: { taskId: true, side: true },
+    });
+    const execBySide: Record<string, number> = {};
+    const seenTask: Record<string, string> = {};
+    for (const r of execRows) {
+      const tid = r.taskId || "";
+      if (!tid) continue;
+      if (!seenTask[tid]) {
+        seenTask[tid] = r.side || "";
+        const s = (r.side || "").toUpperCase();
+        execBySide[s] = (execBySide[s] || 0) + 1;
+      }
+    }
+
+    // Confirmados por lado
+    const sigRows = await prisma.signal.findMany({
+      where: {
+        side: { in: ["BUY", "SELL"] },
+        candle: {
+          instrumentId: instr.id,
+          timeframe: timeframe || undefined,
+          time: { gte: range.gte!, lte: range.lte! },
+        },
+      },
+      select: { side: true },
+    });
+    const confirmedBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    for (const s of sigRows) {
+      const sd = (s.side || "").toUpperCase();
+      if (sd === "BUY" || sd === "SELL") confirmedBySide[sd]++;
+    }
+
+    // Trades por lado e PnL
+    const trades = await prisma.trade.findMany({
+      where: {
+        timeframe: timeframe || undefined,
+        instrumentId: instr.id,
+        entrySignal: { time: { gte: range.gte!, lte: range.lte! } },
+      },
+      include: { entrySignal: true },
+    });
+    const tradesBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    let pnlPoints = 0;
+    for (const t of trades) {
+      const sd = (t.entrySignal?.side || "").toUpperCase();
+      if (sd === "BUY" || sd === "SELL") tradesBySide[sd] = (tradesBySide[sd] || 0) + 1;
+      if (Number.isFinite(t.pnlPoints as any)) pnlPoints += Number(t.pnlPoints);
+    }
+
+    // Projetados por lado (usa motor atual)
+    let projectedBySide: Record<string, number> = { BUY: 0, SELL: 0 };
+    try {
+      const items = await generateProjectedSignals({
+        symbol,
+        timeframe: timeframe || "M1",
+        range,
+        limit: 2000,
+      } as any);
+      for (const it of items || []) {
+        const sd = String((it as any).side || "").toUpperCase();
+        if (sd === "BUY" || sd === "SELL") projectedBySide[sd] = (projectedBySide[sd] || 0) + 1;
+      }
+    } catch {
+      projectedBySide = { BUY: -1, SELL: -1 };
+    }
+
+    return res.status(200).json({
+      ok: true,
+      data: {
+        symbol,
+        timeframe: timeframe || null,
+        range,
+        mt5_executions_by_side: execBySide,
+        confirmed_by_side: confirmedBySide,
+        projected_by_side: projectedBySide,
+        trades_by_side: tradesBySide,
+        pnl_points_sum: pnlPoints,
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });

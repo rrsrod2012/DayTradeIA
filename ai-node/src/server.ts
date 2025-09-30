@@ -54,7 +54,7 @@ const cfgSchema = z.object({
 
 // ===== Defaults (ENV tem prioridade) =====
 const defaultConfig = {
-  uiTimeframe: (str(process.env.UI_TIMEFRAME, "M5") as "M1" | "M5" | "M15" | "M30" | "H1"),
+  uiTimeframe: (str(process.env.UI_TIMEFRAME, "M1") as "M1" | "M5" | "M15" | "M30" | "H1"),
   uiLots: num(process.env.UI_LOTS, 1),
 
   rr: num(process.env.UI_RR, 2),
