@@ -1,13 +1,37 @@
-// backend/src/routes/notifyRoutes.ts
 import { Router } from "express";
 import { sendWhatsAppText } from "./services/whatsapp";
+import logger from "./logger"; // <-- CORRIGIDO de '../logger' para './logger'
 
 export const notifyRoutes = Router();
 
 /**
+ * Middleware para logar detalhes da requisição recebida.
+ * Isso nos ajudará a identificar a origem das chamadas.
+ */
+notifyRoutes.use((req, _res, next) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    const forwarded = req.headers['x-forwarded-for'];
+    const userAgent = req.headers['user-agent'];
+
+    // Log detalhado para diagnóstico
+    logger.info("[NOTIFY_TRACE] Recebida requisição em /notify", {
+        path: req.path,
+        method: req.method,
+        ip,
+        forwarded,
+        userAgent,
+        headers: req.headers, // Loga todos os cabeçalhos
+        body: req.body,
+    });
+
+    next();
+});
+
+
+/**
  * Recebe eventos do EA:
- *  opened: { symbol, side, volume, entryPrice, positionId, ticket }
- *  closed: { symbol, side, volume, exitPrice, positionId, ticket, pnlPoints }
+ * opened: { symbol, side, volume, entryPrice, positionId, ticket }
+ * closed: { symbol, side, volume, exitPrice, positionId, ticket, pnlPoints }
  */
 notifyRoutes.post("/trade", async (req, res) => {
     try {

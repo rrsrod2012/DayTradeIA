@@ -7,6 +7,7 @@ import routes from "./routes";
 import adminRoutes from "./routesAdmin";
 // novo arquivo aditivo
 import routesAdminCompare from "./routesAdminCompare";
+import { router as tradesRoutes } from "./tradesRoutes";
 
 import { bootCsvWatchersIfConfigured } from "./services/csvWatcher";
 import { bootConfirmedSignalsWorker } from "./workers/confirmedSignalsWorker";
@@ -149,6 +150,28 @@ app.options(
 );
 
 app.use(express.json({ limit: "5mb" }));
+
+// =========================================================================
+// RASTREADOR GLOBAL: Loga toda e qualquer requisição que chega no servidor
+// =========================================================================
+app.use((req, res, next) => {
+  // Ignora requisições OPTIONS (pre-flight) para não poluir o log
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.headers['user-agent'];
+
+  logger.info(`[GLOBAL_TRACE] Request recebido: ${req.method} ${req.originalUrl}`, {
+    ip,
+    userAgent,
+    origin: req.headers['origin'],
+    body: req.body,
+    query: req.query,
+  });
+
+  next();
+});
 
 /** =========================
  * Gate opcional por API key (EA)
@@ -1216,104 +1239,7 @@ app.get("/api/order-logs", async (req, res) => {
    /api/trades
    ========================= */
 // GET /api/trades?symbol=WIN&timeframe=M1&from=2025-09-26T00:00:00-03:00&to=2025-09-26T23:59:59-03:00&limit=200&offset=0
-app.get("/api/trades", async (req, res) => {
-  try {
-    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : undefined;
-    const timeframe = req.query.timeframe ? String(req.query.timeframe).toUpperCase() : undefined;
-    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
-    const offset = Math.max(0, Number(req.query.offset) || 0);
-
-    const expandLocalDate = (s: any, kind: "start" | "end") => {
-      if (!s) return undefined;
-      const str = String(s).trim();
-      if (str.includes("T")) { const d = new Date(str); return isNaN(d.getTime()) ? undefined : d; }
-      const m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      if (!m) { const d = new Date(str); return isNaN(d.getTime()) ? undefined : d; }
-      const [_, y, mm, dd] = m;
-      const iso = kind === "start"
-        ? `${y}-${mm}-${dd}T00:00:00.000-03:00`
-        : `${y}-${mm}-${dd}T23:59:59.999-03:00`;
-      const d = new Date(iso);
-      return isNaN(d.getTime()) ? undefined : d;
-    };
-    const from = expandLocalDate(req.query.from, "start");
-    const to = expandLocalDate(req.query.to, "end");
-    // where baseado no candle do sinal de entrada
-    const where: any = {
-      entrySignal: {
-        candle: {
-          ...(symbol ? { instrument: { symbol } } : {}),
-          ...(timeframe ? { timeframe } : {}),
-          ...(from || to
-            ? {
-              time: {
-                ...(from ? { gte: from } : {}),
-                ...(to ? { lte: to } : {}),
-              },
-            }
-            : {}),
-        },
-      },
-    };
-
-    const trades = await prisma.trade.findMany({
-      where,
-      // Se preferir, troque por { id: "desc" }
-      orderBy: { entrySignal: { candle: { time: "desc" } } },
-      take: limit,
-      skip: offset,
-      select: {
-        id: true,
-        timeframe: true,
-        qty: true,
-        entryPrice: true,
-        exitPrice: true,
-        pnlPoints: true,
-        entrySignalId: true,
-        exitSignalId: true,
-        entrySignal: {
-          select: {
-            side: true,
-            candle: {
-              select: {
-                time: true,
-                instrument: { select: { symbol: true } },
-              },
-            },
-          },
-        },
-        exitSignal: {
-          select: {
-            signalType: true,
-            reason: true,
-            candle: { select: { time: true } },
-          },
-        },
-      },
-    });
-
-    const out = trades.map((t) => ({
-      id: t.id,
-      symbol: t.entrySignal?.candle?.instrument?.symbol ?? null,
-      timeframe: t.timeframe,
-      side: t.entrySignal?.side ?? null,
-      entryPrice: t.entryPrice,
-      exitPrice: t.exitPrice,
-      pnlPoints: t.pnlPoints,
-      entryTime: t.entrySignal?.candle?.time ?? null,
-      exitTime: t.exitSignal?.candle?.time ?? null,
-      exitSignalType: t.exitSignal?.signalType ?? null,
-      exitReason: t.exitSignal?.reason ?? null,
-      entrySignalId: t.entrySignalId,
-      exitSignalId: t.exitSignalId,
-    }));
-
-    res.json(out);
-  } catch (err: any) {
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
+app.use(tradesRoutes);
 /* =========================
    /admin/trades/backfill
    ========================= */

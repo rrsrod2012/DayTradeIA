@@ -166,6 +166,27 @@ export async function backfillCandlesAndSignals(
   const adx = ADX(highs, lows, closes, 14);
 
   let createdOrUpdated = 0;
+  let lastSignalSide: "BUY" | "SELL" | null = null;
+
+  // Busca o último trade aberto para este instrumento e TF para continuar de onde parou
+  let openTrade = await prisma.trade.findFirst({
+    where: {
+      instrumentId,
+      timeframe: tf,
+      exitSignalId: null,
+    },
+    orderBy: {
+      id: 'desc'
+    }
+  });
+
+  // Se houver um trade aberto, define o lado do último sinal para evitar entradas na mesma direção
+  if (openTrade) {
+    const entrySignal = await prisma.signal.findUnique({ where: { id: openTrade.entrySignalId } });
+    if (entrySignal) {
+      lastSignalSide = entrySignal.side as "BUY" | "SELL";
+    }
+  }
 
   const tfMin = TF_MINUTES[tf];
 
@@ -178,10 +199,19 @@ export async function backfillCandlesAndSignals(
     else if (prevDiff > 0 && diff < 0) side = "SELL";
     else continue;
 
-    // tempo “bucketizado” para o TF
+    // Um novo sinal só deve ser processado se for na direção oposta ao anterior
+    if (side === lastSignalSide) continue;
+
     const bucketTime = floorToBucket(candles[i].time, tfMin);
 
-    // garante que exista um candle PERSISTIDO exatamente no TF solicitado
+    // Evita processar candles anteriores ao trade que já está aberto
+    if (openTrade) {
+      const entrySignal = await prisma.signal.findUnique({ where: { id: openTrade.entrySignalId }, include: { candle: true } });
+      if (entrySignal && bucketTime <= entrySignal.candle.time) {
+        continue;
+      }
+    }
+
     const candleId = await upsertTfCandle(instrumentId, tf, {
       time: bucketTime,
       open: candles[i].open,
@@ -198,27 +228,49 @@ export async function backfillCandlesAndSignals(
         ? `EMA9 cross above EMA21 • ADX14=${(adx[i] ?? 0).toFixed(1)}`
         : `EMA9 cross below EMA21 • ADX14=${(adx[i] ?? 0).toFixed(1)}`;
 
-    const existing = await prisma.signal.findFirst({
-      where: { candleId, signalType: "EMA_CROSS", side },
-      select: { id: true },
+    // Usa 'upsert' para criar ou atualizar o sinal, simplificando a lógica
+    const signal = await prisma.signal.upsert({
+      where: { candleId_signalType_side: { candleId, signalType: "EMA_CROSS", side: side! } },
+      update: { score: Math.abs(diff) / (Math.abs(e21[i]) || 1), reason },
+      create: {
+        candleId,
+        signalType: "EMA_CROSS",
+        side: side!,
+        score: Math.abs(diff) / (Math.abs(e21[i]) || 1),
+        reason,
+      },
     });
 
-    if (existing?.id) {
-      await prisma.signal.update({
-        where: { id: existing.id },
-        data: { score: Math.abs(diff) / (Math.abs(e21[i]) || 1), reason },
-      });
-    } else {
-      await prisma.signal.create({
+    if (!openTrade) {
+      // Se não há trade aberto, este é um sinal de entrada. Cria um novo trade.
+      openTrade = await prisma.trade.create({
         data: {
-          candleId,
-          signalType: "EMA_CROSS",
-          side,
-          score: Math.abs(diff) / (Math.abs(e21[i]) || 1),
-          reason,
+          instrumentId,
+          timeframe: tf,
+          entrySignalId: signal.id,
+          qty: 1,
+          entryPrice: candles[i].close,
         },
       });
+    } else {
+      // Se há um trade aberto, este é um sinal de saída.
+      const pnlPoints =
+        lastSignalSide === "BUY"
+          ? candles[i].close - openTrade.entryPrice
+          : openTrade.entryPrice - candles[i].close;
+
+      await prisma.trade.update({
+        where: { id: openTrade.id },
+        data: {
+          exitSignalId: signal.id,
+          exitPrice: candles[i].close,
+          pnlPoints,
+        },
+      });
+      openTrade = null; // O trade foi fechado
     }
+
+    lastSignalSide = side; // Atualiza o lado do último sinal processado
     createdOrUpdated++;
   }
 
