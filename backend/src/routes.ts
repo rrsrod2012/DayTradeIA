@@ -664,6 +664,332 @@ router.get("/ml/auto/status", async (_req, res) => {
   }
 });
 
+
+/* -------------------- /trades (TABELA DE TRADES CONSOLIDADOS) -------------------- */
+router.get("/trades", async (req, res) => {
+  try {
+    const { symbol, timeframe, from, to, limit = 500, offset = 0 } = req.query as any;
+
+    // Constrói filtros relacionais sobre Instrument e Signals
+    const where: any = {};
+
+    if (timeframe) {
+      where.timeframe = String(timeframe).toUpperCase();
+    }
+
+    // Filtro por símbolo (relacional via Instrument.symbol)
+    if (symbol) {
+      const sym = String(symbol).toUpperCase().trim();
+      where.instrument = { is: { symbol: sym } };
+    }
+
+    // Filtro por intervalo de tempo baseado no entrySignal.time
+    // Usa util local toUtcRange se existir; caso contrário parse básico
+    let range: { from?: Date; to?: Date } = {};
+    try {
+      // @ts-ignore - função util definida acima neste arquivo
+      range = toUtcRange(from as any, to as any) || {};
+    } catch {
+      const fromD = from ? new Date(String(from)) : undefined;
+      const toD = to ? new Date(String(to)) : undefined;
+      range = { from: fromD, to: toD };
+    }
+
+    if (range.from || range.to) {
+      where.entrySignal = { is: {} as any };
+      if (range.from) (where.entrySignal.is as any).time = { ...((where.entrySignal.is as any).time || {}), gte: range.from };
+      if (range.to) {
+        (where.entrySignal.is as any).time = { ...((where.entrySignal.is as any).time || {}), lt: range.to };
+      }
+    }
+
+    const takeNum = Math.min(1000, Math.max(1, Number(limit) || 500));
+    const skipNum = Math.max(0, Number(offset) || 0);
+
+    const rows = await prisma.trade.findMany({
+      where,
+      include: {
+        entrySignal: true,
+        exitSignal: true,
+        instrument: true,
+      },
+      orderBy: { id: "desc" },
+      take: takeNum,
+      skip: skipNum,
+    });
+
+    const items = rows.map((r: any) => ({
+      id: r.id,
+      symbol: r.instrument?.symbol || null,
+      timeframe: r.timeframe,
+      qty: r.qty,
+      side: r.entrySignal?.side ?? null,
+      entrySignalId: r.entrySignalId,
+      exitSignalId: r.exitSignalId,
+      entryPrice: r.entryPrice,
+      exitPrice: r.exitPrice,
+      pnlPoints: r.pnlPoints,
+      pnlMoney: r.pnlMoney ?? null,
+      entryTime: r.entrySignal?.time ? new Date(r.entrySignal.time).toISOString() : null,
+      exitTime: r.exitSignal?.time ? new Date(r.exitSignal.time).toISOString() : null,
+    }));
+
+    return res.status(200).json({ ok: true, count: items.length, trades: items });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/* -------------------- /order-logs (LOGS DO BROKER / EXECUÇÕES) -------------------- */
+router.get("/order-logs", async (req, res) => {
+  try {
+    const { taskId, symbol, from, to, limit = 300 } = req.query as any;
+
+    const where: any = {};
+    if (taskId) where.taskId = String(taskId);
+    if (symbol) where.symbol = String(symbol).toUpperCase();
+
+    const fromD = from ? new Date(String(from)) : undefined;
+    const toD = to ? new Date(String(to)) : undefined;
+    if (fromD || toD) {
+      where.time = {};
+      if (fromD) where.time.gte = fromD;
+      if (toD) where.time.lt = toD;
+    }
+
+    const takeNum = Math.min(1000, Math.max(1, Number(limit) || 300));
+
+    // BrokerExecution é a tabela de logs de execução
+    const rows = await prisma.brokerExecution.findMany({
+      where,
+      orderBy: { createdAt: "asc" },
+      take: takeNum,
+    });
+
+    const logs = rows.map((r: any) => ({
+      id: r.id,
+      taskId: r.taskId ?? null,
+      agentId: r.agentId ?? null,
+      side: r.side ?? null,
+      symbol: r.symbol ?? null,
+      orderId: r.orderId ?? null,
+      status: r.status ?? null,
+      time: r.time ? new Date(r.time).toISOString() : null,
+      price: r.price ?? null,
+      volume: r.volume ?? null,
+      pnlPoints: r.pnlPoints ?? null,
+      raw: r.raw ? (() => { try { return JSON.parse(r.raw); } catch { return r.raw; } })() : null,
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : null,
+    }));
+
+    return res.status(200).json({ ok: true, key: taskId ?? null, count: logs.length, logs });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+
+/* -------------------- /admin/trades/rebuild (RECONSOLIDAR TRADES) -------------------- */
+/**
+ * Reconsolida trades a partir de sinais (entry = primeiro sinal quando flat; exit = primeiro sinal do lado oposto).
+ * - symbol: obrigatório (ex.: WIN, WDO)
+ * - timeframe: opcional (ex.: M5). Se omitido, reconstrói todos os TFs existentes na janela.
+ * - from/to: janela (ISO). Se omitidos, usa todo o histórico.
+ * - dry: se 1, não grava; apenas simula e retorna amostra.
+ *
+ * Idempotente: apaga trades existentes da janela antes de recriar (mesmo instrument/timeframe).
+ */
+
+// Helper: busca preço de execução no BrokerExecution próximo ao horário alvo
+async function findExecutionPrice(symbol: string, side: string, time: Date, windowMinutes = 10) {
+  const startA = new Date(time.getTime());
+  const endA = new Date(time.getTime() + windowMinutes * 60 * 1000);
+  const startB = new Date(time.getTime() - windowMinutes * 60 * 1000);
+  try {
+    // primeira tentativa: [t, t+window]
+    const rowA = await prisma.brokerExecution.findFirst({
+      where: {
+        symbol,
+        side,
+        time: { gte: startA, lt: endA },
+      },
+      orderBy: { time: "asc" },
+    });
+    if (rowA && Number.isFinite(rowA.price as any)) return Number(rowA.price);
+
+    // fallback: [t-window, t+window]
+    const rowB = await prisma.brokerExecution.findFirst({
+      where: {
+        symbol,
+        side,
+        time: { gte: startB, lt: endA },
+      },
+      orderBy: { time: "asc" },
+    });
+    if (rowB && Number.isFinite(rowB.price as any)) return Number(rowB.price);
+  } catch (e) {
+    // silencioso
+  }
+  return null;
+}
+router.post("/admin/trades/rebuild", async (req, res) => {
+  try {
+    const { symbol, timeframe, from, to, dry = "0", sample = 5 } = (req.query as any) || {};
+    if (!symbol) return res.status(400).json({ ok: false, error: "faltou symbol" });
+    const sym = String(symbol).toUpperCase().trim();
+    const tf = timeframe ? String(timeframe).toUpperCase().trim() : undefined;
+    const isDry = String(dry) === "1";
+
+    // Local util para range
+    let range: { from?: Date; to?: Date } = {};
+    try {
+      // @ts-ignore
+      range = toUtcRange(from as any, to as any) || {};
+    } catch {
+      const fD = from ? new Date(String(from)) : undefined;
+      const tD = to ? new Date(String(to)) : undefined;
+      range = { from: fD, to: tD };
+    }
+
+    // Instrument
+    const instrument = await prisma.instrument.findUnique({ where: { symbol: sym } });
+    if (!instrument) return res.status(200).json({ ok: false, error: `instrumento não encontrado para ${sym}` });
+
+    // Carregar sinais no período (com candle/timeframe)
+    const whereSignal: any = {
+      candle: {
+        instrumentId: instrument.id,
+      },
+    };
+    if (tf) whereSignal.candle.timeframe = tf;
+    if (range.from || range.to) {
+      whereSignal.candle.time = {};
+      if (range.from) whereSignal.candle.time.gte = range.from;
+      if (range.to) whereSignal.candle.time.lt = range.to;
+    }
+
+    const signals = await prisma.signal.findMany({
+      where: whereSignal,
+      include: { candle: true },
+      orderBy: [{ candle: { timeframe: "asc" } }, { candle: { time: "asc" } }, { id: "asc" }],
+    });
+
+    if (!signals.length) {
+      return res.status(200).json({ ok: true, rebuilt: 0, deleted: 0, trades: [] });
+    }
+
+    // Se não foi especificado timeframe, vamos reconstruir por TF existente
+    const byTF = new Map<string, any[]>();
+    for (const s of signals) {
+      const tframe = s.candle.timeframe.toUpperCase();
+      if (tf && tframe !== tf) continue;
+      if (!byTF.has(tframe)) byTF.set(tframe, []);
+      byTF.get(tframe)!.push(s);
+    }
+
+    let totalDeleted = 0;
+    let totalCreated = 0;
+    const sampleTrades: any[] = [];
+
+    for (const [tframe, list] of byTF.entries()) {
+      // Apagar trades existentes deste TF na janela selecionada (buscando ids primeiro)
+      const existing = await prisma.trade.findMany({
+        where: {
+          instrumentId: instrument.id,
+          timeframe: tframe,
+          ...(range.from || range.to
+            ? {
+              entrySignal: {
+                is: {
+                  candle: {
+                    time: {
+                      ...(range.from ? { gte: range.from } : {}),
+                      ...(range.to ? { lt: range.to } : {}),
+                    },
+                  },
+                },
+              },
+            }
+            : {}),
+        },
+        select: { id: true },
+      });
+      const existingIds = existing.map((r) => r.id);
+
+      if (!isDry && existingIds.length) {
+        await prisma.trade.deleteMany({ where: { id: { in: existingIds } } });
+        totalDeleted += existingIds.length;
+      }
+
+      // Reconstruir pairing simples: abre com o primeiro sinal; fecha no primeiro oposto
+      let position: null | { entry: any } = null;
+      const creations: any[] = [];
+
+      for (const s of list) {
+        if (!position) {
+          // abre posição
+          position = { entry: s };
+          continue;
+        } else {
+          // já em posição; só fecha se for lado oposto
+          const entrySide = String(position.entry.side).toUpperCase();
+          const thisSide = String(s.side).toUpperCase();
+          if (entrySide !== thisSide) {
+            const entryC = position.entry.candle;
+            const exitC = s.candle;
+            const entryPrice = Number(entryC.close);
+            const exitPrice = Number(exitC.close);
+            const pnlPoints = entrySide === "BUY" ? (exitPrice - entryPrice) : (entryPrice - exitPrice);
+
+            creations.push({
+              instrumentId: instrument.id,
+              timeframe: tframe,
+              entrySignalId: position.entry.id,
+              exitSignalId: s.id,
+              qty: 1,
+              entryPrice,
+              exitPrice,
+              pnlPoints,
+            });
+            position = null;
+          }
+        }
+      }
+
+      if (!isDry && creations.length) {
+        // createMany só aceita escalares (ok)
+        const batchSize = 500;
+        for (let i = 0; i < creations.length; i += batchSize) {
+          const slice = creations.slice(i, i + batchSize);
+          await prisma.trade.createMany({ data: slice, skipDuplicates: true });
+        }
+      }
+
+      totalCreated += creations.length;
+
+      // Amostra para retorno
+      for (const c of creations.slice(0, Number(sample) || 5)) {
+        sampleTrades.push({
+          ...c,
+          symbol: sym,
+          entryTime: list.find((x) => x.id === c.entrySignalId)?.candle?.time ?? null,
+          exitTime: list.find((x) => x.id === c.exitSignalId)?.candle?.time ?? null,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      dryRun: isDry,
+      deleted: totalDeleted,
+      rebuilt: totalCreated,
+      sample: sampleTrades,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 export default router;
 
 
