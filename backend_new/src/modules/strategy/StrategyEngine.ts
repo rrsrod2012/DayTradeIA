@@ -1,7 +1,7 @@
 import { eventBus, EVENTS } from '../../core/eventBus';
 import { logger } from '../../core/logger';
 import { prisma } from '../../core/prisma';
-import { ADX, ema } from './lib/indicators';
+import { ADX, ema } from './indicators';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 
 const STRATEGY_SYMBOL = process.env.STRATEGY_SYMBOL || 'WIN';
@@ -61,12 +61,12 @@ const runStrategy = async (symbol: string, timeframe: string) => {
   logger.info(`Executando estratégia para ${symbol} ${timeframe}...`);
   const tf = timeframe.toUpperCase() as TFKey;
 
-  const instrument = await prisma.instrument.findUnique({ where: { symbol }});
+  const instrument = await prisma.instrument.findUnique({ where: { symbol } });
   if (!instrument) {
     logger.warn(`Instrumento ${symbol} não encontrado no banco.`);
     return;
   }
-  
+
   const candles = await loadCandlesAnyTF(instrument.symbol, tf);
   if (candles.length < 22) {
     logger.warn(`Dados insuficientes para ${symbol} ${tf} (necessário no mínimo 22 candles).`);
@@ -187,11 +187,11 @@ const runStrategy = async (symbol: string, timeframe: string) => {
 };
 
 export const initStrategyEngine = () => {
-  eventBus.on(EVENTS.NEW_CANDLE_DATA, (data: { symbol: string, timeframe: string}) => {
-      runStrategy(data.symbol, data.timeframe);
+  eventBus.on(EVENTS.NEW_CANDLE_DATA, (data: { symbol: string, timeframe: string }) => {
+    runStrategy(data.symbol, data.timeframe);
   });
   logger.info('✅ Motor de Estratégia inicializado e aguardando novos candles.');
-  
+
   // Executa uma vez no início para processar dados existentes
   runStrategy(STRATEGY_SYMBOL, STRATEGY_TIMEFRAME);
 };

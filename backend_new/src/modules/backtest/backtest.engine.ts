@@ -1,6 +1,6 @@
 import { DateTime } from 'luxon';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
-import { ema, ADX } from '../strategy/lib/indicators';
+import { ema, ADX } from '../strategy/indicators';
 
 const ZONE_BR = "America/Sao_Paulo";
 
@@ -35,7 +35,7 @@ const normalizeDayRange = (fromRaw: any, toRaw: any): { from: DateTime; to: Date
 
     if (pF.ok && !pT.ok) to = from.endOf('day');
     if (!pF.ok && pT.ok) from = to.startOf('day');
-    
+
     return { from: from.startOf('day'), to: to.endOf('day') };
 };
 
@@ -78,7 +78,7 @@ export const runBacktest = async (params: any) => {
     for (let i = 1; i < candles.length; i++) {
         const prevDiff = e9[i - 1] - e21[i - 1];
         const diff = e9[i] - e21[i];
-        
+
         let side: 'BUY' | 'SELL' | null = null;
         if (prevDiff <= 0 && diff > 0) side = 'BUY';
         if (prevDiff >= 0 && diff < 0) side = 'SELL';
@@ -96,12 +96,12 @@ export const runBacktest = async (params: any) => {
         } else if (inTrade && side && side !== currentTrade.side) {
             currentTrade.exitTime = candles[i].time.toISOString();
             currentTrade.exitPrice = candles[i].close;
-            
+
             const pnl = currentTrade.side === 'BUY'
                 ? currentTrade.exitPrice - (currentTrade.entryPrice ?? 0)
                 : (currentTrade.entryPrice ?? 0) - currentTrade.exitPrice;
             currentTrade.pnlPoints = pnl;
-            
+
             trades.push(currentTrade as Trade);
             inTrade = false;
             currentTrade = {};
@@ -118,7 +118,7 @@ export const runBacktest = async (params: any) => {
             };
         }
     }
-    
+
     if (inTrade && currentTrade.entryPrice) {
         const lastCandle = candles[candles.length - 1];
         currentTrade.exitTime = lastCandle.time.toISOString();
@@ -129,7 +129,7 @@ export const runBacktest = async (params: any) => {
         currentTrade.pnlPoints = pnl;
         trades.push(currentTrade as Trade);
     }
-    
+
     const totalPnl = trades.reduce((sum, trade) => sum + (trade.pnlPoints || 0), 0);
 
     return {

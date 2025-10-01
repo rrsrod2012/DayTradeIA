@@ -1,40 +1,136 @@
-export function ema(values: number[], period: number): number[] {
-  const k = 2 / (period + 1);
-  const out: number[] = [];
-  let currentEma: number | null = null;
-  for (const value of values) {
-    if (currentEma === null) {
-      currentEma = value;
-    } else {
-      currentEma = value * k + currentEma * (1 - k);
+import fetch from 'node-fetch';
+import { prisma } from '../../core/prisma';
+import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
+import { logger } from '../../core/logger';
+import { ema, ADX } from '../strategy/indicators';
+
+// Variáveis de estado para controlar o worker
+let isRunning = false;
+let lastRun: Date | null = null;
+let currentStatus: string = "stopped";
+let intervalId: NodeJS.Timeout | null = null;
+
+const toNum = (v: any, def = 0): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+};
+
+// Função para fazer a requisição ao serviço de IA
+async function httpPostJSON<T = any>(url: string, body: any, timeoutMs = 5000): Promise<T> {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      // @ts-ignore
+      signal: ctrl.signal,
+    });
+    const txt = await resp.text();
+    const data = txt ? JSON.parse(txt) : null;
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    return data as T;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// Lógica principal do treinamento
+async function runTrainingCycle() {
+  if (!isRunning) return;
+  currentStatus = "running";
+  logger.info('[AutoTrainer] Iniciando ciclo de treinamento...');
+
+  const MICRO_MODEL_URL = process.env.MICRO_MODEL_URL || "";
+  if (!MICRO_MODEL_URL) {
+    logger.warn('[AutoTrainer] MICRO_MODEL_URL não configurada. Ciclo de treinamento pulado.');
+    currentStatus = "idle";
+    return;
+  }
+
+  try {
+    const symbol = process.env.STRATEGY_SYMBOL || 'WIN';
+    const timeframe = process.env.STRATEGY_TIMEFRAME || 'M5';
+
+    // Coleta de dados e preparação de features (simplificado, pode ser expandido)
+    const candles = await loadCandlesAnyTF(symbol, timeframe);
+    if (candles.length < 100) {
+      logger.warn('[AutoTrainer] Dados de candles insuficientes.');
+      currentStatus = "idle";
+      return;
     }
-    out.push(currentEma);
+
+    const closes = candles.map(c => c.close);
+    const features = closes.map((c, i) => ({
+      close: c,
+      ema9: ema(closes.slice(0, i + 1), 9).pop(),
+      ema21: ema(closes.slice(0, i + 1), 21).pop(),
+    }));
+
+    const run = await prisma.trainingRun.create({
+      data: { status: 'STARTED', symbol, timeframe }
+    });
+
+    // Chamada para a API de treinamento do ai-node
+    const trainingResult = await httpPostJSON(`${MICRO_MODEL_URL}/train`, { features });
+
+    await prisma.trainingRun.update({
+      where: { id: run.id },
+      data: {
+        status: 'COMPLETED',
+        finishedAt: new Date(),
+        loss: toNum(trainingResult?.loss),
+        accuracy: toNum(trainingResult?.accuracy),
+        notes: `Treinamento concluído com ${features.length} exemplos.`,
+      }
+    });
+
+    logger.info('[AutoTrainer] Ciclo de treinamento concluído com sucesso.', trainingResult);
+
+  } catch (error: any) {
+    logger.error('[AutoTrainer] Erro durante o ciclo de treinamento', { error: error?.message });
+    currentStatus = "error";
+  } finally {
+    lastRun = new Date();
+    if (isRunning) currentStatus = "idle";
   }
-  return out;
 }
 
-export function atr(candles: { high: number, low: number, close: number }[], period: number): number[] {
-  if (candles.length < 2) return [];
 
-  const trueRanges: number[] = [];
-  for (let i = 1; i < candles.length; i++) {
-    const high = candles[i].high;
-    const low = candles[i].low;
-    const prevClose = candles[i - 1].close;
-    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
-    trueRanges.push(tr);
+// Funções de controle do worker
+export const startAutoTrainer = () => {
+  if (isRunning) return { ok: false, message: 'AutoTrainer já está em execução.' };
+
+  isRunning = true;
+  currentStatus = "starting";
+  logger.info('[AutoTrainer] Serviço de Auto-Treinamento iniciado.');
+
+  // Roda a cada 1 hora, por exemplo. Ajuste conforme necessário.
+  const intervalMinutes = 60;
+  runTrainingCycle(); // Roda imediatamente ao iniciar
+  intervalId = setInterval(runTrainingCycle, intervalMinutes * 60 * 1000);
+
+  return { ok: true, message: 'AutoTrainer iniciado.' };
+};
+
+export const stopAutoTrainer = () => {
+  if (!isRunning) return { ok: false, message: 'AutoTrainer não está em execução.' };
+
+  isRunning = false;
+  currentStatus = "stopped";
+  if (intervalId) {
+    clearInterval(intervalId);
+    intervalId = null;
   }
+  logger.info('[AutoTrainer] Serviço de Auto-Treinamento parado.');
+  return { ok: true, message: 'AutoTrainer parado.' };
+};
 
-  // Simple Moving Average for the first ATR value
-  let atrValues: number[] = [trueRanges.slice(0, period - 1).reduce((sum, val) => sum + val, 0) / (period - 1)];
-
-  for (let i = period - 1; i < trueRanges.length; i++) {
-    const prevAtr = atrValues[atrValues.length - 1];
-    const currentAtr = (prevAtr * (period - 1) + trueRanges[i]) / period;
-    atrValues.push(currentAtr);
-  }
-
-  // Pad the start with nulls to match candle array length
-  const padding = Array(candles.length - atrValues.length).fill(atrValues[0]);
-  return [...padding, ...atrValues];
-}
+export const statusAutoTrainer = () => {
+  return {
+    running: isRunning,
+    status: currentStatus,
+    lastRun: lastRun?.toISOString() ?? null,
+  };
+};

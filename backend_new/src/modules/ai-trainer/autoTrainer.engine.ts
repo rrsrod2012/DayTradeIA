@@ -2,7 +2,7 @@ import fetch from 'node-fetch';
 import { prisma } from '../../core/prisma';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 import { logger } from '../../core/logger';
-import { ema, ADX } from '../strategy/lib/indicators';
+import { ema, ADX } from '../strategy/indicators';
 
 // Variáveis de estado para controlar o worker
 let isRunning = false;
@@ -41,7 +41,7 @@ async function runTrainingCycle() {
     if (!isRunning) return;
     currentStatus = "running";
     logger.info('[AutoTrainer] Iniciando ciclo de treinamento...');
-    
+
     const MICRO_MODEL_URL = process.env.MICRO_MODEL_URL || "";
     if (!MICRO_MODEL_URL) {
         logger.warn('[AutoTrainer] MICRO_MODEL_URL não configurada. Ciclo de treinamento pulado.');
@@ -67,7 +67,7 @@ async function runTrainingCycle() {
             ema9: ema(closes.slice(0, i + 1), 9).pop(),
             ema21: ema(closes.slice(0, i + 1), 21).pop(),
         }));
-        
+
         const run = await prisma.trainingRun.create({
             data: { status: 'STARTED', symbol, timeframe }
         });
@@ -101,7 +101,7 @@ async function runTrainingCycle() {
 // Funções de controle do worker
 export const startAutoTrainer = () => {
     if (isRunning) return { ok: false, message: 'AutoTrainer já está em execução.' };
-    
+
     isRunning = true;
     currentStatus = "starting";
     logger.info('[AutoTrainer] Serviço de Auto-Treinamento iniciado.');
@@ -110,7 +110,7 @@ export const startAutoTrainer = () => {
     const intervalMinutes = 60;
     runTrainingCycle(); // Roda imediatamente ao iniciar
     intervalId = setInterval(runTrainingCycle, intervalMinutes * 60 * 1000);
-    
+
     return { ok: true, message: 'AutoTrainer iniciado.' };
 };
 
