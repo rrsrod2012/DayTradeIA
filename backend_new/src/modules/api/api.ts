@@ -1,50 +1,44 @@
 import { Express, Request, Response } from 'express';
 import { prisma } from '../../core/prisma';
-import { initTradesRoutes } from './tradesRoutes';
+import { tradesRoutes } from './tradesRoutes';
+import { signalsRoutes } from './signalsRoutes';
+import { backtestRoutes } from './backtestRoutes';
+import { notifyRoutes } from './notifyRoutes';
+import { adminRoutes } from './adminRoutes'; // Importa as novas rotas
+import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
+import { logger } from '../../core/logger';
 
 export const initApi = (app: Express) => {
-  // Inicializa as rotas específicas para trades
-  initTradesRoutes(app);
-
-  // Rota para buscar sinais confirmados
-  app.get('/api/signals/confirmed', async (req: Request, res: Response) => {
-    const { symbol, timeframe, from, to } = req.query;
-    
-    // Adicionar lógica de busca de sinais confirmados do banco de dados aqui
-    // similar à que existia no seu `routesAdmin.ts` original.
-    
-    res.json({ message: 'Endpoint de Sinais Confirmados - A ser implementado', query: req.query });
-  });
-
-  // Rota para buscar sinais projetados (agora pode ser integrada com o StrategyEngine)
-  app.get('/api/signals/projected', async (req: Request, res: Response) => {
-    // Adicionar lógica de busca de sinais projetados aqui
-    // Pode chamar uma função que simula a estratégia com os parâmetros recebidos
-    
-    res.json({ message: 'Endpoint de Sinais Projetados - A ser implementado', query: req.query });
-  });
+  // Inicializa as rotas específicas
+  app.use('/api', tradesRoutes);
+  app.use('/api', signalsRoutes);
+  app.use('/api', backtestRoutes);
+  app.use('/api', notifyRoutes);
+  app.use('/api', adminRoutes); // Registra as novas rotas de administração
   
   // Rota para buscar candles para o gráfico
   app.get('/api/candles', async (req: Request, res: Response) => {
-    const { symbol, timeframe } = req.query;
-    if (!symbol || !timeframe) {
-        return res.status(400).json({ error: 'Parâmetros symbol e timeframe são obrigatórios.'});
+    try {
+        const { symbol, timeframe, from, to, limit } = req.query;
+        if (!symbol || !timeframe) {
+            return res.status(400).json({ error: 'Parâmetros symbol e timeframe são obrigatórios.'});
+        }
+
+        const range = from || to ? { 
+            gte: from ? new Date(String(from)) : undefined, 
+            lte: to ? new Date(String(to)) : undefined 
+        } : undefined;
+
+        const candles = await loadCandlesAnyTF(
+            String(symbol), 
+            String(timeframe), 
+            { ...range, limit: limit ? Number(limit) : undefined }
+        );
+
+        res.json(candles);
+    } catch (err: any) {
+        logger.error("[/candles] erro", { message: err?.message });
+        res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
-
-    const instrument = await prisma.instrument.findUnique({ where: { symbol: String(symbol) }});
-    if (!instrument) {
-        return res.status(404).json({ error: 'Instrumento não encontrado.'});
-    }
-
-    const candles = await prisma.candle.findMany({
-        where: {
-            instrumentId: instrument.id,
-            timeframe: String(timeframe)
-        },
-        orderBy: { time: 'asc' },
-        take: 1000 // Limite para evitar sobrecarga, pode ser ajustado
-    });
-
-    res.json(candles);
   });
 };

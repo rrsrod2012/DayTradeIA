@@ -10,6 +10,7 @@ import { initStrategyEngine } from './modules/strategy/StrategyEngine';
 import { initExecutionEngine } from './modules/execution/ExecutionEngine';
 import { initNotificationService } from './modules/notifications/NotificationService';
 import { initWebSocket } from './core/ws';
+import { initAiTrainer } from './modules/ai-trainer'; // Importa o inicializador
 
 // Carrega variáveis de ambiente do .env
 dotenv.config();
@@ -31,6 +32,7 @@ const main = async () => {
   initExecutionEngine();
   initNotificationService();
   initWebSocket(server);
+  initAiTrainer(); // Inicializa o módulo de IA
 
   // Rota de Health Check
   app.get('/health', (_req, res) => {
@@ -39,7 +41,7 @@ const main = async () => {
 
   server.listen(PORT, () => {
     logger.info(`🚀 Servidor principal rodando na porta ${PORT}`);
-    logger.info('✅ Módulos inicializados: API, Broker, CSVWatcher, Strategy, Execution, Notifications, WebSocket');
+    logger.info('✅ Módulos inicializados: API, Broker, CSVWatcher, Strategy, Execution, Notifications, WebSocket, AiTrainer');
   });
 };
 
