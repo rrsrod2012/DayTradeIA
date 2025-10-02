@@ -1,3 +1,6 @@
+// ===============================
+// FILE: frontend/src/components/ImportProgress.tsx
+// ===============================
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ProgressBar, Alert, Badge, Card } from "react-bootstrap";
 
@@ -8,7 +11,7 @@ import { ProgressBar, Alert, Badge, Card } from "react-bootstrap";
  * - Agrega progresso por arquivo
  * - Exibe status da conexão WS e um mini-log
  * - Dispara "daytrade:data-invalidate" no término da importação,
- *   e repassa qualquer "data:invalidate" que vier do backend.
+ * e repassa qualquer "data:invalidate" que vier do backend.
  * - HOTFIX: se ninguém tratar o evento em ~800ms, força um reload da página (uma vez).
  */
 
@@ -43,17 +46,13 @@ type FileProgress = {
   error?: string;
 };
 
+// <<<<<<< FUNÇÃO DE URL DO WEBSOCKET CORRIGIDA >>>>>>>>
 function getWSUrl(): string {
-  const env: any = (import.meta as any).env || {};
-  const explicit = env.VITE_WS_URL as string | undefined;
-  if (explicit && explicit.trim()) return explicit.trim();
-
-  const apiBase = (env.VITE_API_BASE as string | undefined)?.trim() || "";
-  const base =
-    apiBase !== ""
-      ? apiBase.replace(/^http/i, "ws")
-      : window.location.origin.replace(/^http/i, "ws");
-  return base.replace(/\/?$/, "") + "/stream";
+  // Constrói a URL do WebSocket de forma que o proxy do Vite possa interceptá-la.
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  // Usa o mesmo host do site, e o caminho /stream será redirecionado pelo proxy.
+  const host = window.location.host;
+  return `${protocol}//${host}/stream`;
 }
 
 // Heurística para extrair symbol/timeframe do nome do arquivo (fallback)

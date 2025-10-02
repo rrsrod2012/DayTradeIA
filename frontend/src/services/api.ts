@@ -1,13 +1,16 @@
+// ===============================
+// FILE: frontend/src/services/api.ts
+// ===============================
 // Frontend API client — daytrade-ia
 // frontend/src/services/api.ts
 
-// import axios from "axios"; // (removido — padronizamos no jsonFetch)
-
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3002";
+// A URL base agora é desnecessária, pois o proxy cuidará do redirecionamento.
+// const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3002";
 
 // Comparação detalhada: Simulado vs Real
 export async function getBrokerComparison(tradeId: number) {
-  return jsonFetchBase<any>(API_BASE, `/admin/broker/compare-detailed?tradeId=${tradeId}`, {
+  // A chamada agora usa um caminho relativo
+  return jsonFetch<any>(`/admin/broker/compare-detailed?tradeId=${tradeId}`, {
     method: "GET",
   });
 }
@@ -147,14 +150,9 @@ export type BacktestDTO = {
 };
 
 /* ===============================
-   Bases/URLs
+   Bases/URLs - REMOVIDAS
    =============================== */
-const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE ?? API_URL;  // <<< fallback corrigido
-const API_BASE = String(RAW_API_BASE || "").replace(/\/$/, "");
-const RAW_EXEC_BASE = (import.meta as any).env?.VITE_EXEC_BASE ?? API_BASE;
-const EXEC_BASE = String(RAW_EXEC_BASE || "").replace(/\/$/, "");
-
-const ML_BASE = String(((import.meta as any).env?.VITE_ML_URL ?? "") || "").replace(/\/$/, "");
+// const API_BASE, EXEC_BASE, ML_BASE foram removidos para forçar o uso de caminhos relativos via proxy.
 
 /** --------- Helpers --------- */
 function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
@@ -202,19 +200,16 @@ function ymdLocalFromISO(iso?: string): string | null {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-async function jsonFetchBase<T>(
-  base: string,
-  url: string,
+// <<<<<<< FUNÇÃO DE FETCH CORRIGIDA >>>>>>>>
+async function jsonFetch<T>(
+  url: string, // URL agora é sempre um caminho relativo, ex: /api/trades
   init?: RequestInit
 ): Promise<T> {
-  const fullUrl =
-    (base || window.location.origin.replace(/\/$/, "")) +
-    (url.startsWith("/") ? url : `/${url}`);
-
-  const resp = await fetch(fullUrl, {
+  // A URL completa é montada pelo navegador, e o proxy do Vite irá interceptá-la
+  const resp = await fetch(url, {
     headers: { "content-type": "application/json", ...(init?.headers || {}) },
     credentials: "omit",
-    mode: "cors",
+    mode: "cors", // 'cors' é necessário para requisições entre portas diferentes (mesmo com proxy)
     cache: "no-cache",
     ...init,
   });
@@ -231,20 +226,16 @@ async function jsonFetchBase<T>(
     const err: any = new Error(msg);
     (err as any).response = data ?? txt;
     (err as any).status = resp.status;
-    (err as any).urlTried = fullUrl;
+    (err as any).urlTried = url;
     throw err;
   }
   if (process.env.NODE_ENV !== "production") {
     // eslint-disable-next-line no-console
-    console.debug("[api] ok", { url: fullUrl, init });
+    console.debug("[api] ok", { url: url, init });
   }
   return data as T;
 }
 
-/** Usa API_BASE por padrão */
-async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  return jsonFetchBase<T>(API_BASE, url, init);
-}
 
 export type { ProjectedSignalsParams };
 
@@ -277,8 +268,14 @@ export async function saveRuntimeConfig(patch: RuntimeConfigPayload): Promise<{ 
 }
 
 export async function getAiNodeConfig(): Promise<{ ok?: boolean; config?: RuntimeConfigPayload }> {
+  // Esta chamada para outro serviço precisaria de uma configuração de proxy separada se não estiver no mesmo backend
+  // Por enquanto, vamos assumir que não é usada ou que o ML_BASE está configurado corretamente no ambiente
+  const ML_BASE = String(((import.meta as any).env?.VITE_ML_URL ?? "") || "").replace(/\/$/, "");
   if (!ML_BASE) return { ok: false, config: undefined };
-  return jsonFetchBase<{ ok?: boolean; config?: RuntimeConfigPayload }>(ML_BASE, "/config", { method: "GET" });
+
+  // A função jsonFetch não serve para chamadas a bases diferentes, então criamos uma fetch direta
+  const resp = await fetch(`${ML_BASE}/config`, { method: "GET" });
+  return resp.json();
 }
 
 /* =========================
@@ -478,82 +475,18 @@ export async function runBacktest(params: {
   vwapFilter?: boolean; bbEnabled?: boolean; bbPeriod?: number; bbK?: number; candlePatterns?: string;
   slPoints?: number; tpPoints?: number; tpViaRR?: boolean;
 }): Promise<BacktestDTO> {
-  const body = JSON.stringify(params);
-
-  // helpers
-  const post = (base: string, path: string) =>
-    jsonFetchBase<any>(base, path, { method: "POST", body });
-  const getQ = (base: string, path: string) => {
-    const q = new URLSearchParams();
-    q.set("symbol", params.symbol.toUpperCase());
-    q.set("timeframe", params.timeframe.toUpperCase());
-    if (params.from) q.set("from", params.from);
-    if (params.to) q.set("to", params.to);
-    // custos / limites
-    if (params.pointValue != null) q.set("pointValue", String(params.pointValue));
-    if (params.costPts != null) q.set("costPts", String(params.costPts));
-    if (params.slippagePts != null) q.set("slippagePts", String(params.slippagePts));
-    if (params.lossCap != null) q.set("lossCap", String(params.lossCap));
-    if (params.maxConsecLosses != null) q.set("maxConsecLosses", String(params.maxConsecLosses));
-    // política
-    if (params.rr != null) q.set("rr", String(params.rr));
-    if (params.kSL != null) q.set("kSL", String(params.kSL));
-    if (params.kTrail != null) q.set("kTrail", String(params.kTrail));
-    if (params.breakEvenAtR != null) q.set("breakEvenAtR", String(params.breakEvenAtR));
-    if (params.beOffsetR != null) q.set("beOffsetR", String(params.beOffsetR));
-    if (params.breakEvenAtPts != null) q.set("breakEvenAtPts", String(params.breakEvenAtPts));
-    if (params.beOffsetPts != null) q.set("beOffsetPts", String(params.beOffsetPts));
-    if (params.timeStopBars != null) q.set("timeStopBars", String(params.timeStopBars));
-    if (params.horizonBars != null) q.set("horizonBars", String(params.horizonBars));
-    // filtros/IA
-    if (params.evalWindow != null) q.set("evalWindow", String(params.evalWindow));
-    if (params.regime != null) q.set("regime", String(params.regime));
-    if (params.tod != null) q.set("tod", String(params.tod));
-    if (params.conformal != null) q.set("conformal", String(params.conformal));
-    if (params.minProb != null) q.set("minProb", String(params.minProb));
-    if (params.minEV != null) q.set("minEV", String(params.minEV));
-    if (params.useMicroModel != null) q.set("useMicroModel", String(params.useMicroModel ? 1 : 0));
-    // indicadores/gates
-    if (params.vwapFilter != null) q.set("vwapFilter", String(params.vwapFilter ? 1 : 0));
-    if (params.bbEnabled != null) q.set("bbEnabled", String(params.bbEnabled ? 1 : 0));
-    if (params.bbPeriod != null) q.set("bbPeriod", String(params.bbPeriod));
-    if (params.bbK != null) q.set("bbK", String(params.bbK));
-    if (params.candlePatterns) q.set("candlePatterns", params.candlePatterns);
-    // stops explícitos
-    if (params.slPoints != null) q.set("slPoints", String(params.slPoints));
-    if (params.tpPoints != null) q.set("tpPoints", String(params.tpPoints));
-    if (params.tpViaRR != null) q.set("tpViaRR", String(params.tpViaRR ? 1 : 0));
-    return jsonFetchBase<any>(base, `${path}?${q.toString()}`, { method: "GET" });
-  };
-
-  // ORDEM DE TENTATIVA:
-  // 1) EXEC_BASE -> /api/backtest (preferido)
-  try { return normalizeBacktestPayload(await post(EXEC_BASE, "/api/backtest")); }
-  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] POST EXEC /api/backtest falhou", e?.status, e?.urlTried || ""); }
-
-  // 2) EXEC_BASE -> GET /api/backtest
-  try { return normalizeBacktestPayload(await getQ(EXEC_BASE, "/api/backtest")); }
-  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] GET EXEC /api/backtest falhou", e?.status, e?.urlTried || ""); }
-
-  // 3) EXEC_BASE -> /backtest (alias no broker)
-  try { return normalizeBacktestPayload(await post(EXEC_BASE, "/backtest")); }
-  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] POST EXEC /backtest falhou", e?.status, e?.urlTried || ""); }
-
-  try { return normalizeBacktestPayload(await getQ(EXEC_BASE, "/backtest")); }
-  catch (e: any) { if (process.env.NODE_ENV !== "production") console.warn("[api] GET EXEC /backtest falhou", e?.status, e?.urlTried || ""); }
-
-  // 4) API_BASE (fallback final — caso você também tenha montado lá)
-  try { return normalizeBacktestPayload(await post(API_BASE, "/api/backtest")); } catch { }
-  try { return normalizeBacktestPayload(await getQ(API_BASE, "/api/backtest")); } catch { }
-  try { return normalizeBacktestPayload(await post(API_BASE, "/backtest")); } catch { }
-  return normalizeBacktestPayload(await getQ(API_BASE, "/backtest")); // joga última tentativa
+  const raw = await jsonFetch<any>('/api/backtest', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+  return normalizeBacktestPayload(raw);
 }
 
 /** (opcional) lista execuções de backtest salvas */
 export async function fetchBacktestRuns(limit = 100) {
   const q = new URLSearchParams();
   q.set("limit", String(limit));
-  return jsonFetchBase<any>(EXEC_BASE, `/api/backtest/runs?${q.toString()}`, { method: "GET" });
+  return jsonFetch<any>(`/api/backtest/runs?${q.toString()}`, { method: "GET" });
 }
 
 /** ===========================
@@ -594,19 +527,19 @@ function mapSymbolForBroker(sym: string): string {
    ========================= */
 export async function execEnable(on?: boolean) {
   const qs = on === undefined ? "" : `?on=${on ? "1" : "0"}`;
-  return jsonFetchBase<any>(EXEC_BASE, `/enable${qs}`, { method: "GET" });
+  return jsonFetch<any>(`/enable${qs}`, { method: "GET" });
 }
 
 export async function execPeek(agentId: string): Promise<ExecPeekResponse> {
   const q = new URLSearchParams();
   q.set("agentId", agentId || "mt5-ea-1");
-  return jsonFetchBase<ExecPeekResponse>(EXEC_BASE, `/debug/peek?${q.toString()}`, {
+  return jsonFetch<ExecPeekResponse>(`/debug/peek?${q.toString()}`, {
     method: "GET",
   });
 }
 
 export async function execStats(): Promise<ExecStatsResponse> {
-  return jsonFetchBase<ExecStatsResponse>(EXEC_BASE, "/debug/stats", {
+  return jsonFetch<ExecStatsResponse>("/debug/stats", {
     method: "GET",
   });
 }
@@ -614,15 +547,14 @@ export async function execStats(): Promise<ExecStatsResponse> {
 export async function execHistory(agentId: string): Promise<ExecHistoryResponse> {
   const q = new URLSearchParams();
   q.set("agentId", agentId || "mt5-ea-1");
-  return jsonFetchBase<ExecHistoryResponse>(
-    EXEC_BASE,
+  return jsonFetch<ExecHistoryResponse>(
     `/debug/history?${q.toString()}`,
     { method: "GET" }
   );
 }
 
 export async function execPollNoop(agentId: string, max = 10) {
-  return jsonFetchBase<any>(EXEC_BASE, `/poll?noop=1`, {
+  return jsonFetch<any>(`/poll?noop=1`, {
     method: "POST",
     body: JSON.stringify({ agentId: agentId || "mt5-ea-1", max }),
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -688,7 +620,7 @@ export async function enqueueMT5Order(
       })),
     };
 
-    return jsonFetchBase<any>(EXEC_BASE, "/enqueue", {
+    return jsonFetch<any>("/enqueue", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -728,7 +660,7 @@ export async function enqueueMT5Order(
     tasks: [task],
   };
 
-  return jsonFetchBase<any>(EXEC_BASE, "/enqueue", {
+  return jsonFetch<any>("/enqueue", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(envelope),

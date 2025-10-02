@@ -1,11 +1,15 @@
+// ===============================
+// FILE: backend_new/src/modules/strategy/StrategyEngine.ts
+// ===============================
 import { eventBus, EVENTS } from '../../core/eventBus';
 import { logger } from '../../core/logger';
 import { prisma } from '../../core/prisma';
 import { ADX, ema } from './indicators';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 
+// Parâmetros padrão para a estratégia
 const STRATEGY_SYMBOL = process.env.STRATEGY_SYMBOL || 'WIN';
-const STRATEGY_TIMEFRAME = process.env.STRATEGY_TIMEFRAME || 'M5';
+const STRATEGY_TIMEFRAME = process.env.STRATEGY_TIMEFRAME || 'M5'; // Alterado para M5 para corresponder ao arquivo de dados
 
 const TF_MINUTES: Record<string, number> = {
   M1: 1, M5: 5, M15: 15, M30: 30, H1: 60,
@@ -58,20 +62,22 @@ async function upsertTfCandle(
 }
 
 const runStrategy = async (symbol: string, timeframe: string) => {
-  logger.info(`Executando estratégia para ${symbol} ${timeframe}...`);
+  logger.info(`[StrategyEngine] Executando estratégia para ${symbol} ${timeframe}...`);
   const tf = timeframe.toUpperCase() as TFKey;
 
   const instrument = await prisma.instrument.findUnique({ where: { symbol } });
   if (!instrument) {
-    logger.warn(`Instrumento ${symbol} não encontrado no banco.`);
+    logger.warn(`[StrategyEngine] Instrumento ${symbol} não encontrado no banco.`);
     return;
   }
 
   const candles = await loadCandlesAnyTF(instrument.symbol, tf);
   if (candles.length < 22) {
-    logger.warn(`Dados insuficientes para ${symbol} ${tf} (necessário no mínimo 22 candles).`);
+    logger.warn(`[StrategyEngine] Dados insuficientes para ${symbol} ${tf} (encontrados: ${candles.length}, necessário: 22).`);
     return;
   }
+
+  logger.info(`[StrategyEngine] ${candles.length} candles carregados para ${symbol} ${tf}. Calculando indicadores...`);
 
   const closes = candles.map((c) => c.close);
   const highs = candles.map((c) => c.high);
@@ -99,8 +105,8 @@ const runStrategy = async (symbol: string, timeframe: string) => {
   const tfMin = TF_MINUTES[tf];
 
   for (let i = 1; i < candles.length; i++) {
-    const prevDiff = e9[i - 1] - e21[i - 1];
-    const diff = e9[i] - e21[i];
+    const prevDiff = (e9[i - 1] ?? 0) - (e21[i - 1] ?? 0);
+    const diff = (e9[i] ?? 0) - (e21[i] ?? 0);
 
     let side: "BUY" | "SELL" | null = null;
     if (prevDiff <= 0 && diff > 0) side = "BUY";
@@ -136,12 +142,12 @@ const runStrategy = async (symbol: string, timeframe: string) => {
 
     const signal = await prisma.signal.upsert({
       where: { candleId_signalType_side: { candleId, signalType: "EMA_CROSS", side: side! } },
-      update: { score: Math.abs(diff) / (Math.abs(e21[i]) || 1), reason },
+      update: { score: Math.abs(diff) / (Math.abs(e21[i] || 1)), reason },
       create: {
         candleId,
         signalType: "EMA_CROSS",
         side: side!,
-        score: Math.abs(diff) / (Math.abs(e21[i]) || 1),
+        score: Math.abs(diff) / (Math.abs(e21[i] || 1)),
         reason,
       },
     });
@@ -158,7 +164,7 @@ const runStrategy = async (symbol: string, timeframe: string) => {
           entryPrice: candles[i].close,
         },
       });
-      logger.info(`🔥 NOVO TRADE ABERTO: ${side} para ${symbol} em ${candles[i].time.toISOString()}`);
+      logger.info(`[StrategyEngine] 🔥 NOVO TRADE ABERTO: ${side} para ${symbol} em ${candles[i].time.toISOString()}`);
     } else {
       const pnlPoints =
         lastSignalSide === "BUY"
@@ -173,7 +179,7 @@ const runStrategy = async (symbol: string, timeframe: string) => {
           pnlPoints,
         },
       });
-      logger.info(`✅ TRADE FECHADO: ${side} para ${symbol} em ${candles[i].time.toISOString()} com ${pnlPoints.toFixed(2)} pontos.`);
+      logger.info(`[StrategyEngine] ✅ TRADE FECHADO: ${side} para ${symbol} em ${candles[i].time.toISOString()} com ${pnlPoints.toFixed(2)} pontos.`);
       openTrade = null;
     }
 
@@ -182,16 +188,25 @@ const runStrategy = async (symbol: string, timeframe: string) => {
   }
 
   if (createdOrUpdated > 0) {
-    logger.info(`Estratégia finalizada. ${createdOrUpdated} sinais/trades processados para ${symbol} ${tf}.`);
+    logger.info(`[StrategyEngine] Estratégia finalizada. ${createdOrUpdated} sinais/trades processados para ${symbol} ${tf}.`);
   }
 };
 
 export const initStrategyEngine = () => {
+  // Ouve o evento de nova importação de dados
   eventBus.on(EVENTS.NEW_CANDLE_DATA, (data: { symbol: string, timeframe: string }) => {
+    logger.info(`[StrategyEngine] Evento NEW_CANDLE_DATA recebido para ${data.symbol} ${data.timeframe}. Disparando estratégia.`);
     runStrategy(data.symbol, data.timeframe);
   });
-  logger.info('✅ Motor de Estratégia inicializado e aguardando novos candles.');
 
-  // Executa uma vez no início para processar dados existentes
+  // Executa uma vez no início para processar dados que já possam existir
   runStrategy(STRATEGY_SYMBOL, STRATEGY_TIMEFRAME);
+
+  // <<< NOVO >>> Adiciona uma execução periódica a cada 5 minutos como garantia
+  setInterval(() => {
+    logger.info('[StrategyEngine] Execução periódica de garantia disparada.');
+    runStrategy(STRATEGY_SYMBOL, STRATEGY_TIMEFRAME);
+  }, 5 * 60 * 1000); // 5 minutos
+
+  logger.info('✅ Motor de Estratégia inicializado e aguardando eventos de novos candles.');
 };

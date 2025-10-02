@@ -1,66 +1,42 @@
-import { PrismaClient } from "@prisma/client";
-import { DateTime } from "luxon";
+// ===============================
+// FILE: backend_new/src/modules/data-import/lib/aggregation.ts
+// ===============================
+import { prisma } from '../../../core/prisma';
+import { Candle } from '@prisma/client';
 
-const prisma = new PrismaClient();
-
-const TF_MINUTES: Record<string, number> = {
-  M1: 1, M5: 5, M15: 15, M30: 30, H1: 60,
+const tfToMinutes = (tf: string): number => {
+  const s = tf.toUpperCase();
+  if (s.startsWith('M')) return parseInt(s.slice(1), 10) || 1;
+  if (s.startsWith('H')) return (parseInt(s.slice(1), 10) || 1) * 60;
+  return 1;
 };
 
-type Candle = {
-  time: Date;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
-
-function aggregateCandles(m1Candles: Candle[], targetTf: string): Candle[] {
-  const targetMin = TF_MINUTES[targetTf];
-  if (!targetMin || targetMin === 1) return m1Candles;
-
-  const out: Candle[] = [];
-  if (m1Candles.length === 0) return out;
-
-  let bucketTime = DateTime.fromJSDate(m1Candles[0].time, { zone: 'utc' }).startOf('minute');
-  bucketTime = bucketTime.set({ minute: Math.floor(bucketTime.minute / targetMin) * targetMin });
-
-  let open = m1Candles[0].open;
-  let high = -Infinity;
-  let low = Infinity;
-  let close = m1Candles[0].close;
-  let volume = 0;
-
-  for (const c of m1Candles) {
-    const cTime = DateTime.fromJSDate(c.time, { zone: 'utc' });
-    const cBucketTime = cTime.set({ minute: Math.floor(cTime.minute / targetMin) * targetMin });
-
-    if (cBucketTime.toMillis() !== bucketTime.toMillis()) {
-      out.push({ time: bucketTime.toJSDate(), open, high, low, close, volume });
-      bucketTime = cBucketTime;
-      open = c.open;
-      high = -Infinity;
-      low = Infinity;
-      volume = 0;
-    }
-
-    high = Math.max(high, c.high);
-    low = Math.min(low, c.low);
-    close = c.close;
-    volume += c.volume ?? 0;
-  }
-
-  out.push({ time: bucketTime.toJSDate(), open, high, low, close, volume });
-  return out;
-}
-
+// Esta função é o coração do agregador.
 export async function loadCandlesAnyTF(
   symbol: string,
   timeframe: string,
-  range?: { gte?: Date; lte?: Date; limit?: number }
+  range?: { gte?: Date, lte?: Date, limit?: number }
 ): Promise<Candle[]> {
   const tfUpper = timeframe.toUpperCase();
+
+  // Se o timeframe pedido for M1, busca diretamente no banco.
+  if (tfUpper === 'M1') {
+    const instrument = await prisma.instrument.findUnique({ where: { symbol } });
+    if (!instrument) return [];
+
+    return prisma.candle.findMany({
+      where: {
+        instrumentId: instrument.id,
+        timeframe: 'M1',
+        ...(range?.gte && { time: { gte: range.gte } }),
+        ...(range?.lte && { time: { lte: range.lte } }),
+      },
+      orderBy: { time: 'asc' },
+      take: range?.limit,
+    });
+  }
+
+  // Se for outro timeframe, busca a base M1 para agregar.
   const instrument = await prisma.instrument.findUnique({ where: { symbol } });
   if (!instrument) return [];
 
@@ -68,14 +44,40 @@ export async function loadCandlesAnyTF(
     where: {
       instrumentId: instrument.id,
       timeframe: 'M1',
-      ...(range?.gte || range?.lte ? { time: { gte: range.gte, lte: range.lte } } : {}),
+      ...(range?.gte && { time: { gte: range.gte } }),
+      ...(range?.lte && { time: { lte: range.lte } }),
     },
     orderBy: { time: 'asc' },
-    take: range?.limit ? range.limit * (TF_MINUTES[tfUpper] || 5) : undefined, // busca mais M1 para garantir a agregação
   });
 
-  if (TF_MINUTES[tfUpper] > 1) {
-    return aggregateCandles(m1Candles, tfUpper);
+  if (m1Candles.length === 0) return [];
+
+  const targetMinutes = tfToMinutes(tfUpper);
+  const aggregated = new Map<number, Partial<Candle>>();
+
+  for (const c of m1Candles) {
+    const bucketTime = Math.floor(c.time.getTime() / (targetMinutes * 60 * 1000)) * (targetMinutes * 60 * 1000);
+
+    if (!aggregated.has(bucketTime)) {
+      aggregated.set(bucketTime, {
+        instrumentId: c.instrumentId,
+        timeframe: tfUpper,
+        time: new Date(bucketTime),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+      });
+    } else {
+      const current = aggregated.get(bucketTime)!;
+      current.high = Math.max(current.high!, c.high);
+      current.low = Math.min(current.low!, c.low);
+      current.close = c.close;
+      current.volume = (current.volume || 0) + (c.volume || 0);
+    }
   }
-  return m1Candles;
+
+  const result = Array.from(aggregated.values()) as Candle[];
+  return range?.limit ? result.slice(-range.limit) : result;
 }
