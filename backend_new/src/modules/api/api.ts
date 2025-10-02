@@ -1,10 +1,17 @@
+// ===============================
+// FILE: backend_new/src/modules/api/api.ts
+// ===============================
 import { Express, Request, Response } from 'express';
 import { prisma } from '../../core/prisma';
 import { tradesRoutes } from './tradesRoutes';
 import { signalsRoutes } from './signalsRoutes';
+import { projectedSignalsRoutes } from './projectedSignalsRoutes';
 import { backtestRoutes } from './backtestRoutes';
 import { notifyRoutes } from './notifyRoutes';
-import { adminRoutes } from './adminRoutes'; // Importa as novas rotas
+import { adminRoutes } from './adminRoutes';
+import { orderLogsRoutes } from './orderLogsRoutes';
+import { brokerAdminRoutes } from './brokerAdminRoutes';
+import { runtimeConfigRoutes } from './runtimeConfigRoutes'; // <<< NOVA IMPORTAÇÃO
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 import { logger } from '../../core/logger';
 
@@ -12,9 +19,13 @@ export const initApi = (app: Express) => {
   // Inicializa as rotas específicas
   app.use('/api', tradesRoutes);
   app.use('/api', signalsRoutes);
+  app.use('/api', projectedSignalsRoutes);
   app.use('/api', backtestRoutes);
   app.use('/api', notifyRoutes);
-  app.use('/api', adminRoutes); // Registra as novas rotas de administração
+  app.use('/api', adminRoutes);
+  app.use('/api', orderLogsRoutes);
+  app.use('/', brokerAdminRoutes);
+  app.use('/', runtimeConfigRoutes); // <<< NOVO USO (Registrado na raiz para bater com /admin/runtime-config)
   
   // Rota para buscar candles para o gráfico
   app.get('/api/candles', async (req: Request, res: Response) => {
