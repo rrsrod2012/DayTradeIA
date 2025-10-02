@@ -880,7 +880,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       side,
       comment: `ui-test ${side} ${new Date().toISOString()}${slPtsToSend ? ` SL=${slPtsToSend}` : ""}${tpPtsToSend ? ` TP=${tpPtsToSend}` : ""}`,
       beAtPoints: breakEvenAtPts,
-      beOffsetPts: beOffsetPts,
+      beOffsetPoints: beOffsetPts,
       timeframe: null,
       time: null,
       price: 0,

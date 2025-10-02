@@ -8,8 +8,10 @@ import { parse } from 'csv-parse';
 import { prisma } from '../../core/prisma';
 import { logger } from '../../core/logger';
 import { eventBus, EVENTS } from '../../core/eventBus';
+import { DateTime } from 'luxon'; // <<< NOVA IMPORTAÇÃO
 
 const DATA_DIR = process.env.CSV_DIR || path.resolve(process.cwd(), 'dados');
+const CSV_TIMEZONE = 'America/Sao_Paulo'; // Fuso horário dos dados de origem
 
 const processFile = async (filePath: string) => {
   if (!fs.existsSync(filePath)) {
@@ -73,11 +75,17 @@ const processFile = async (filePath: string) => {
       const timeValue = rec.time;
       if (!timeValue) return null;
 
-      const time = new Date(timeValue.replace(/\./g, '-'));
-      if (isNaN(time.getTime())) {
+      // <<< CORREÇÃO DE FUSO HORÁRIO AQUI >>>
+      // Interpreta a string de tempo como sendo do fuso horário de São Paulo
+      const dt = DateTime.fromFormat(timeValue, 'yyyy.LL.dd HH:mm', { zone: CSV_TIMEZONE });
+
+      if (!dt.isValid) {
         logger.warn(`[CSV] Data inválida encontrada e ignorada: ${timeValue}`);
         return null;
       }
+
+      // Converte para um objeto Date nativo (que é sempre UTC)
+      const time = dt.toJSDate();
 
       const volumeValue = rec.volume || rec.tick_volume;
 
@@ -100,10 +108,9 @@ const processFile = async (filePath: string) => {
 
       let upsertedCount = 0;
       for (const candle of candleData) {
-        // <<< CORREÇÃO DA SINTAXE DO PRISMA UPSERT >>>
         await prisma.candle.upsert({
           where: {
-            instrument_time_tf_unique: { // Nome correto do índice
+            instrument_time_tf_unique: {
               instrumentId: candle.instrumentId,
               timeframe: candle.timeframe,
               time: candle.time,

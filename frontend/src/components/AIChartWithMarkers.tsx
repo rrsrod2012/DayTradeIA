@@ -1,59 +1,13 @@
-import React from "react";
+// ===============================
+// FILE: frontend/src/components/AIChartWithMarkers.tsx
+// ===============================
+import React, { useSyncExternalStore } from "react";
 import { createChart, IChartApi, UTCTimestamp } from "lightweight-charts";
 import { fetchCandles } from "../services/api";
+import { DateTime } from 'luxon'; // <<< IMPORTAÇÃO DO LUXON
 import * as AIStoreModule from "../store/ai";
 const useAIStore: any =
   (AIStoreModule as any).useAIStore ?? (AIStoreModule as any).default;
-
-const TZ = "America/Sao_Paulo";
-
-/* ---------- Formatadores de data/hora em BRT ---------- */
-const fmtDateShortBRT = new Intl.DateTimeFormat("pt-BR", {
-  timeZone: TZ,
-  year: "2-digit",
-  month: "2-digit",
-  day: "2-digit",
-});
-const fmtTimeBRT = new Intl.DateTimeFormat("pt-BR", {
-  timeZone: TZ,
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-});
-const fmtTimeNoSecBRT = new Intl.DateTimeFormat("pt-BR", {
-  timeZone: TZ,
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-});
-
-// usado nos tooltips de candle
-function timeFormatterBRT(time: any /* Time */): string {
-  if (typeof time === "number") {
-    const d = new Date(time * 1000);
-    return fmtDateShortBRT.format(d) + " " + fmtTimeBRT.format(d);
-  }
-  if (time && typeof time === "object" && "year" in time) {
-    const d = new Date(Date.UTC(time.year, time.month - 1, time.day));
-    return fmtDateShortBRT.format(d) + " 00:00:00";
-  }
-  return String(time ?? "");
-}
-
-// usado nos rótulos do tooltip custom e AGORA no eixo X
-function timeToLabelBRT(time: any /* Time */): string {
-  if (typeof time === "number") {
-    const d = new Date(time * 1000);
-    return fmtDateShortBRT.format(d) + " " + fmtTimeNoSecBRT.format(d); // dd/mm/aa HH:mm
-  }
-  if (time && typeof time === "object" && "year" in time) {
-    // BusinessDay
-    const d = new Date(Date.UTC(time.year, time.month - 1, time.day));
-    return fmtDateShortBRT.format(d); // dd/mm/aa
-  }
-  return String(time ?? "");
-}
 
 function isoToUtcTs(iso: string | undefined | null): UTCTimestamp | null {
   if (!iso) return null;
@@ -62,7 +16,8 @@ function isoToUtcTs(iso: string | undefined | null): UTCTimestamp | null {
   return Math.floor(t / 1000) as UTCTimestamp;
 }
 
-// ----- QS helpers (usar mesmos flags do painel) -----
+// ... (o resto das funções auxiliares como parseQS, tfToMinutes, etc., permanecem as mesmas) ...
+
 function parseQS() {
   const sp =
     typeof window !== "undefined"
@@ -124,7 +79,6 @@ function normSide(raw: any): "BUY" | "SELL" | "FLAT" {
   )
     return "BUY";
   if (s === "FLAT" || s === "NEUTRAL" || s === "0") return "FLAT";
-  // fallback: se não reconheceu, não elimina; assume BUY para não sumir
   return "BUY";
 }
 
@@ -147,8 +101,8 @@ type Marker = ReturnType<
   }
   : never;
 
+
 function AIChartWithMarkers() {
-  // Controles locais para alternar entriesOnly via URL e re-renderizar
   const [, __forceRerender] = React.useReducer((c) => c + 1, 0);
   const { entriesOnly, reEntryBars, syncWithTrades, nextOpenEntry } = parseQS();
   const setQS = React.useCallback(
@@ -190,7 +144,6 @@ function AIChartWithMarkers() {
   const seriesRef =
     React.useRef<ReturnType<IChartApi["addCandlestickSeries"]> | null>(null);
 
-  // Tempos existentes na série (em segundos UTC), em ordem asc
   const candleTimesRef = React.useRef<UTCTimestamp[]>([]);
 
   const projectedRaw = useAIStore((s) => s.projected);
@@ -216,15 +169,19 @@ function AIChartWithMarkers() {
       timeScale: {
         borderVisible: false,
         timeVisible: true,
-        secondsVisible: false,
-        // >>> AQUI: formata os rótulos do eixo X em BRT (São Paulo)
-        tickMarkFormatter: (time: any /* Time */) => timeToLabelBRT(time),
+        secondsVisible: true,
+        // <<< CORREÇÃO AQUI >>>
+        tickMarkFormatter: (time: UTCTimestamp) => {
+          return DateTime.fromSeconds(time).toFormat('HH:mm');
+        },
       },
       crosshair: { mode: 0 },
-      // crosshair/tooltip (não afeta eixo)
+      // <<< CORREÇÃO AQUI >>>
       localization: {
         locale: "pt-BR",
-        timeFormatter: (t: any) => timeFormatterBRT(t),
+        timeFormatter: (time: UTCTimestamp) => {
+          return DateTime.fromSeconds(time).toFormat('dd/LL/yy HH:mm:ss');
+        },
       },
     });
 
@@ -241,7 +198,6 @@ function AIChartWithMarkers() {
     chartRef.current = chart;
     seriesRef.current = series;
 
-    // resize
     const ro = new ResizeObserver(() => {
       const rect = el.getBoundingClientRect();
       chart.applyOptions({ width: Math.floor(rect.width) });
@@ -257,7 +213,6 @@ function AIChartWithMarkers() {
     };
   }, []);
 
-  // Carrega candles e garante ordenação por tempo
   React.useEffect(() => {
     (async () => {
       if (!params || !seriesRef.current) return;
@@ -301,10 +256,10 @@ function AIChartWithMarkers() {
             first,
             last,
             first_brt: first
-              ? fmtTimeBRT.format(new Date((first as number) * 1000))
+              ? DateTime.fromSeconds(first as number).toFormat('dd/LL/yy HH:mm:ss')
               : null,
             last_brt: last
-              ? fmtTimeBRT.format(new Date((last as number) * 1000))
+              ? DateTime.fromSeconds(last as number).toFormat('dd/LL/yy HH:mm:ss')
               : null,
           });
         }
@@ -315,18 +270,15 @@ function AIChartWithMarkers() {
     })();
   }, [params?.symbol, params?.timeframe, params?.from, params?.to]);
 
-  // Snap de um timestamp (seg UTC) ao candle mais próximo existente
   const snapToExistingBar = React.useCallback((tsRaw: UTCTimestamp | null) => {
     if (tsRaw == null) return null;
     const arr = candleTimesRef.current;
     if (!arr || arr.length === 0) return null;
 
-    // clamp a [first,last]
     const first = arr[0] as number;
     const last = arr[arr.length - 1] as number;
     const ts = Math.max(first, Math.min(last, tsRaw as number));
 
-    // busca binária: candle mais próximo
     let lo = 0,
       hi = arr.length - 1;
     while (lo <= hi) {
@@ -344,7 +296,6 @@ function AIChartWithMarkers() {
       : next;
   }, []);
 
-  // Aplica markers (Projetados + Confirmados) com clamp de futuro
   const [diag, setDiag] = React.useState<{
     srcBuy: number;
     srcSell: number;
@@ -365,7 +316,6 @@ function AIChartWithMarkers() {
     const projSrc = Array.isArray(projectedRaw) ? projectedRaw : [];
     const confSrc = Array.isArray(confirmedRaw) ? confirmedRaw : [];
 
-    // Aplica filtro "Só entradas" opcional (básico, sem sincronização de next-open no gráfico)
     let confSrcFiltered = confSrc;
     if (entriesOnly) {
       const tfMin = tfToMinutes(params?.timeframe);
@@ -403,10 +353,8 @@ function AIChartWithMarkers() {
       confSrcFiltered = out;
     }
 
-    // Contadores de origem (do store) — antes de qualquer transformação
     let srcBuy = 0, srcSell = 0;
 
-    // Limites temporais: agora (UTC) e extremos da série de candles
     const nowTs = Math.floor(Date.now() / 1000) as UTCTimestamp;
     const firstTs = candleTimesRef.current[0] ?? null;
     const lastTs =
@@ -420,7 +368,6 @@ function AIChartWithMarkers() {
       return true;
     };
 
-    // Projetados -> setas
     type Marker = any;
     const projMarkers: Marker[] = projSrc
       .map((s, idx) => {
@@ -442,15 +389,12 @@ function AIChartWithMarkers() {
           text: `PROJ ${isBuy ? "BUY" : "SELL"}${(s as any).note ? ` • ${(s as any).note}` : ""
             }`,
           size: 1,
-          // @ts-ignore
           __k: `p#${idx}`,
-          // @ts-ignore
           __isBuy: isBuy,
         } as any;
       })
       .filter(Boolean) as any;
 
-    // Confirmados -> bolinhas
     const confMarkers: Marker[] = confSrcFiltered
       .map((s, idx) => {
         const side = normSide((s as any).side);
@@ -469,15 +413,12 @@ function AIChartWithMarkers() {
           text: `CONF ${isBuy ? "BUY" : "SELL"}${(s as any).note ? ` • ${(s as any).note}` : ""
             }`,
           size: 1,
-          // @ts-ignore
           __k: `c#${idx}`,
-          // @ts-ignore
           __isBuy: isBuy,
         } as any;
       })
       .filter(Boolean) as any;
 
-    // Junta e ordena (asc); em empate, circles (confirmados) antes de setas (projetados)
     const all: (Marker & any)[] = [...projMarkers, ...confMarkers];
     all.sort((a, b) => {
       const dt = (a.time as number) - (b.time as number);
@@ -492,20 +433,16 @@ function AIChartWithMarkers() {
       return 0;
     });
 
-    // Limpa campos internos
     const clean = all.map(({ __k, __isBuy, ...rest }) => rest);
 
-    // Aplica
     try {
       seriesRef.current.setMarkers(clean as any);
     } catch (err) {
       const onlyGood = clean.filter((m) => Number.isFinite(m.time as any));
       onlyGood.sort((a, b) => (a.time as number) - (b.time as number));
-      // fallback em caso de out-of-range
       seriesRef.current.setMarkers(onlyGood as any);
     }
 
-    // Diagnóstico (considerando projetados para manter compat com seu log atual)
     const plottedBuy = projMarkers.filter(
       (m: any) => m.__isBuy === true
     ).length;

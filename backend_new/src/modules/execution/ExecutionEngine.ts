@@ -14,7 +14,6 @@ const handleSignal = async (data: { signal: Signal, candle: Candle, instrument: 
   const { signal, candle, instrument } = data;
 
   if (isPositionOpen && signal.side !== 'CLOSE') {
-    // Se o sinal for na direção oposta, tratamos como um fechamento e reabrimos.
     if ((signal.side === 'BUY' && isPositionOpen) || (signal.side === 'SELL' && isPositionOpen)) {
       logger.info(`Sinal oposto (${signal.side}) recebido com posição aberta. Fechando e reabrindo.`);
     } else {

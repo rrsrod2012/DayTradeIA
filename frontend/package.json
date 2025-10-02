@@ -12,6 +12,7 @@
     "axios": "^1.7.3",
     "bootstrap": "^5.3.3",
     "lightweight-charts": "^4.2.3",
+    "luxon": "^3.7.2",
     "react": "^18.3.1",
     "react-bootstrap": "^2.10.4",
     "react-dom": "^18.3.1",
@@ -19,6 +20,7 @@
     "zustand": "^5.0.8"
   },
   "devDependencies": {
+    "@types/luxon": "^3.7.1",
     "@types/react": "^18.3.4",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.7.0",

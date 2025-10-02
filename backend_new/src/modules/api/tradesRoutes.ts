@@ -4,7 +4,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../core/prisma';
 import { logger } from '../../core/logger';
-import { toUtcRange } from './api.helpers'; // Usando o helper centralizado
+import { normalizeApiDateRange } from './api.helpers'; // <<< USANDO O NOVO HELPER
 
 const router = Router();
 
@@ -21,16 +21,14 @@ router.get('/trades', async (req: Request, res: Response) => {
             where.timeframe = String(timeframe).toUpperCase().trim();
         }
 
-        const range = toUtcRange(from, to);
-        // <<< CORREÇÃO DA LÓGICA DE FILTRO DE DATA >>>
-        if (range?.gte || range?.lte) {
+        // <<< CORREÇÃO DA LÓGICA DE DATAS AQUI >>>
+        // A nova função trata corretamente os fusos horários e os intervalos de dia completo.
+        const range = normalizeApiDateRange(from, to);
+        if (range) {
             where.entrySignal = {
-                is: { // A condição deve estar dentro de 'is' para relations 1-para-muitos
+                is: {
                     candle: {
-                        time: {
-                            ...(range.gte && { gte: range.gte }),
-                            ...(range.lte && { lte: range.lte }),
-                        }
+                        time: range
                     }
                 }
             };
@@ -40,7 +38,7 @@ router.get('/trades', async (req: Request, res: Response) => {
             where,
             include: {
                 instrument: true,
-                entrySignal: { include: { candle: true } }, // Inclui o candle para obter o tempo
+                entrySignal: { include: { candle: true } },
                 exitSignal: { include: { candle: true } },
             },
             orderBy: { id: 'desc' },
@@ -63,8 +61,7 @@ router.get('/trades', async (req: Request, res: Response) => {
             entryTime: t.entrySignal?.candle?.time?.toISOString() ?? null,
             exitTime: t.exitSignal?.candle?.time?.toISOString() ?? null,
         }));
-        
-        // Retornamos o formato esperado pelo frontend, que é um array diretamente
+
         res.json(formattedTrades);
 
     } catch (e: any) {

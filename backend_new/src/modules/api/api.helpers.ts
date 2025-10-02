@@ -3,37 +3,21 @@
 // ===============================
 import { DateTime } from 'luxon';
 
-const ZONE = "America/Sao_Paulo";
+const ZONE_BR = "America/Sao_Paulo";
 
 /**
  * Converte um intervalo de datas (strings 'from' e 'to') para um objeto de data UTC.
- * Suporta formatos ISO e BR (dd/MM/yyyy).
+ * Esta versão é mais simples e foi substituída pela função mais robusta abaixo.
  */
 export function toUtcRange(from?: string, to?: string) {
+  // ... (código anterior mantido por compatibilidade, mas não será mais usado pelas rotas principais)
   const parse = (s: string, endOfDay = false) => {
     if (!s) return null;
-    let dt: DateTime;
-    // ISO?
-    if (/^\d{4}-\d{2}-\d{2}(T.*)?$/.test(s))
-      dt = DateTime.fromISO(s, { zone: "utc" });
-    // BR (dd/MM/yyyy [HH:mm[:ss]])
-    else if (/^\d{2}\/\d{2}\/\d{4}(\s+\d{2}:\d{2}(:\d{2})?)?$/.test(s)) {
-      const parts = s.split(/[\s/:]/).map(p => parseInt(p, 10));
-      const isoStr = `${parts[2]}-${String(parts[1]).padStart(2, '0')}-${String(parts[0]).padStart(2, '0')}T${String(parts[3] || 0).padStart(2, '0')}:${String(parts[4] || 0).padStart(2, '0')}:${String(parts[5] || 0).padStart(2, '0')}Z`;
-      dt = DateTime.fromISO(isoStr, { zone: "utc" });
-    } else {
-      // Tenta como ISO flexível
-      dt = DateTime.fromISO(s, { zone: "utc" });
-    }
-    if (!dt.isValid) {
-      const d = new Date(s);
-      if (isNaN(d.getTime())) return null;
-      dt = DateTime.fromJSDate(d).toUTC();
-    }
-    if (endOfDay) {
-      dt = dt.endOf('day');
-    }
-    return dt.toJSDate();
+    let dt = DateTime.fromISO(s, { zone: ZONE_BR });
+    if (!dt.isValid) dt = DateTime.fromSQL(s, { zone: ZONE_BR });
+    if (!dt.isValid) return null;
+
+    return endOfDay ? dt.endOf('day').toUTC().toJSDate() : dt.startOf('day').toUTC().toJSDate();
   };
   if (!from && !to) return undefined;
   const out: { gte?: Date; lte?: Date } = {};
@@ -43,10 +27,47 @@ export function toUtcRange(from?: string, to?: string) {
 }
 
 /**
+ * <<< NOVA FUNÇÃO ROBUSTA >>>
+ * Normaliza um intervalo de datas vindo da API, interpretando as datas no fuso horário de São Paulo
+ * e garantindo que o intervalo cubra os dias completos.
+ * @param fromRaw A data de início (string).
+ * @param toRaw A data de fim (string).
+ * @returns Um objeto com datas { gte, lte } em UTC, ou undefined se nenhuma data for fornecida.
+ */
+export function normalizeApiDateRange(fromRaw: any, toRaw: any): { gte?: Date; lte?: Date } | undefined {
+  const parseDate = (raw: any) => {
+    if (!raw) return null;
+    // Tenta interpretar a data como ISO (YYYY-MM-DD), que é o que o input[type=date] envia
+    const dt = DateTime.fromISO(String(raw), { zone: ZONE_BR });
+    return dt.isValid ? dt : null;
+  };
+
+  const fromDate = parseDate(fromRaw);
+  const toDate = parseDate(toRaw);
+
+  if (!fromDate && !toDate) {
+    return undefined;
+  }
+
+  // Se apenas uma data for fornecida, usamos a mesma para início e fim
+  const start = fromDate || toDate;
+  const end = toDate || fromDate;
+
+  if (!start || !end) return undefined;
+
+  // Garante que o intervalo cubra desde o início do primeiro dia até o fim do último dia
+  const gte = start.startOf('day').toUTC().toJSDate();
+  const lte = end.endOf('day').toUTC().toJSDate();
+
+  return { gte, lte };
+}
+
+
+/**
  * Converte um objeto Date para uma string de data local no formato 'yyyy-LL-dd HH:mm:ss'.
  */
 export const toLocalDateStr = (d: Date) =>
-  DateTime.fromJSDate(d).setZone(ZONE).toFormat("yyyy-LL-dd HH:mm:ss");
+  DateTime.fromJSDate(d).setZone(ZONE_BR).toFormat("yyyy-LL-dd HH:mm:ss");
 
 /**
  * Converte um timeframe (ex: 'M5', 'H1') para o equivalente em minutos.

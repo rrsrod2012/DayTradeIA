@@ -207,18 +207,16 @@ async function rescoreWithML(
   logger.info(`[AI] A tentar contactar o serviço de IA em: ${base}`);
 
   try {
-    // A lógica de extração de features permanece a mesma
-    const times = new Set(items.map((i) => i.time));
-    const closes = candles.map((c) => c.close);
-    const e9 = EMA(closes, 9);
-    const e21 = EMA(closes, 21);
-    const highs = candles.map((c) => c.high);
-    const lows = candles.map((c) => c.low);
-    const atr = ATR(highs, lows, closes, 14);
-
     const itemsWithFeatures = items.map(item => {
       const index = candles.findIndex(c => c.time.toISOString() === item.time);
       if (index < 1) return null;
+
+      const closes = candles.map(c => c.close);
+      const highs = candles.map(c => c.high);
+      const lows = candles.map(c => c.low);
+      const e9 = EMA(closes, 9);
+      const e21 = EMA(closes, 21);
+      const atr = ATR(highs, lows, closes, 14);
 
       const _atr = (atr[index] ?? atr[index - 1] ?? 1) as number;
       const features = {
@@ -237,7 +235,6 @@ async function rescoreWithML(
 
     logger.info(`[AI] A enviar ${itemsWithFeatures.length} candidatos para ${base}/predict`);
 
-    // <<< CORREÇÃO: Chamada individual em vez de em lote >>>
     for (const item of itemsWithFeatures) {
       try {
         const res = await fetch(`${base}/predict`, {
@@ -248,10 +245,14 @@ async function rescoreWithML(
 
         const aiResponse = await res.json();
 
-        if (res.ok && typeof aiResponse.p === 'number') {
-          item.prob = aiResponse.p;
-          // Simples cálculo de EV se não vier da IA
-          item.expectedValuePoints = (item.prob * 2) - (1 - item.prob); // Assumindo RR 2:1
+        // <<< CORREÇÃO DA INTERPRETAÇÃO DA RESPOSTA >>>
+        // Esta lógica agora procura por diferentes nomes de campos que o AI-node pode retornar.
+        const prob = aiResponse.p ?? aiResponse.probHit ?? aiResponse.prob;
+        const ev = aiResponse.ev ?? aiResponse.expectedValuePoints;
+
+        if (res.ok && typeof prob === 'number') {
+          item.prob = prob;
+          item.expectedValuePoints = typeof ev === 'number' ? ev : (prob * 2) - (1 - prob); // Simples cálculo de EV se não vier da IA
         } else {
           logger.warn(`[AI] Resposta inválida do serviço de IA para o sinal em ${item.time}`, { response: aiResponse });
         }
@@ -268,6 +269,7 @@ async function rescoreWithML(
     return items;
   }
 }
+
 
 /* ---------------- Consulta de candles ---------------- */
 async function fetchCandles(

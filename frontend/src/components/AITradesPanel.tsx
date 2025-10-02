@@ -1,170 +1,111 @@
-import React, { useEffect, useMemo, useState } from "react";
-// IMPORTANTE: assumindo que o AIControlsBar expõe o estado global via este hook.
-// Caso o seu hook tenha outro nome/caminho, me avise que eu mando a versão correspondente.
+// ===============================
+// FILE: frontend/src/components/AITradesPanel.tsx
+// ===============================
+import React, { useState, useEffect } from "react";
+import { Table, Card, Badge, Button } from "react-bootstrap";
+import { useAIStore } from "../store/ai";
+import OrderLogsModal from "./OrderLogsModal";
+import { fetchTrades, TradeRow } from "../services/api";
 import { useAIControls } from "./AIControlsBar";
-
-type TradeRow = {
-    id: number;
-    symbol: string;
-    timeframe: string;
-    qty: number;
-    side: "BUY" | "SELL" | null;
-    entrySignalId: number;
-    exitSignalId: number | null;
-    entryPrice: number;
-    exitPrice: number | null;
-    pnlPoints: number | null;
-    pnlMoney: number | null;
-    entryTime: string | null; // ISO
-    exitTime: string | null;  // ISO
-};
-
-function fmtTime(iso: string | null) {
-    if (!iso) return "-";
-    try {
-        const d = new Date(iso);
-        if (Number.isNaN(d.getTime())) return "-";
-        // Mostra em horário local do navegador (ok para UI)
-        return d.toLocaleString();
-    } catch {
-        return "-";
-    }
-}
-
-function withinRange(iso: string | null, from?: string, to?: string) {
-    if (!iso) return false;
-    try {
-        const t = new Date(iso).getTime();
-        if (!Number.isFinite(t)) return false;
-
-        // Se vierem strings vindas do AIControlsBar, o backend já entende “dd/MM/yyyy” e ISO.
-        // Aqui no cliente só checamos de forma defensiva:
-        const f = from ? new Date(from).getTime() : NaN;
-        const tt = to ? new Date(to).getTime() : NaN;
-
-        // Quando usuário escolhe apenas a data (sem hora), seu backend expande o dia todo.
-        // Para o cliente ficar coerente, se "to" for só data, considere fim do dia:
-        let tFrom = Number.isFinite(f) ? f : -Infinity;
-        let tTo = Number.isFinite(tt) ? tt : Infinity;
-
-        // heurística simples: se `to` parecer ISO só com data, empurra para 23:59:59.999
-        if (to && /^\d{4}-\d{2}-\d{2}$/.test(to)) {
-            const end = new Date(to + "T23:59:59.999");
-            if (Number.isFinite(end.getTime())) tTo = end.getTime();
-        }
-        return t >= tFrom && t <= tTo;
-    } catch {
-        return false;
-    }
-}
+import { formatToLocalTime } from "../core/dateUtils"; // <<< NOVA IMPORTAÇÃO
 
 export default function AITradesPanel() {
-    const { symbol, timeframe, from, to } = useAIControls(); // <- estado global de filtros
-    const [rows, setRows] = useState<TradeRow[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [err, setErr] = useState<string | null>(null);
+    const { symbol, timeframe, from, to } = useAIControls();
+    const [trades, setTrades] = useState<TradeRow[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [selectedKey, setSelectedKey] = useState<string | number | null>(null);
+
+    const load = async () => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const data = await fetchTrades({
+                symbol,
+                timeframe,
+                from: from || undefined,
+                to: to || undefined,
+                limit: 500,
+            });
+            setTrades(data);
+        } catch (e: any) {
+            setError(e.message || "Erro ao carregar trades.");
+        } finally {
+            setIsLoading(false);
+        }
+    };
 
     useEffect(() => {
-        let cancelled = false;
-
-        async function load() {
-            try {
-                setLoading(true);
-                setErr(null);
-
-                const params = new URLSearchParams();
-                if (symbol) params.set("symbol", String(symbol).toUpperCase());
-                if (timeframe) params.set("timeframe", String(timeframe).toUpperCase());
-                // Passa o range para o backend (que já expande “dia inteiro” se vier só a data):
-                if (from) params.set("from", String(from));
-                if (to) params.set("to", String(to));
-                params.set("limit", "500"); // margem
-
-                const resp = await fetch(`/api/trades?${params.toString()}`);
-                const data = await resp.json();
-
-                if (!cancelled) {
-                    if (Array.isArray(data)) setRows(data as TradeRow[]);
-                    else if (data?.ok === false && data?.error) {
-                        setErr(String(data.error));
-                        setRows([]);
-                    } else {
-                        setRows([]);
-                    }
-                }
-            } catch (e: any) {
-                if (!cancelled) {
-                    setErr(e?.message || "erro ao carregar");
-                    setRows([]);
-                }
-            } finally {
-                if (!cancelled) setLoading(false);
-            }
-        }
-
         load();
-        return () => {
-            cancelled = true;
-        };
     }, [symbol, timeframe, from, to]);
 
-    // Filtro defensivo no cliente (garante consistência caso /api/trades um dia mude)
-    const filtered = useMemo(() => {
-        if (!rows?.length) return [];
-        return rows.filter((r) => withinRange(r.entryTime, from, to));
-    }, [rows, from, to]);
+    const pointValue = useAIStore((s) => s.trades?.pointValue ?? 1);
 
     return (
-        <div className="p-4">
-            <h2 className="text-lg font-semibold mb-2">Trades</h2>
-
-            {loading && (
-                <div className="text-sm opacity-70 mb-2">Carregando trades…</div>
-            )}
-            {err && (
-                <div className="text-sm text-red-600 mb-2">Erro: {err}</div>
-            )}
-
-            {!loading && !err && filtered.length === 0 && (
-                <div className="text-sm opacity-70">Sem trades no filtro atual.</div>
-            )}
-
-            {!loading && !err && filtered.length > 0 && (
-                <div className="overflow-x-auto">
-                    <table className="min-w-full text-sm">
+        <>
+            <Card>
+                <Card.Header>
+                    <div className="d-flex justify-content-between align-items-center">
+                        <strong>Trades do Backtest</strong>
+                        <Button variant="outline-secondary" size="sm" onClick={load} disabled={isLoading}>
+                            {isLoading ? "A carregar..." : "Recarregar"}
+                        </Button>
+                    </div>
+                </Card.Header>
+                <Card.Body className="p-0" style={{ maxHeight: 400, overflowY: "auto" }}>
+                    {error && <div className="alert alert-danger m-2">{error}</div>}
+                    <Table hover striped size="sm" className="mb-0">
                         <thead>
-                            <tr className="text-left border-b">
-                                <th className="py-2 pr-4">#</th>
-                                <th className="py-2 pr-4">Symbol</th>
-                                <th className="py-2 pr-4">TF</th>
-                                <th className="py-2 pr-4">Side</th>
-                                <th className="py-2 pr-4">Qty</th>
-                                <th className="py-2 pr-4">Entry</th>
-                                <th className="py-2 pr-4">Exit</th>
-                                <th className="py-2 pr-4">PnL (pts)</th>
-                                <th className="py-2 pr-4">Entry Time</th>
-                                <th className="py-2 pr-4">Exit Time</th>
+                            <tr>
+                                <th>Lado</th>
+                                <th>Entrada</th>
+                                <th>Saída</th>
+                                <th>Pontos</th>
+                                <th>R$</th>
+                                <th>Logs</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {filtered.map((r) => (
-                                <tr key={r.id} className="border-b hover:bg-black/5">
-                                    <td className="py-2 pr-4">{r.id}</td>
-                                    <td className="py-2 pr-4">{r.symbol}</td>
-                                    <td className="py-2 pr-4">{r.timeframe}</td>
-                                    <td className="py-2 pr-4">{r.side ?? "-"}</td>
-                                    <td className="py-2 pr-4">{r.qty}</td>
-                                    <td className="py-2 pr-4">{Number.isFinite(r.entryPrice) ? r.entryPrice : "-"}</td>
-                                    <td className="py-2 pr-4">{r.exitPrice ?? "-"}</td>
-                                    <td className="py-2 pr-4">{r.pnlPoints ?? "-"}</td>
-                                    <td className="py-2 pr-4">{fmtTime(r.entryTime)}</td>
-                                    <td className="py-2 pr-4">{fmtTime(r.exitTime)}</td>
+                            {trades.map((t) => (
+                                <tr key={t.id}>
+                                    <td>
+                                        <Badge bg={t.side === "BUY" ? "success" : "danger"}>
+                                            {t.side}
+                                        </Badge>
+                                    </td>
+                                    {/* <<< CORREÇÃO DE FORMATAÇÃO DE HORA >>> */}
+                                    <td>{formatToLocalTime(t.entryTime)}</td>
+                                    <td>{formatToLocalTime(t.exitTime)}</td>
+                                    <td className={Number(t.pnlPoints) >= 0 ? "text-success" : "text-danger"}>
+                                        {t.pnlPoints?.toFixed(2)}
+                                    </td>
+                                    <td className={Number(t.pnlPoints) * pointValue >= 0 ? "text-success" : "text-danger"}>
+                                        {(Number(t.pnlPoints) * pointValue).toFixed(2)}
+                                    </td>
+                                    <td>
+                                        {t.taskId && (
+                                            <Button
+                                                variant="link"
+                                                size="sm"
+                                                className="p-0"
+                                                onClick={() => setSelectedKey(t.taskId!)}
+                                            >
+                                                Ver
+                                            </Button>
+                                        )}
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>
-                    </table>
-                </div>
-            )}
-        </div>
+                    </Table>
+                </Card.Body>
+            </Card>
+
+            <OrderLogsModal
+                show={!!selectedKey}
+                handleClose={() => setSelectedKey(null)}
+                orderKey={selectedKey}
+            />
+        </>
     );
 }
