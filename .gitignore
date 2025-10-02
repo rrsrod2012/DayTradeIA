@@ -19,3 +19,6 @@ build/
 # Config do sistema
 .DS_Store
 Thumbs.db
+
+# Ignorar banco de dados, pois ele muda frequentemente
+*.db
