@@ -6,7 +6,7 @@ import { prisma } from '../../core/prisma';
 import { logger } from '../../core/logger';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 import { ADX, ATR, ema } from '../strategy/indicators';
-import { toUtcRange, toLocalDateStr, tfToMinutes } from './api.helpers';
+import { normalizeApiDateRange, toLocalDateStr, tfToMinutes } from './api.helpers';
 import { DateTime } from 'luxon';
 
 const router = Router();
@@ -44,11 +44,17 @@ router.get('/signals', async (req: Request, res: Response) => {
 
     const from = (_from as string) || (dateFrom as string) || undefined;
     const to = (_to as string) || (dateTo as string) || undefined;
-    const range = toUtcRange(from, to);
+
+    // <<< CORREÇÃO DA LÓGICA DE DATAS AQUI >>>
+    // Substituído 'toUtcRange' pela função correta 'normalizeApiDateRange'.
+    const range = normalizeApiDateRange(from, to);
     const effLimit = Number(limit) || 200;
 
     const whereBase: any = {};
-    if (range) whereBase.candle = { is: { time: range } } as any;
+    // <<< CORREÇÃO DA SINTAXE DA CONSULTA PRISMA >>>
+    if (range) {
+      whereBase.candle = { time: range };
+    }
 
     const signalsRaw = await prisma.signal.findMany({
       where: whereBase,
@@ -133,96 +139,96 @@ router.get('/signals', async (req: Request, res: Response) => {
     const pairPreferMode = String(pairPrefer || "stronger").toLowerCase() === "older" ? "older" : "stronger";
 
     function strengthAt(i: number): number {
-        const atrv = atr[i] ?? 0;
-        const atrRef = Math.max(atrv, 1e-6);
-        const sNow = (e9[i] ?? closes[i]) - (e21[i] ?? closes[i]);
-        const sPrev = i > 0 ? (e9[i - 1] ?? closes[i - 1]) - (e21[i - 1] ?? closes[i - 1]) : 0;
-        const spreadAbs = Math.abs(sNow) / atrRef;
-        const slopeAbs = Math.abs(sNow - sPrev) / atrRef;
-        const adxVal = (adx[i] ?? 0) / 50;
-        return spreadAbs * 1.0 + slopeAbs * 0.7 + adxVal * 0.5;
+      const atrv = atr[i] ?? 0;
+      const atrRef = Math.max(atrv, 1e-6);
+      const sNow = (e9[i] ?? closes[i]) - (e21[i] ?? closes[i]);
+      const sPrev = i > 0 ? (e9[i - 1] ?? closes[i - 1]) - (e21[i - 1] ?? closes[i - 1]) : 0;
+      const spreadAbs = Math.abs(sNow) / atrRef;
+      const slopeAbs = Math.abs(sNow - sPrev) / atrRef;
+      const adxVal = (adx[i] ?? 0) / 50;
+      return spreadAbs * 1.0 + slopeAbs * 0.7 + adxVal * 0.5;
     }
 
     const accepted: typeof signalsAsc = [];
     let lastAcceptedIdx = -1;
     for (const s of signalsAsc) {
-        const i = idxByTime.get(s.candle.time.getTime());
-        if (i == null) continue;
-        if (minGap > 0 && lastAcceptedIdx >= 0 && i - lastAcceptedIdx < minGap) continue;
-        const atrv = atr[i] ?? 0;
-        const atrRef = Math.max(atrv, 1e-6);
-        const adxVal = adx[i] ?? null;
-        if (adxVal == null || adxVal < adxMinEff) continue;
-        const sNow = (e9[i] ?? closes[i]) - (e21[i] ?? closes[i]);
-        const sPrev = i > 0 ? (e9[i - 1] ?? closes[i - 1]) - (e21[i - 1] ?? closes[i - 1]) : 0;
-        const spreadAbs = Math.abs(sNow);
-        const slopeAbs = Math.abs(sNow - sPrev);
-        if (spreadAbs < spreadMinEff * atrRef) continue;
-        if (slopeAbs < slopeMinEff * atrRef) continue;
-        if (vwapSideReq || vwapMinDistEff > 0) {
-            const v = vwap[i] ?? null;
-            if (v != null) {
-                if (vwapSideReq) {
-                    const okSide = s.side === "BUY" ? closes[i] >= v : closes[i] <= v;
-                    if (!okSide) continue;
-                }
-                if (vwapMinDistEff > 0) {
-                    const dist = Math.abs(closes[i] - (v as number));
-                    if (dist < vwapMinDistEff * atrRef) continue;
-                }
-            }
+      const i = idxByTime.get(s.candle.time.getTime());
+      if (i == null) continue;
+      if (minGap > 0 && lastAcceptedIdx >= 0 && i - lastAcceptedIdx < minGap) continue;
+      const atrv = atr[i] ?? 0;
+      const atrRef = Math.max(atrv, 1e-6);
+      const adxVal = adx[i] ?? null;
+      if (adxVal == null || adxVal < adxMinEff) continue;
+      const sNow = (e9[i] ?? closes[i]) - (e21[i] ?? closes[i]);
+      const sPrev = i > 0 ? (e9[i - 1] ?? closes[i - 1]) - (e21[i - 1] ?? closes[i - 1]) : 0;
+      const spreadAbs = Math.abs(sNow);
+      const slopeAbs = Math.abs(sNow - sPrev);
+      if (spreadAbs < spreadMinEff * atrRef) continue;
+      if (slopeAbs < slopeMinEff * atrRef) continue;
+      if (vwapSideReq || vwapMinDistEff > 0) {
+        const v = vwap[i] ?? null;
+        if (v != null) {
+          if (vwapSideReq) {
+            const okSide = s.side === "BUY" ? closes[i] >= v : closes[i] <= v;
+            if (!okSide) continue;
+          }
+          if (vwapMinDistEff > 0) {
+            const dist = Math.abs(closes[i] - (v as number));
+            if (dist < vwapMinDistEff * atrRef) continue;
+          }
         }
-        accepted.push(s);
-        lastAcceptedIdx = i;
+      }
+      accepted.push(s);
+      lastAcceptedIdx = i;
     }
 
     const paired: typeof accepted = [];
     const idxCache = new Map<number, number>();
     for (const s of accepted) {
-        const i = idxByTime.get(s.candle.time.getTime());
-        if (i == null) continue;
-        if (paired.length === 0) {
-            paired.push(s); idxCache.set(s.candle.id, i); continue;
-        }
-        const last = paired[paired.length - 1];
-        if (s.side === last.side) {
-            paired.push(s); idxCache.set(s.candle.id, i); continue;
-        }
-        const lastIdx = idxCache.get(last.candle.id) ?? idxByTime.get(last.candle.time.getTime())!;
-        const gapBars = i - lastIdx;
-        if (gapBars >= oppMinBarsEff) {
-            paired.push(s); idxCache.set(s.candle.id, i); continue;
-        }
-        if (pairPreferMode === "older") continue;
-        const sStrength = strengthAt(i);
-        const lastStrength = strengthAt(lastIdx);
-        if (sStrength > lastStrength) {
-            paired.pop(); paired.push(s); idxCache.set(s.candle.id, i);
-        } else {
-            continue;
-        }
+      const i = idxByTime.get(s.candle.time.getTime());
+      if (i == null) continue;
+      if (paired.length === 0) {
+        paired.push(s); idxCache.set(s.candle.id, i); continue;
+      }
+      const last = paired[paired.length - 1];
+      if (s.side === last.side) {
+        paired.push(s); idxCache.set(s.candle.id, i); continue;
+      }
+      const lastIdx = idxCache.get(last.candle.id) ?? idxByTime.get(last.candle.time.getTime())!;
+      const gapBars = i - lastIdx;
+      if (gapBars >= oppMinBarsEff) {
+        paired.push(s); idxCache.set(s.candle.id, i); continue;
+      }
+      if (pairPreferMode === "older") continue;
+      const sStrength = strengthAt(i);
+      const lastStrength = strengthAt(lastIdx);
+      if (sStrength > lastStrength) {
+        paired.pop(); paired.push(s); idxCache.set(s.candle.id, i);
+      } else {
+        continue;
+      }
     }
 
     let working = paired;
     if (wantEntriesOnly) {
-        const reEntryBarsEff = Number.isFinite(Number(reEntryBars)) ? Math.max(0, Number(reEntryBars)) : oppMinBarsEff;
-        const onlyEntries: typeof paired = [];
-        let flat = true;
-        let lastSide: "BUY" | "SELL" | null = null;
-        let lastCloseIdx: number | null = null;
-        for (const s of paired) {
-            const i = idxByTime.get(s.candle.time.getTime());
-            if (i == null) continue;
-            if (flat) {
-                if (lastCloseIdx != null && i - lastCloseIdx < reEntryBarsEff) continue;
-                onlyEntries.push(s); flat = false; lastSide = (s.side as any) || null;
-            } else {
-                if (String(s.side).toUpperCase() !== String(lastSide)) {
-                    flat = true; lastSide = null; lastCloseIdx = i;
-                }
-            }
+      const reEntryBarsEff = Number.isFinite(Number(reEntryBars)) ? Math.max(0, Number(reEntryBars)) : oppMinBarsEff;
+      const onlyEntries: typeof paired = [];
+      let flat = true;
+      let lastSide: "BUY" | "SELL" | null = null;
+      let lastCloseIdx: number | null = null;
+      for (const s of paired) {
+        const i = idxByTime.get(s.candle.time.getTime());
+        if (i == null) continue;
+        if (flat) {
+          if (lastCloseIdx != null && i - lastCloseIdx < reEntryBarsEff) continue;
+          onlyEntries.push(s); flat = false; lastSide = (s.side as any) || null;
+        } else {
+          if (String(s.side).toUpperCase() !== String(lastSide)) {
+            flat = true; lastSide = null; lastCloseIdx = i;
+          }
         }
-        working = onlyEntries;
+      }
+      working = onlyEntries;
     }
 
     const items = working.map((s) => ({
@@ -235,6 +241,41 @@ router.get('/signals', async (req: Request, res: Response) => {
   } catch (err: any) {
     logger.error("[/signals] erro", { message: err?.message });
     res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+router.get('/signals/confirmed', async (req: Request, res: Response) => {
+  try {
+    const { symbol, timeframe, from, to, limit } = req.query;
+    if (!symbol) {
+      return res.status(400).json({ error: 'Parâmetro symbol é obrigatório.' });
+    }
+
+    const where: any = {
+      symbol: String(symbol),
+    };
+
+    if (timeframe) {
+      where.timeframe = String(timeframe);
+    }
+
+    const dateRange = normalizeApiDateRange(from, to);
+    if (dateRange) {
+      where.time = dateRange;
+    }
+
+    const signals = await prisma.signal.findMany({
+      where,
+      orderBy: {
+        time: 'desc'
+      },
+      take: limit ? Number(limit) : 1000,
+    });
+    res.json(signals);
+
+  } catch (err: any) {
+    logger.error('[/signals/confirmed] erro', { message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 

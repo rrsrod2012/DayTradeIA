@@ -73,8 +73,8 @@ type FiltersAPI = {
   subscribe: (cb: () => void) => () => void;
 };
 
-// <<< DATA FINAL CORRIGIDA >>>
-const _defaultDate = new Date("2025-10-02T12:00:00Z");
+// <<< DATA PADRÃO CORRIGIDA PARA O DIA ATUAL >>>
+const _defaultDate = new Date();
 
 const _filtersInitial: FiltersState = (() => {
   const fallback: FiltersState = {

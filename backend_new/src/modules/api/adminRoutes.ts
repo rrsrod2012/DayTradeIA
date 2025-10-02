@@ -4,15 +4,33 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../core/prisma';
 import { logger } from '../../core/logger';
-import { backfillSignalsAndTrades, processImportedRange } from '../strategy/maintenance.tasks';
-import { startAutoTrainer, stopAutoTrainer, statusAutoTrainer } from '../ai-trainer';
-import { toUtcRange } from './api.helpers';
+import { backfillSignalsAndTrades } from '../strategy/maintenance.tasks';
+import { startAutoTrainer, stopAutoTrainer, statusAutoTrainer, runTrainingCycle } from '../ai-trainer';
+import { normalizeApiDateRange } from './api.helpers'; // Usando o helper correto
 import { DateTime } from 'luxon';
+import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
 
 const router = Router();
 
+// <<< ROTA ADICIONADA PARA RETREINAMENTO MANUAL >>>
+router.post('/retrain', async (req: Request, res: Response) => {
+    try {
+        logger.info('[API_ADMIN] Recebida requisição para forçar o retreinamento da IA.');
+        const result = await runTrainingCycle();
+        res.json({
+            ok: true,
+            message: 'Ciclo de treinamento concluído com sucesso.',
+            details: result
+        });
+    } catch (e: any) {
+        logger.error('[API_ADMIN] Falha ao executar o ciclo de treinamento manual', { error: e.message });
+        res.status(500).json({ ok: false, error: 'Ocorreu um erro durante o retreinamento.' });
+    }
+});
+
+
 // Rota para forçar o backfill de sinais e trades
-router.post('/admin/signals/backfill', async (req: Request, res: Response) => {
+router.post('/signals/backfill', async (req: Request, res: Response) => {
     try {
         const { symbol, timeframe } = req.body;
         if (!symbol || !timeframe) {
@@ -22,7 +40,7 @@ router.post('/admin/signals/backfill', async (req: Request, res: Response) => {
         if (!instrument) {
             return res.status(404).json({ ok: false, error: `Instrumento ${symbol} não encontrado.` });
         }
-        
+
         logger.info(`[Admin] Iniciando backfill para ${symbol} ${timeframe}...`);
         const result = await backfillSignalsAndTrades(instrument, timeframe);
         logger.info(`[Admin] Backfill para ${symbol} ${timeframe} concluído.`);
@@ -34,8 +52,8 @@ router.post('/admin/signals/backfill', async (req: Request, res: Response) => {
     }
 });
 
-// Rota para reconstruir trades (usa a mesma lógica do backfill completo)
-router.post('/admin/rebuild/trades', async (req: Request, res: Response) => {
+// Rota para reconstruir trades
+router.post('/rebuild/trades', async (req: Request, res: Response) => {
     try {
         const { symbol, timeframe } = req.body;
         if (!symbol || !timeframe) {
@@ -58,51 +76,51 @@ router.post('/admin/rebuild/trades', async (req: Request, res: Response) => {
 });
 
 // Rotas de controle do AutoTrainer
-router.get('/admin/auto-trainer/status', (_req, res) => res.json(statusAutoTrainer()));
-router.post('/admin/auto-trainer/start', (_req, res) => res.json(startAutoTrainer()));
-router.post('/admin/auto-trainer/stop', (_req, res) => res.json(stopAutoTrainer()));
+router.get('/auto-trainer/status', (_req, res) => res.json(statusAutoTrainer()));
+router.post('/auto-trainer/start', (_req, res) => res.json(startAutoTrainer()));
+router.post('/auto-trainer/stop', (_req, res) => res.json(stopAutoTrainer()));
 
 // Rota para inspecionar trades recentes
-router.get("/admin/trades/inspect", async (req: Request, res: Response) => {
+router.get("/trades/inspect", async (req: Request, res: Response) => {
     try {
-      const { symbol, timeframe, limit = 50 } = req.query;
-      const where: any = {};
-      if (symbol) where.instrument = { symbol: String(symbol).toUpperCase() };
-      if (timeframe) where.timeframe = String(timeframe).toUpperCase();
-  
-      const trades = await prisma.trade.findMany({
-        where,
-        orderBy: { id: "desc" },
-        take: Number(limit),
-        include: {
-          instrument: { select: { symbol: true } },
-          entrySignal: { include: { candle: { select: { time: true } } } },
-          exitSignal: { include: { candle: { select: { time: true } } } },
-        },
-      });
-  
-      const out = trades.map((tr) => ({
-        id: tr.id,
-        symbol: tr.instrument.symbol,
-        timeframe: tr.timeframe,
-        side: tr.entrySignal?.side || null,
-        entryPrice: tr.entryPrice,
-        exitPrice: tr.exitPrice,
-        pnlPoints: tr.pnlPoints,
-        entryTime: tr.entrySignal?.candle?.time?.toISOString() || null,
-        exitTime: tr.exitSignal?.candle?.time?.toISOString() || null,
-        exitReason: tr.exitSignal?.reason || null,
-      }));
-  
-      res.json({ ok: true, data: out });
+        const { symbol, timeframe, limit = 50 } = req.query;
+        const where: any = {};
+        if (symbol) where.instrument = { symbol: String(symbol).toUpperCase() };
+        if (timeframe) where.timeframe = String(timeframe).toUpperCase();
+
+        const trades = await prisma.trade.findMany({
+            where,
+            orderBy: { id: "desc" },
+            take: Number(limit),
+            include: {
+                instrument: { select: { symbol: true } },
+                entrySignal: { include: { candle: { select: { time: true } } } },
+                exitSignal: { include: { candle: { select: { time: true } } } },
+            },
+        });
+
+        const out = trades.map((tr) => ({
+            id: tr.id,
+            symbol: tr.instrument.symbol,
+            timeframe: tr.timeframe,
+            side: tr.entrySignal?.side || null,
+            entryPrice: tr.entryPrice,
+            exitPrice: tr.exitPrice,
+            pnlPoints: tr.pnlPoints,
+            entryTime: tr.entrySignal?.candle?.time?.toISOString() || null,
+            exitTime: tr.exitSignal?.candle?.time?.toISOString() || null,
+            exitReason: tr.exitSignal?.reason || null,
+        }));
+
+        res.json({ ok: true, data: out });
     } catch (e: any) {
-      logger.error("[Admin] Erro ao inspecionar trades", { error: e.message });
-      res.status(500).json({ ok: false, error: e.message });
+        logger.error("[Admin] Erro ao inspecionar trades", { error: e.message });
+        res.status(500).json({ ok: false, error: e.message });
     }
 });
 
 // Rota de diagnóstico de disponibilidade de dados
-router.get("/api/debug/availability", async (_req, res) => {
+router.get("/debug/availability", async (_req, res) => {
     try {
         const syms = (process.env.DEBUG_SYMBOLS || "WIN,WDO").split(',').map(s => s.trim().toUpperCase());
         const tfs = (process.env.DEBUG_TFS || "M1,M5,M15,H1").split(',').map(s => s.trim().toUpperCase());

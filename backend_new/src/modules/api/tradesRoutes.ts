@@ -4,13 +4,14 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../core/prisma';
 import { logger } from '../../core/logger';
-import { normalizeApiDateRange } from './api.helpers'; // <<< USANDO O NOVO HELPER
+import { normalizeApiDateRange } from './api.helpers';
 
 const router = Router();
 
 router.get('/trades', async (req: Request, res: Response) => {
     try {
         const { symbol, timeframe, from, to, limit = 500, offset = 0 } = req.query as any;
+        logger.info('[TRADES_ROUTE_DEBUG] Recebida requisição /trades', { query: req.query });
 
         const where: any = {};
 
@@ -21,18 +22,16 @@ router.get('/trades', async (req: Request, res: Response) => {
             where.timeframe = String(timeframe).toUpperCase().trim();
         }
 
-        // <<< CORREÇÃO DA LÓGICA DE DATAS AQUI >>>
-        // A nova função trata corretamente os fusos horários e os intervalos de dia completo.
         const range = normalizeApiDateRange(from, to);
         if (range) {
             where.entrySignal = {
-                is: {
-                    candle: {
-                        time: range
-                    }
+                candle: {
+                    time: range
                 }
             };
         }
+
+        logger.info('[TRADES_ROUTE_DEBUG] Executando consulta Prisma com a cláusula "where":', { where: JSON.stringify(where, null, 2) });
 
         const trades = await prisma.trade.findMany({
             where,
@@ -45,6 +44,8 @@ router.get('/trades', async (req: Request, res: Response) => {
             take: Number(limit),
             skip: Number(offset),
         });
+
+        logger.info(`[TRADES_ROUTE_DEBUG] Consulta ao banco de dados retornou ${trades.length} trades.`);
 
         const formattedTrades = trades.map(t => ({
             id: t.id,
