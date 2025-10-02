@@ -1,6 +1,6 @@
 import { prisma } from '../../core/prisma';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
-import { ema } from './lib/indicators';
+import { ema } from './indicators';
 
 type Candle = {
   time: Date;
@@ -81,9 +81,9 @@ export async function generateProjectedSignals(params: {
   try {
     const { symbol, timeframe, from, to, limit = 500 } = params;
 
-    const range = from || to ? { 
-        gte: from ? new Date(from) : undefined, 
-        lte: to ? new Date(to) : undefined 
+    const range = from || to ? {
+      gte: from ? new Date(from) : undefined,
+      lte: to ? new Date(to) : undefined
     } : undefined;
 
     const candles = await loadCandlesAnyTF(symbol, timeframe, range);
@@ -92,7 +92,7 @@ export async function generateProjectedSignals(params: {
     const tail = range ? candles : candles.slice(-Math.min(limit, 600));
 
     let items = buildHeuristicSignals(symbol, timeframe, tail);
-    
+
     // Futuramente, a chamada para o `ai-node` pode ser adicionada aqui para re-pontuar os sinais
     // items = await rescoreWithML(items, tail);
 
