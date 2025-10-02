@@ -1,3 +1,6 @@
+// ===============================
+// FILE: frontend/src/components/AIControlsBar.tsx
+// ===============================
 import React, { useSyncExternalStore } from "react";
 import {
   projectedSignals,
@@ -70,13 +73,15 @@ type FiltersAPI = {
   subscribe: (cb: () => void) => () => void;
 };
 
-const _today = new Date();
+// <<< DATA FINAL CORRIGIDA >>>
+const _defaultDate = new Date("2025-10-02T12:00:00Z");
+
 const _filtersInitial: FiltersState = (() => {
   const fallback: FiltersState = {
     symbol: "WIN",
     timeframe: "M5",
-    from: fmtDate(_today),
-    to: fmtDate(_today),
+    from: fmtDate(_defaultDate),
+    to: fmtDate(_defaultDate),
   };
   return lsGet<FiltersState>(LS_FILTERS_KEY, fallback);
 })();
@@ -875,7 +880,7 @@ export default function AIControlsBar({ collapsedByDefault }: Props) {
       side,
       comment: `ui-test ${side} ${new Date().toISOString()}${slPtsToSend ? ` SL=${slPtsToSend}` : ""}${tpPtsToSend ? ` TP=${tpPtsToSend}` : ""}`,
       beAtPoints: breakEvenAtPts,
-      beOffsetPoints: beOffsetPts,
+      beOffsetPts: beOffsetPts,
       timeframe: null,
       time: null,
       price: 0,

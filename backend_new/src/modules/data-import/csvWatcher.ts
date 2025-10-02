@@ -12,20 +12,22 @@ import { eventBus, EVENTS } from '../../core/eventBus';
 const DATA_DIR = process.env.CSV_DIR || path.resolve(process.cwd(), 'dados');
 
 const processFile = async (filePath: string) => {
-  logger.info(`[CSV] Processando arquivo: ${path.basename(filePath)}`);
+  if (!fs.existsSync(filePath)) {
+    logger.warn(`[CSV] Ficheiro ${path.basename(filePath)} não encontrado no momento do processamento.`);
+    return;
+  }
+  logger.info(`[CSV] A processar o ficheiro: ${path.basename(filePath)}`);
 
   const fileName = path.basename(filePath);
   const match = fileName.match(/^([A-Z]+)(M\d+|H\d+)\.csv$/i);
   if (!match) {
-    logger.warn(`[CSV] Arquivo ${fileName} ignorado (nome fora do padrão esperado, ex: WINM1.csv).`);
+    logger.warn(`[CSV] Ficheiro ${fileName} ignorado (nome fora do padrão esperado, ex: WINM1.csv).`);
     return;
   }
 
-  // <<< ALTERAÇÃO PRINCIPAL AQUI >>>
-  // Ignoramos o timeframe do nome do arquivo e forçamos a importação como M1.
   const symbol = match[1].toUpperCase();
   const importTimeframe = 'M1';
-  logger.info(`[CSV] Identificado Symbol: ${symbol}. Forçando importação no timeframe base: ${importTimeframe}`);
+  logger.info(`[CSV] Símbolo Identificado: ${symbol}. A forçar importação no timeframe base: ${importTimeframe}`);
 
   try {
     const instrument = await prisma.instrument.upsert({
@@ -36,7 +38,7 @@ const processFile = async (filePath: string) => {
 
     const fileContent = fs.readFileSync(filePath, 'utf-8');
     if (!fileContent.trim()) {
-      logger.warn(`[CSV] Arquivo ${fileName} está vazio.`);
+      logger.warn(`[CSV] O ficheiro ${fileName} está vazio.`);
       return;
     }
 
@@ -63,22 +65,25 @@ const processFile = async (filePath: string) => {
     });
 
     if (records.length === 0) {
-      logger.warn(`[CSV] Nenhum registro válido encontrado em ${fileName}.`);
+      logger.warn(`[CSV] Nenhum registo válido encontrado em ${fileName}.`);
       return;
     }
 
     const candleData = records.map(rec => {
-      const timeValue = rec.date && rec.time ? `${rec.date} ${rec.time}` : null;
+      const timeValue = rec.time;
       if (!timeValue) return null;
 
       const time = new Date(timeValue.replace(/\./g, '-'));
-      if (isNaN(time.getTime())) return null;
+      if (isNaN(time.getTime())) {
+        logger.warn(`[CSV] Data inválida encontrada e ignorada: ${timeValue}`);
+        return null;
+      }
 
-      const volumeValue = rec.tick_volume || rec.volume;
+      const volumeValue = rec.volume || rec.tick_volume;
 
       return {
         instrumentId: instrument.id,
-        timeframe: importTimeframe, // Salva sempre como M1
+        timeframe: importTimeframe,
         time,
         open: parseFloat(rec.open),
         high: parseFloat(rec.high),
@@ -88,15 +93,36 @@ const processFile = async (filePath: string) => {
       };
     }).filter((c): c is NonNullable<typeof c> => c !== null && !isNaN(c.open));
 
+    logger.info(`[CSV] Foram analisados ${records.length} registos. Foram encontrados ${candleData.length} candles válidos para inserir.`);
+
     if (candleData.length > 0) {
-      logger.info(`[CSV] Inserindo/atualizando ${candleData.length} candles de ${symbol} como ${importTimeframe}...`);
-      const result = await prisma.candle.createMany({
-        data: candleData,
-        skipDuplicates: true,
-      });
-      logger.info(`[CSV] ${result.count} novos candles M1 inseridos.`);
-      if (result.count > 0) {
-        // Notifica o sistema que novos dados M1 estão disponíveis
+      logger.info(`[CSV] A inserir/atualizar ${candleData.length} candles de ${symbol} como ${importTimeframe} usando 'upsert'...`);
+
+      let upsertedCount = 0;
+      for (const candle of candleData) {
+        // <<< CORREÇÃO DA SINTAXE DO PRISMA UPSERT >>>
+        await prisma.candle.upsert({
+          where: {
+            instrument_time_tf_unique: { // Nome correto do índice
+              instrumentId: candle.instrumentId,
+              timeframe: candle.timeframe,
+              time: candle.time,
+            }
+          },
+          update: {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+          },
+          create: candle,
+        });
+        upsertedCount++;
+      }
+
+      logger.info(`[CSV] ${upsertedCount} candles inseridos/atualizados.`);
+      if (upsertedCount > 0) {
         eventBus.emit(EVENTS.NEW_CANDLE_DATA, { symbol: symbol, timeframe: importTimeframe });
       }
     }
@@ -112,18 +138,31 @@ export const initCsvWatcher = () => {
 
   const watcher = chokidar.watch(`${DATA_DIR}/*.csv`, {
     persistent: true,
-    ignoreInitial: false,
+    ignoreInitial: true,
     usePolling: true,
     interval: 5000,
-    awaitWriteFinish: {
-      stabilityThreshold: 2000,
-      pollInterval: 100,
-    },
+    awaitWriteFinish: true,
   });
 
   watcher
-    .on('ready', () => {
-      logger.info(`[CSV] Monitoramento iniciado e pronto. Escutando por alterações em: ${DATA_DIR}`);
+    .on('ready', async () => {
+      logger.info(`[CSV] Monitorização pronta. A verificar ficheiros existentes em: ${DATA_DIR}`);
+
+      const watchedPaths = watcher.getWatched();
+      const processPromises: Promise<void>[] = [];
+
+      for (const dir in watchedPaths) {
+        for (const fileName of watchedPaths[dir]) {
+          const fullPath = path.join(dir, fileName);
+          logger.info(`[CSV] Ficheiro existente encontrado no arranque: ${fileName}`);
+          processPromises.push(processFile(fullPath));
+        }
+      }
+
+      await Promise.all(processPromises);
+
+      logger.info(`[CSV] Processamento inicial concluído. A aguardar por novas alterações...`);
+
       watcher.on('add', processFile);
       watcher.on('change', processFile);
     })

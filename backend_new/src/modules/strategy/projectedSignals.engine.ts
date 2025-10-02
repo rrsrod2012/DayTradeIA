@@ -4,15 +4,10 @@
 /* eslint-disable no-console */
 import { prisma } from '../../core/prisma';
 import { loadCandlesAnyTF } from '../data-import/lib/aggregation';
+import { logger } from '../../core/logger'; // Import logger
 
 /**
  * Motor de projeção de sinais (migrado do backend original).
- * - Busca candles do símbolo/timeframe pedidos
- * - Calcula indicadores básicos (EMA9, EMA21, ATR14, VWAP simples)
- * - Gera sinais heurísticos (cross EMA + breakout simples) com score
- * - Se houver MICRO_MODEL_URL e /predict responder, repondera o score (opcional)
- *
- * Importante: NUNCA lança exceção para não derrubar a rota da API.
  */
 
 type Params = {
@@ -21,9 +16,9 @@ type Params = {
   from?: string;
   to?: string;
   limit?: number;
-  vwapFilter?: boolean; // <-- respeitado aqui, lado-sensível
-  minEV?: number; // <-- EV SELL normalizado para positivo
-  minProb?: number; // (se houver prob vindo da IA)
+  vwapFilter?: boolean;
+  minEV?: number;
+  minProb?: number;
   [k: string]: any;
 };
 
@@ -44,29 +39,12 @@ type Projected = {
   reason: string;
   symbol: string;
   timeframe: string;
-  // campos opcionais que podem aparecer quando IA está ligada:
   prob?: number;
   expectedValuePoints?: number;
   ev?: number;
   expectedValue?: number;
   expected_value?: number;
-  // enriquecimento local:
   vwapOk?: boolean;
-};
-
-const tfToMinutes = (tfRaw: string) => {
-  const s = String(tfRaw || "")
-    .trim()
-    .toUpperCase();
-  if (s.startsWith("M")) return Number(s.slice(1)) || 5;
-  if (s.startsWith("H")) return (Number(s.slice(1)) || 1) * 60;
-  const m = /(\d+)\s*(M|min|h|H)/.exec(s);
-  if (m) {
-    const n = Number(m[1]) || 5;
-    const unit = (m[2] || "M").toUpperCase();
-    return unit.startsWith("H") ? n * 60 : n;
-  }
-  return 5;
 };
 
 /* ---------------- Indicadores simples ---------------- */
@@ -97,7 +75,6 @@ function ATR(
     );
     tr[i] = trueRange;
   }
-  // RMA simples
   const out: (number | null)[] = [];
   let acc = 0;
   for (let i = 0; i < len; i++) {
@@ -118,7 +95,6 @@ function ATR(
   }
   return out;
 }
-/** VWAP acumulada simples (typical price * volume / soma volumes). */
 function VWAP(
   high: number[],
   low: number[],
@@ -154,56 +130,44 @@ function buildHeuristicSignals(
   const atr = ATR(highs, lows, closes, 14);
 
   const out: Projected[] = [];
-
-  // Sinal de cruzamento (EMA9 cruza EMA21) + breakout simples da máxima/mínima dos últimos N
   const N = 10;
   for (let i = 2; i < candles.length; i++) {
     const c = candles[i];
-
     const ema9 = e9[i] ?? closes[i];
     const ema21 = e21[i] ?? closes[i];
     const prevDiff =
       (e9[i - 1] ?? closes[i - 1]) - (e21[i - 1] ?? closes[i - 1]);
     const diff = ema9 - ema21;
-
-    // breakout contexto
     const window = candles.slice(Math.max(0, i - N), i);
     const winHigh = Math.max(...window.map((x) => x.high));
     const winLow = Math.min(...window.map((x) => x.low));
     const _atr = (atr[i] ?? atr[i - 1] ?? 1) as number;
 
-    // BUY: cruzou para cima e fechou acima da máxima recente
     if (prevDiff <= 0 && diff > 0 && c.close > winHigh) {
       const strength = (c.close - ema21) / Math.max(1e-6, _atr);
       out.push({
         time: c.time.toISOString(),
         side: "BUY",
         score: Math.max(0.1, Math.min(1, Math.abs(strength))),
-        reason: `EMA9>EMA21 + breakout (${N}) • dist/ATR=${strength.toFixed(
-          2
-        )}`,
+        reason: `EMA9>EMA21 + breakout (${N}) • dist/ATR=${strength.toFixed(2)}`,
         symbol,
         timeframe,
       });
     }
 
-    // SELL: cruzou para baixo e fechou abaixo da mínima recente
     if (prevDiff >= 0 && diff < 0 && c.close < winLow) {
       const strength = (ema21 - c.close) / Math.max(1e-6, _atr);
       out.push({
         time: c.time.toISOString(),
         side: "SELL",
         score: Math.max(0.1, Math.min(1, Math.abs(strength))),
-        reason: `EMA9<EMA21 + breakdown (${N}) • dist/ATR=${strength.toFixed(
-          2
-        )}`,
+        reason: `EMA9<EMA21 + breakdown (${N}) • dist/ATR=${strength.toFixed(2)}`,
         symbol,
         timeframe,
       });
     }
   }
 
-  // Fallback suave
   if (out.length === 0 && candles.length > 1) {
     const i = candles.length - 1;
     const closes = candles.map((c) => c.close);
@@ -221,14 +185,11 @@ function buildHeuristicSignals(
       time: candles[i].time.toISOString(),
       side,
       score,
-      reason: `bias EMA (fallback) • slope9=${slope9.toFixed(
-        2
-      )} slope21=${slope21.toFixed(2)}`,
+      reason: `bias EMA (fallback) • slope9=${slope9.toFixed(2)} slope21=${slope21.toFixed(2)}`,
       symbol,
       timeframe,
     });
   }
-
   return out;
 }
 
@@ -237,10 +198,16 @@ async function rescoreWithML(
   items: Projected[],
   candles: Candle[]
 ): Promise<Projected[]> {
-  try {
-    const base = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
-    if (!base) return items;
+  const base = String(process.env.MICRO_MODEL_URL || "").replace(/\/+$/, "");
+  if (!base) {
+    logger.warn('[AI] MICRO_MODEL_URL não está definida. A saltar a pontuação da IA.');
+    return items;
+  }
 
+  logger.info(`[AI] A tentar contactar o serviço de IA em: ${base}`);
+
+  try {
+    // A lógica de extração de features permanece a mesma
     const times = new Set(items.map((i) => i.time));
     const closes = candles.map((c) => c.close);
     const e9 = EMA(closes, 9);
@@ -249,64 +216,56 @@ async function rescoreWithML(
     const lows = candles.map((c) => c.low);
     const atr = ATR(highs, lows, closes, 14);
 
-    const rows: any[] = [];
-    for (let i = 1; i < candles.length; i++) { // Começa de 1 para ter i-1
-      const iso = candles[i].time.toISOString();
-      if (!times.has(iso)) continue;
-      const _atr = (atr[i] ?? atr[i - 1] ?? 1) as number;
-      rows.push({
-        features: {
-          dist_ema21:
-            (closes[i] - (e21[i] ?? closes[i])) / Math.max(1e-6, _atr),
-          slope_e9:
-            ((e9[i] ?? closes[i]) - (e9[i - 1] ?? closes[i - 1])) /
-            Math.max(1e-6, _atr),
-          slope_e21:
-            ((e21[i] ?? closes[i]) - (e21[i - 1] ?? closes[i - 1])) /
-            Math.max(1e-6, _atr),
-          range_ratio: (highs[i] - lows[i]) / Math.max(1e-6, _atr),
-        },
-      });
+    const itemsWithFeatures = items.map(item => {
+      const index = candles.findIndex(c => c.time.toISOString() === item.time);
+      if (index < 1) return null;
+
+      const _atr = (atr[index] ?? atr[index - 1] ?? 1) as number;
+      const features = {
+        dist_ema21: (closes[index] - (e21[index] ?? closes[index])) / Math.max(1e-6, _atr),
+        slope_e9: ((e9[index] ?? closes[index]) - (e9[index - 1] ?? closes[index - 1])) / Math.max(1e-6, _atr),
+        slope_e21: ((e21[index] ?? closes[index]) - (e21[index - 1] ?? closes[index - 1])) / Math.max(1e-6, _atr),
+        range_ratio: (highs[index] - lows[index]) / Math.max(1e-6, _atr),
+      };
+      return { ...item, features };
+    }).filter(Boolean) as (Projected & { features: any })[];
+
+    if (itemsWithFeatures.length === 0) {
+      logger.warn('[AI] Nenhum candidato a sinal com features válidas para enviar para a IA.');
+      return items;
     }
 
-    if (rows.length === 0) return items;
+    logger.info(`[AI] A enviar ${itemsWithFeatures.length} candidatos para ${base}/predict`);
 
-    // @ts-ignore
-    const r = await fetch(`${base}/predict`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ rows }),
-    });
-    const text = await r.text();
-    const j = text ? JSON.parse(text) : null;
-    if (!r.ok || !j?.ok) return items;
+    // <<< CORREÇÃO: Chamada individual em vez de em lote >>>
+    for (const item of itemsWithFeatures) {
+      try {
+        const res = await fetch(`${base}/predict`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ features: item.features }),
+        });
 
-    const probs: number[] | undefined = Array.isArray(j?.scores) ? j.scores : undefined;
-    const evArr: number[] | undefined =
-      Array.isArray(j?.ev) ? j.ev :
-        Array.isArray(j?.ev_points) ? j.ev_points :
-          Array.isArray(j?.expectedValuePoints) ? j.expectedValuePoints : undefined;
+        const aiResponse = await res.json();
 
-    const rescored: Projected[] = [];
-    let k = 0;
-    for (const it of items) {
-      const p = probs && typeof probs[k] === "number" ? Math.min(1, Math.max(0, probs[k])) : undefined;
-      const ev = evArr && typeof evArr[k] === "number" ? evArr[k] : undefined;
-
-      let score = it.score;
-      if (typeof p === "number") {
-        score = Math.min(1, Math.max(0.1, (it.score * 0.6 + p * 0.8) / 1.2));
+        if (res.ok && typeof aiResponse.p === 'number') {
+          item.prob = aiResponse.p;
+          // Simples cálculo de EV se não vier da IA
+          item.expectedValuePoints = (item.prob * 2) - (1 - item.prob); // Assumindo RR 2:1
+        } else {
+          logger.warn(`[AI] Resposta inválida do serviço de IA para o sinal em ${item.time}`, { response: aiResponse });
+        }
+      } catch (e: any) {
+        logger.error(`[AI] Falha na chamada de fetch para o sinal em ${item.time}`, { error: e.message });
       }
-
-      const out: Projected = { ...it, score };
-      if (typeof p === "number") out.prob = p;
-      if (typeof ev === "number") out.expectedValuePoints = ev;
-      rescored.push(out);
-      k++;
     }
-    return rescored;
-  } catch {
-    return items; // se a IA falhar, segue heurístico
+
+    logger.info(`[AI] Pontuação da IA concluída.`);
+    return itemsWithFeatures;
+
+  } catch (err: any) {
+    logger.error('[AI] Falha catastrófica ao tentar comunicar com o serviço de IA.', { error: err.message, stack: err.stack });
+    return items;
   }
 }
 
@@ -414,9 +373,9 @@ export async function generateProjectedSignals(
 
     return items;
   } catch (e: any) {
-    console.warn(
+    logger.error(
       "[engine] erro em generateProjectedSignals:",
-      e?.message || String(e)
+      { error: e.message, stack: e.stack }
     );
     return [];
   }
