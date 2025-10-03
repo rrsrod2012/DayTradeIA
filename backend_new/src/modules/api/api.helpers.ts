@@ -7,42 +7,71 @@ import { logger } from '../../core/logger';
 const APP_TIMEZONE = "America/Sao_Paulo";
 
 /**
- * Normaliza um intervalo de datas vindo da API (strings 'from' e 'to'), 
- * interpretando-as no fuso horário de São Paulo para garantir que o filtro
- * corresponda corretamente ao dia de pregão.
- * @param fromRaw A data de início (string no formato 'YYYY-MM-DD').
- * @param toRaw A data de fim (string no formato 'YYYY-MM-DD').
- * @returns Um objeto com datas { gte, lte } prontas para a consulta no Prisma, ou undefined se nenhuma data for fornecida.
+ * Converte várias formas de data para 'yyyy-LL-dd' (date-only).
+ * Aceita:
+ *  - 'YYYY-MM-DD'
+ *  - 'DD/MM/YYYY'
+ *  - ISO completo (pega apenas a parte de data, no fuso de SP)
  */
-export function normalizeApiDateRange(fromRaw: any, toRaw: any): { gte?: Date; lte?: Date } | undefined {
-  if (!fromRaw && !toRaw) {
-    return undefined;
+function parseToYMD(input?: any): string | undefined {
+  if (input == null) return undefined;
+  const s = String(input).trim();
+  if (!s) return undefined;
+
+  // Já no formato yyyy-LL-dd?
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // DD/MM/YYYY
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const MM = parseInt(m[2], 10);
+    const yyyy = parseInt(m[3], 10);
+    if (dd >= 1 && dd <= 31 && MM >= 1 && MM <= 12) {
+      return `${yyyy}-${String(MM).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+    }
   }
 
-  // Usa a data 'from' ou 'to' se uma delas estiver faltando.
-  const effectiveFrom = String(fromRaw || toRaw);
-  const effectiveTo = String(toRaw || fromRaw);
+  // ISO ou outra coisa parsável: extrai data no fuso de SP
+  const dt = DateTime.fromISO(s, { zone: APP_TIMEZONE });
+  if (dt.isValid) {
+    return dt.toFormat("yyyy-LL-dd");
+  }
 
+  return undefined;
+}
+
+/**
+ * Normaliza um intervalo de datas vindo da API (strings 'from' e 'to'),
+ * interpretando-as no fuso de São Paulo e convertendo para UTC.
+ * Se só 'from' vier, usa o mesmo dia em 'to'. Se só 'to' vier, usa o mesmo dia em 'from'.
+ * Retorna undefined se nenhum limite for fornecido.
+ */
+export function normalizeApiDateRange(
+  fromRaw?: any,
+  toRaw?: any
+): { gte?: Date; lte?: Date } | undefined {
   try {
-    // Constrói a data de início como o primeiro momento do dia em São Paulo.
-    const gte = DateTime.fromISO(effectiveFrom, { zone: APP_TIMEZONE })
-      .startOf('day')
-      .toJSDate();
+    const fromYMD = parseToYMD(fromRaw);
+    const toYMD = parseToYMD(toRaw);
 
-    // Constrói a data de fim como o último momento do dia em São Paulo.
-    const lte = DateTime.fromISO(effectiveTo, { zone: APP_TIMEZONE })
-      .endOf('day')
-      .toJSDate();
+    if (!fromYMD && !toYMD) return undefined;
 
-    logger.info('[API_HELPER] Intervalo de datas para a consulta', {
-      from: effectiveFrom,
-      to: effectiveTo,
-      gte_utc: gte.toISOString(),
-      lte_utc: lte.toISOString()
-    });
+    const startYMD = fromYMD ?? toYMD!;
+    const endYMD = toYMD ?? fromYMD!;
 
-    return { gte, lte };
+    const start = DateTime.fromISO(startYMD, { zone: APP_TIMEZONE }).startOf('day');
+    const end = DateTime.fromISO(endYMD, { zone: APP_TIMEZONE }).endOf('day');
 
+    if (!start.isValid || !end.isValid) {
+      logger.warn("[API_HELPER] Datas inválidas", { fromRaw, toRaw, start: start.invalidReason, end: end.invalidReason });
+      return undefined;
+    }
+
+    return {
+      gte: start.toUTC().toJSDate(),
+      lte: end.toUTC().toJSDate(),
+    };
   } catch (error) {
     logger.error('[API_HELPER] Falha ao analisar as datas', { fromRaw, toRaw, error });
     return undefined;
@@ -50,7 +79,7 @@ export function normalizeApiDateRange(fromRaw: any, toRaw: any): { gte?: Date; l
 }
 
 /**
- * Converte um objeto Date para uma string de data local no formato 'yyyy-LL-dd HH:mm:ss'.
+ * Converte um objeto Date para uma string de data local (SP) no formato 'yyyy-LL-dd HH:mm:ss'.
  */
 export const toLocalDateStr = (d: Date) =>
   DateTime.fromJSDate(d).setZone(APP_TIMEZONE).toFormat("yyyy-LL-dd HH:mm:ss");

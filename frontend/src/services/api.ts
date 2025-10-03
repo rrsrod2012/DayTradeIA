@@ -2,14 +2,9 @@
 // FILE: frontend/src/services/api.ts
 // ===============================
 // Frontend API client — daytrade-ia
-// frontend/src/services/api.ts
-
-// A URL base agora é desnecessária, pois o proxy cuidará do redirecionamento.
-// const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3002";
 
 // Comparação detalhada: Simulado vs Real
 export async function getBrokerComparison(tradeId: number) {
-  // A chamada agora usa um caminho relativo
   return jsonFetch<any>(`/admin/broker/compare-detailed?tradeId=${tradeId}`, {
     method: "GET",
   });
@@ -35,7 +30,7 @@ export type ProjectedSignal = {
   probCalibrated?: number | null;
   expectedValuePoints?: number | null;
   time?: string; // ISO
-  date?: string | null; // YYYY-MM-DD no local (ou do backend)
+  date?: string | null; // YYYY-MM-DD
 };
 
 export type ConfirmedSignal = {
@@ -58,11 +53,11 @@ export type ProjectedSignalsParams = {
   requireMtf?: boolean;
   confirmTf?: string;
 
-  // >>> novos (pass-through; backend pode ignorar sem quebrar)
+  // pass-through opcionais
   bbEnabled?: number | boolean;
   bbPeriod?: number;
   bbK?: number;
-  candlePatterns?: string; // "engulfing,hammer,star,doji"
+  candlePatterns?: string;
 };
 
 export type ExecPeekResponse = {
@@ -94,7 +89,7 @@ declare global {
       pointValueBySymbol?: Record<string, number>;
       defaultRiskPoints?: number;
       brokerSymbolMap?: Record<string, string>;
-      tickSizeBySymbol?: Record<string, number>; // usado para converter preços→pontos se necessário
+      tickSizeBySymbol?: Record<string, number>;
     };
   }
 }
@@ -109,12 +104,12 @@ export type BacktestTradeDTO = {
   exitTime: string;
   entryPrice: number;
   exitPrice: number;
-  pnl?: number;          // alguns backends mandam "pnl"
-  pnlPoints?: number;    // outros mandam "pnlPoints"
-  note?: string | null;  // motivo/nota direta
-  reason?: string | null; // alias usado por alguns payloads
-  conditionText?: string | null; // outro alias possível
-  comment?: string | null;       // outro alias possível
+  pnl?: number;
+  pnlPoints?: number;
+  note?: string | null;
+  reason?: string | null;
+  conditionText?: string | null;
+  comment?: string | null;
   movedToBE?: boolean;
   trailEvents?: number;
 };
@@ -149,34 +144,11 @@ export type BacktestDTO = {
   config?: any;
 };
 
-/* ===============================
-   Bases/URLs - REMOVIDAS
-   =============================== */
-// const API_BASE, EXEC_BASE, ML_BASE foram removidos para forçar o uso de caminhos relativos via proxy.
-
 /** --------- Helpers --------- */
 function normalizeSide(val: any): "BUY" | "SELL" | "FLAT" {
   const s = String(val ?? "").trim().toUpperCase();
-  if (
-    s === "SELL" ||
-    s === "SHORT" ||
-    s === "S" ||
-    s === "-1" ||
-    s === "DOWN" ||
-    s.includes("SELL") ||
-    s.includes("SHORT")
-  )
-    return "SELL";
-  if (
-    s === "BUY" ||
-    s === "LONG" ||
-    s === "B" ||
-    s === "1" ||
-    s === "UP" ||
-    s.includes("BUY") ||
-    s.includes("LONG")
-  )
-    return "BUY";
+  if (s === "SELL" || s === "SHORT" || s === "S" || s === "-1" || s === "DOWN" || s.includes("SELL") || s.includes("SHORT")) return "SELL";
+  if (s === "BUY" || s === "LONG" || s === "B" || s === "1" || s === "UP" || s.includes("BUY") || s.includes("LONG")) return "BUY";
   if (s === "FLAT" || s === "NEUTRAL" || s === "0") return "FLAT";
   return "BUY";
 }
@@ -200,47 +172,94 @@ function ymdLocalFromISO(iso?: string): string | null {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-// <<<<<<< FUNÇÃO DE FETCH CORRIGIDA >>>>>>>>
-async function jsonFetch<T>(
-  url: string, // URL agora é sempre um caminho relativo, ex: /api/trades
-  init?: RequestInit
-): Promise<T> {
-  // A URL completa é montada pelo navegador, e o proxy do Vite irá interceptá-la
+/** Normaliza date-only para 'YYYY-MM-DD'. Aceita 'YYYY-MM-DD' e 'DD/MM/YYYY'. */
+function normalizeDateOnly(input?: string): string | undefined {
+  if (!input) return undefined;
+  const s = String(input).trim();
+  if (!s) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    const yyyy = parseInt(m[3], 10);
+    if (dd > 31 || mm > 12) return undefined;
+    return `${yyyy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+  }
+  return s;
+}
+
+/** Data de hoje no fuso 'America/Sao_Paulo' como 'YYYY-MM-DD' */
+function todayYMD_SaoPaulo(): string {
+  try {
+    const fmt = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const parts = fmt.formatToParts(new Date());
+    const d = Object.fromEntries(parts.map(p => [p.type, p.value]));
+    return `${d.year}-${d.month}-${d.day}`;
+  } catch {
+    // fallback: local
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+}
+
+/** Expande 'YYYY-MM-DD' para ISO com timezone local (-03:00) */
+function expandLocalDate(dateStr: string | undefined, kind: 'start' | 'end'): string | undefined {
+  if (!dateStr) return undefined;
+  const s = String(dateStr).trim();
+  if (s.includes("T")) return s;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return s;
+  const [_, y, mm, dd] = m;
+  return kind === 'start'
+    ? `${y}-${mm}-${dd}T00:00:00.000-03:00`
+    : `${y}-${mm}-${dd}T23:59:59.999-03:00`;
+}
+
+/** Log helper (sempre visível) */
+function logWithStack(tag: string, payload: any) {
+  // eslint-disable-next-line no-console
+  console.log(tag, payload);
+  try { throw new Error("TRACE"); } catch (e: any) {
+    const stack = e?.stack?.split("\n").slice(2, 8).join("\n");
+    // eslint-disable-next-line no-console
+    console.log(tag + " stack:", stack);
+  }
+}
+
+// --------- Fetch base ---------
+async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, {
     headers: { "content-type": "application/json", ...(init?.headers || {}) },
     credentials: "omit",
-    mode: "cors", // 'cors' é necessário para requisições entre portas diferentes (mesmo com proxy)
+    mode: "cors",
     cache: "no-cache",
     ...init,
   });
-
   const txt = await resp.text();
   const data = txt ? JSON.parse(txt) : null;
-  const backendErr =
-    data && typeof data === "object" && "ok" in data && (data as any).ok === false;
+  const backendErr = data && typeof data === "object" && "ok" in data && (data as any).ok === false;
 
   if (!resp.ok || backendErr) {
-    const msg =
-      (backendErr && ((data as any).error || "Erro na API")) ||
-      `HTTP ${resp.status} ${resp.statusText}`;
+    const msg = (backendErr && ((data as any).error || "Erro na API")) || `HTTP ${resp.status} ${resp.statusText}`;
     const err: any = new Error(msg);
     (err as any).response = data ?? txt;
     (err as any).status = resp.status;
     (err as any).urlTried = url;
     throw err;
   }
-  if (process.env.NODE_ENV !== "production") {
-    // eslint-disable-next-line no-console
-    console.debug("[api] ok", { url: url, init });
-  }
+  // eslint-disable-next-line no-console
+  console.log("[api] ok", { url, init });
   return data as T;
 }
-
 
 export type { ProjectedSignalsParams };
 
 /* =========================
-   Runtime Config (NOVO)
+   Runtime Config
    ========================= */
 export type RuntimeConfigPayload = Partial<{
   uiTimeframe: "M1" | "M5" | "M15" | "M30" | "H1";
@@ -255,11 +274,8 @@ export type RuntimeConfigPayload = Partial<{
 }>;
 
 export async function getRuntimeConfig(): Promise<{ ok: boolean; config: RuntimeConfigPayload }> {
-  return jsonFetch<{ ok: boolean; config: RuntimeConfigPayload }>("/admin/runtime-config", {
-    method: "GET",
-  });
+  return jsonFetch<{ ok: boolean; config: RuntimeConfigPayload }>("/admin/runtime-config", { method: "GET" });
 }
-
 export async function saveRuntimeConfig(patch: RuntimeConfigPayload): Promise<{ ok: boolean; config: RuntimeConfigPayload }> {
   return jsonFetch<{ ok: boolean; config: RuntimeConfigPayload }>("/admin/runtime-config", {
     method: "POST",
@@ -268,12 +284,8 @@ export async function saveRuntimeConfig(patch: RuntimeConfigPayload): Promise<{ 
 }
 
 export async function getAiNodeConfig(): Promise<{ ok?: boolean; config?: RuntimeConfigPayload }> {
-  // Esta chamada para outro serviço precisaria de uma configuração de proxy separada se não estiver no mesmo backend
-  // Por enquanto, vamos assumir que não é usada ou que o ML_BASE está configurado corretamente no ambiente
   const ML_BASE = String(((import.meta as any).env?.VITE_ML_URL ?? "") || "").replace(/\/$/, "");
   if (!ML_BASE) return { ok: false, config: undefined };
-
-  // A função jsonFetch não serve para chamadas a bases diferentes, então criamos uma fetch direta
   const resp = await fetch(`${ML_BASE}/config`, { method: "GET" });
   return resp.json();
 }
@@ -281,36 +293,36 @@ export async function getAiNodeConfig(): Promise<{ ok?: boolean; config?: Runtim
 /* =========================
    Signals
    ========================= */
-export async function projectedSignals(
-  params: ProjectedSignalsParams
-): Promise<ProjectedSignal[]> {
+export async function projectedSignals(params: ProjectedSignalsParams): Promise<ProjectedSignal[]> {
+  // normaliza e aplica fallback
+  let from = normalizeDateOnly(params.from);
+  let to = normalizeDateOnly(params.to);
+  if (!from || !to) {
+    const today = todayYMD_SaoPaulo();
+    from = from || today;
+    to = to || today;
+    logWithStack("[api] WARN projectedSignals without from/to — applying fallback(today SP)", { from, to, raw: { fromRaw: params.from, toRaw: params.to } });
+  } else {
+    logWithStack("[api] POST /api/signals/projected body", { ...params, from, to });
+  }
+
   const raw = await jsonFetch<any>("/api/signals/projected", {
     method: "POST",
-    body: JSON.stringify(params),
+    body: JSON.stringify({ ...params, from, to }),
   });
 
   const arr: any[] =
-    (Array.isArray(raw) && raw) ||
-    raw?.data ||
-    raw?.rows ||
-    raw?.signals ||
-    raw?.items ||
-    [];
+    (Array.isArray(raw) && raw) || raw?.data || raw?.rows || raw?.signals || raw?.items || [];
 
   return arr.map((s) => {
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
     const iso = toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime);
     const date = s.date ?? (iso ? ymdLocalFromISO(iso) : null);
     const num = (v: any) => (v === undefined || v === null ? null : Number(v));
-    let evRaw =
-      s.expectedValuePoints ?? s.ev ?? s.expectedValue ?? s.expected_value ?? null;
+    let evRaw = s.expectedValuePoints ?? s.ev ?? s.expectedValue ?? s.expected_value ?? null;
     evRaw = evRaw === null || evRaw === undefined ? null : Number(evRaw);
-    let expectedValuePoints: number | null =
-      evRaw === null || !Number.isFinite(evRaw) ? null : evRaw;
-    // deixamos EV sempre positivo no frontend para SELL também (magnitude)
-    if (expectedValuePoints !== null && side === "SELL") {
-      expectedValuePoints = Math.abs(expectedValuePoints);
-    }
+    let expectedValuePoints: number | null = evRaw === null || !Number.isFinite(evRaw) ? null : evRaw;
+    if (expectedValuePoints !== null && side === "SELL") expectedValuePoints = Math.abs(expectedValuePoints);
     return {
       side,
       suggestedEntry: num(s.suggestedEntry ?? s.entry),
@@ -333,45 +345,41 @@ export async function fetchConfirmedSignals(params: {
   from?: string;
   to?: string;
   limit?: number;
-
-  // >>> novos (apenas para alinhamento visual/legendas; o backend pode ignorar)
   slPoints?: number;
   tpPoints?: number;
 }): Promise<ConfirmedSignal[]> {
   const q = new URLSearchParams();
   q.set("symbol", params.symbol.toUpperCase());
   q.set("timeframe", params.timeframe.toUpperCase());
-  if (params.from) q.set("from", params.from);
-  if (params.to) q.set("to", params.to);
+
+  let from = normalizeDateOnly(params.from);
+  let to = normalizeDateOnly(params.to);
+  if (!from || !to) {
+    const today = todayYMD_SaoPaulo();
+    from = from || today;
+    to = to || today;
+    logWithStack("[api] WARN GET /api/signals without from/to — applying fallback(today SP)", { from, to, raw: { fromRaw: params.from, toRaw: params.to } });
+  }
+  q.set("from", from);
+  q.set("to", to);
+
   if (params.limit) q.set("limit", String(params.limit));
   if (params.slPoints != null) q.set("slPoints", String(params.slPoints));
   if (params.tpPoints != null) q.set("tpPoints", String(params.tpPoints));
 
-  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, {
-    method: "GET",
-  });
+  logWithStack("[api] GET /api/signals", { qs: q.toString() });
+
+  const raw = await jsonFetch<any>(`/api/signals?${q.toString()}`, { method: "GET" });
 
   const arr: any[] =
-    (Array.isArray(raw) && raw) ||
-    raw?.data ||
-    raw?.rows ||
-    raw?.signals ||
-    raw?.items ||
-    [];
+    (Array.isArray(raw) && raw) || raw?.data || raw?.rows || raw?.signals || raw?.items || [];
 
   return arr.map((s) => {
     const side = normalizeSide(s.side ?? s.direction ?? s.type ?? s.signalSide);
-    const iso =
-      toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ??
-      new Date().toISOString();
+    const iso = toISO(s.time ?? s.timestamp ?? s.date ?? s.datetime) ?? new Date().toISOString();
     const price = s.price ?? s.entry ?? s.value ?? s.execPrice ?? null;
     const note = s.note ?? s.reason ?? s.conditionText ?? s.comment ?? null;
-    return {
-      side,
-      time: iso,
-      price: price != null ? Number(price) : null,
-      note,
-    };
+    return { side, time: iso, price: price != null ? Number(price) : null, note };
   });
 }
 
@@ -385,18 +393,8 @@ export type BacktestTradeNormalized = BacktestTradeDTO & {
 };
 
 function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeNormalized {
-  const pnlPoints =
-    Number.isFinite(t.pnlPoints as any)
-      ? Number(t.pnlPoints)
-      : Number(t.pnl ?? 0);
-
-  const noteRaw =
-    t.note ??
-    t.reason ??
-    t.conditionText ??
-    t.comment ??
-    null;
-
+  const pnlPoints = Number.isFinite(t.pnlPoints as any) ? Number(t.pnlPoints) : Number(t.pnl ?? 0);
+  const noteRaw = t.note ?? t.reason ?? t.conditionText ?? t.comment ?? null;
   return {
     id: t.id ?? idx + 1,
     side: t.side,
@@ -404,11 +402,10 @@ function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeNormal
     exitTime: t.exitTime,
     entryPrice: Number(t.entryPrice),
     exitPrice: Number(t.exitPrice),
-    pnlPoints, // garantido
+    pnlPoints,
     note: noteRaw && String(noteRaw).trim() !== "" ? String(noteRaw).trim() : null,
     movedToBE: !!t.movedToBE,
     trailEvents: t.trailEvents ?? 0,
-    // campos originais mantidos:
     pnl: t.pnl ?? pnlPoints,
     reason: t.reason ?? null,
     conditionText: t.conditionText ?? null,
@@ -417,21 +414,11 @@ function mapBacktestTrade(t: BacktestTradeDTO, idx: number): BacktestTradeNormal
 }
 
 function normalizeBacktestPayload(raw: any): BacktestDTO {
-  const dto: any =
-    (raw && raw.data && typeof raw.data === "object" && raw.data) ||
-    raw;
-
-  const tradesArr: any[] =
-    (Array.isArray(dto?.trades) && dto.trades) ||
-    dto?.items ||
-    dto?.rows ||
-    [];
-
+  const dto: any = (raw && raw.data && typeof raw.data === "object" && raw.data) || raw;
+  const tradesArr: any[] = (Array.isArray(dto?.trades) && dto.trades) || dto?.items || dto?.rows || [];
   const trades = tradesArr.map(mapBacktestTrade);
-
   const pnlPointsTop = Number(dto?.pnlPoints ?? dto?.summary?.pnlPoints ?? 0);
   const pnlMoneyTop = Number(dto?.pnlMoney ?? 0);
-
   return {
     ok: dto?.ok !== false,
     id: String(dto?.id ?? `run-${Date.now()}`),
@@ -463,9 +450,6 @@ function normalizeBacktestPayload(raw: any): BacktestDTO {
   };
 }
 
-/** ===========================
- * Backtest com política completa
- * =========================== */
 export async function runBacktest(params: {
   symbol: string; timeframe: string; from?: string; to?: string;
   pointValue?: number; costPts?: number; slippagePts?: number; lossCap?: number; maxConsecLosses?: number;
@@ -475,23 +459,19 @@ export async function runBacktest(params: {
   vwapFilter?: boolean; bbEnabled?: boolean; bbPeriod?: number; bbK?: number; candlePatterns?: string;
   slPoints?: number; tpPoints?: number; tpViaRR?: boolean;
 }): Promise<BacktestDTO> {
-  const raw = await jsonFetch<any>('/api/backtest', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
+  const raw = await jsonFetch<any>('/api/backtest', { method: 'POST', body: JSON.stringify(params) });
   return normalizeBacktestPayload(raw);
 }
 
-/** (opcional) lista execuções de backtest salvas */
 export async function fetchBacktestRuns(limit = 100) {
   const q = new URLSearchParams();
   q.set("limit", String(limit));
   return jsonFetch<any>(`/api/backtest/runs?${q.toString()}`, { method: "GET" });
 }
 
-/** ===========================
- * Candles
- * =========================== */
+/* =========================
+   Candles
+   ========================= */
 export async function fetchCandles(params: {
   symbol: string;
   timeframe: string;
@@ -502,9 +482,23 @@ export async function fetchCandles(params: {
   const q = new URLSearchParams();
   q.set("symbol", params.symbol.toUpperCase());
   q.set("timeframe", params.timeframe.toUpperCase());
-  if (params.from) q.set("from", params.from);
-  if (params.to) q.set("to", params.to);
+
+  // normaliza e aplica fallback (evita “janeiro” sem filtro)
+  let from = normalizeDateOnly(params.from);
+  let to = normalizeDateOnly(params.to);
+  if (!from || !to) {
+    const today = todayYMD_SaoPaulo();
+    from = from || today;
+    to = to || today;
+    logWithStack("[api] WARN GET /api/candles without from/to — applying fallback(today SP)", { from, to, raw: { fromRaw: params.from, toRaw: params.to } });
+  }
+  q.set("from", from);
+  q.set("to", to);
+
   if (params.limit) q.set("limit", String(params.limit));
+
+  logWithStack("[api] GET /api/candles", { qs: q.toString() });
+
   return jsonFetch<Candle[]>(`/api/candles?${q.toString()}`, { method: "GET" });
 }
 
@@ -517,9 +511,10 @@ function mapSymbolForBroker(sym: string): string {
   if (fromWin) return fromWin;
   const envKey = `VITE_BROKER_SYMBOL_${s}`;
   const env: any = (import.meta as any)?.env ?? {};
-  const fromEnv = env[envKey] ?? env[envKey.toUpperCase()];
+  const upperKey = envKey.toUpperCase();
+  const fromEnv = env[envKey] ?? env[upperKey];
   if (fromEnv) return String(fromEnv);
-  return s; // fallback: usa como está
+  return s;
 }
 
 /* =========================
@@ -529,30 +524,19 @@ export async function execEnable(on?: boolean) {
   const qs = on === undefined ? "" : `?on=${on ? "1" : "0"}`;
   return jsonFetch<any>(`/enable${qs}`, { method: "GET" });
 }
-
 export async function execPeek(agentId: string): Promise<ExecPeekResponse> {
   const q = new URLSearchParams();
   q.set("agentId", agentId || "mt5-ea-1");
-  return jsonFetch<ExecPeekResponse>(`/debug/peek?${q.toString()}`, {
-    method: "GET",
-  });
+  return jsonFetch<ExecPeekResponse>(`/debug/peek?${q.toString()}`, { method: "GET" });
 }
-
 export async function execStats(): Promise<ExecStatsResponse> {
-  return jsonFetch<ExecStatsResponse>("/debug/stats", {
-    method: "GET",
-  });
+  return jsonFetch<ExecStatsResponse>("/debug/stats", { method: "GET" });
 }
-
 export async function execHistory(agentId: string): Promise<ExecHistoryResponse> {
   const q = new URLSearchParams();
   q.set("agentId", agentId || "mt5-ea-1");
-  return jsonFetch<ExecHistoryResponse>(
-    `/debug/history?${q.toString()}`,
-    { method: "GET" }
-  );
+  return jsonFetch<ExecHistoryResponse>(`/debug/history?${q.toString()}`, { method: "GET" });
 }
-
 export async function execPollNoop(agentId: string, max = 10) {
   return jsonFetch<any>(`/poll?noop=1`, {
     method: "POST",
@@ -562,7 +546,7 @@ export async function execPollNoop(agentId: string, max = 10) {
 }
 
 /* =========================
-   Enfileirar ordem p/ MT5 (EA NodeBridge)
+   Enfileirar ordem p/ MT5
    ========================= */
 export async function enqueueMT5Order(
   input:
@@ -574,7 +558,7 @@ export async function enqueueMT5Order(
         comment?: string;
         beAtPoints?: number | null;
         beOffsetPoints?: number | null;
-        symbol?: string; // opcional
+        symbol?: string;
         timeframe?: any;
         time?: any;
         price?: number | null;
@@ -597,19 +581,15 @@ export async function enqueueMT5Order(
       tp?: number | null;
     }
 ) {
-  // Se já veio no formato {agentId, tasks:[...]} apenas encaminha
   if ((input as any)?.tasks && Array.isArray((input as any).tasks)) {
     const envelope = {
       agentId: (input as any).agentId ?? "mt5-ea-1",
       tasks: (input as any).tasks.map((t: any) => ({
-        id:
-          t.id ??
-          `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: t.id ?? `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         side: t.side,
         comment: t.comment ?? "",
         beAtPoints: t.beAtPoints ?? null,
         beOffsetPoints: t.beOffsetPoints ?? null,
-        // SÓ envie symbol se for o código real do MT5 (ex.: WINV25). Caso contrário, omita:
         ...(t.symbol ? { symbol: mapSymbolForBroker(t.symbol) } : {}),
         timeframe: t.timeframe ?? null,
         time: t.time ?? null,
@@ -619,26 +599,17 @@ export async function enqueueMT5Order(
         tpPoints: t.tpPoints ?? null,
       })),
     };
-
     return jsonFetch<any>("/enqueue", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(envelope),
     });
   }
 
-  // Caso contrário, monta uma task única no formato esperado pelo EA
   const p: any = input || {};
   const lots = p.volume ?? p.lots ?? 1;
-
-  // Por padrão, NÃO mandamos symbol (o EA usa _Symbol). Se quiser muito enviar,
-  // garanta que mapSymbolForBroker retorne o código exato do book no MT5:
   const mapped = p.symbol ? mapSymbolForBroker(String(p.symbol)) : null;
-  const maybeSymbol =
-    mapped && mapped !== String(p.symbol).toUpperCase() ? mapped : null;
+  const maybeSymbol = mapped && mapped !== String(p.symbol).toUpperCase() ? mapped : null;
 
   const task = {
     id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -646,7 +617,7 @@ export async function enqueueMT5Order(
     comment: p.comment ?? "",
     beAtPoints: p.beAtPoints ?? null,
     beOffsetPoints: p.beOffsetPoints ?? null,
-    ...(maybeSymbol ? { symbol: maybeSymbol } : {}), // OMIT se não tiver certeza
+    ...(maybeSymbol ? { symbol: maybeSymbol } : {}),
     timeframe: null,
     time: null,
     price: 0,
@@ -655,11 +626,7 @@ export async function enqueueMT5Order(
     tpPoints: null,
   };
 
-  const envelope = {
-    agentId: p.agentId ?? "mt5-ea-1",
-    tasks: [task],
-  };
-
+  const envelope = { agentId: p.agentId ?? "mt5-ea-1", tasks: [task] };
   return jsonFetch<any>("/enqueue", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -668,7 +635,7 @@ export async function enqueueMT5Order(
 }
 
 /* =========================
-   (NOVO) /api/trades (diagnóstico rápido)
+   /api/trades
    ========================= */
 export type TradeRow = {
   id: number;
@@ -678,30 +645,15 @@ export type TradeRow = {
   side: "BUY" | "SELL" | null;
   entrySignalId: number | null;
   exitSignalId: number | null;
-  taskId?: string | null; // <- pode vir do backend (quando existir)
+  taskId?: string | null;
   entryPrice: number | null;
   exitPrice: number | null;
   pnlPoints: number | null;
   pnlMoney: number | null;
-  entryTime: string | null; // ISO
-  exitTime: string | null;  // ISO
+  entryTime: string | null;
+  exitTime: string | null;
 };
 
-
-// Helper: expand date-only (YYYY-MM-DD) to ISO with local timezone (-03:00)
-// kind = 'start' => 00:00:00, 'end' => 23:59:59.999
-function expandLocalDate(dateStr: string | undefined, kind: 'start' | 'end'): string | undefined {
-  if (!dateStr) return undefined;
-  const s = String(dateStr).trim();
-  // if already contains 'T', assume it's full ISO
-  if (s.includes("T")) return s;
-  // match YYYY-MM-DD
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return s;
-  const [_, y, mm, dd] = m;
-  if (kind === 'start') return `${y}-${mm}-${dd}T00:00:00.000-03:00`;
-  return `${y}-${mm}-${dd}T23:59:59.999-03:00`;
-}
 export async function fetchTrades(params: {
   symbol?: string;
   timeframe?: string;
@@ -712,9 +664,16 @@ export async function fetchTrades(params: {
   const q = new URLSearchParams();
   if (params.symbol) q.set("symbol", params.symbol.toUpperCase());
   if (params.timeframe) q.set("timeframe", params.timeframe.toUpperCase());
-  if (params.from) q.set("from", expandLocalDate(params.from, "start") as string);
-  if (params.to) q.set("to", expandLocalDate(params.to, "end") as string);
+
+  const from = expandLocalDate(normalizeDateOnly(params.from) ?? todayYMD_SaoPaulo(), "start")!;
+  const to = expandLocalDate(normalizeDateOnly(params.to) ?? todayYMD_SaoPaulo(), "end")!;
+
+  q.set("from", from);
+  q.set("to", to);
   if (params.limit) q.set("limit", String(params.limit));
+
+  logWithStack("[api] GET /api/trades", { qs: q.toString() });
+
   const raw = await jsonFetch<any>(`/api/trades?${q.toString()}`, { method: "GET" });
   const arr: any[] = Array.isArray(raw) ? raw : (raw?.data || raw?.rows || []);
   return arr.map((t: any) => ({
@@ -736,19 +695,19 @@ export async function fetchTrades(params: {
 }
 
 /* =========================
-   (NOVO) /api/order-logs (ligação tarefa↔ordem)
+   /api/order-logs
    ========================= */
 export type OrderLogEntry = {
-  at: string | null;         // ISO
+  at: string | null;
   taskId: string | null;
   entrySignalId: number | null;
-  level: string | null;      // "info" | "warn" | "error" | ...
-  type: string | null;       // "order_ok" | "order_fail" | "market_closed" | ...
+  level: string | null;
+  type: string | null;
   message: string | null;
   data: any | null;
   symbol: string | null;
   price: number | null;
-  brokerOrderId: string | null; // ticket/ordem no broker (quando houver)
+  brokerOrderId: string | null;
 };
 
 export async function fetchOrderLogs(key: string | number, limit = 300): Promise<{
@@ -761,5 +720,6 @@ export async function fetchOrderLogs(key: string | number, limit = 300): Promise
   const q = new URLSearchParams();
   q.set("taskId", String(key));
   q.set("limit", String(limit));
+  logWithStack("[api] GET /api/order-logs", { qs: q.toString() });
   return jsonFetch<any>(`/api/order-logs?${q.toString()}`, { method: "GET" });
 }

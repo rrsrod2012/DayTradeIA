@@ -15,48 +15,50 @@ const tfToMinutes = (tf: string): number => {
 export async function loadCandlesAnyTF(
   symbol: string,
   timeframe: string,
-  range?: { gte?: Date, lte?: Date, limit?: number }
+  range?: { gte?: Date; lte?: Date; limit?: number }
 ): Promise<Candle[]> {
   const tfUpper = timeframe.toUpperCase();
 
-  // Se o timeframe pedido for M1, busca diretamente no banco.
-  if (tfUpper === 'M1') {
-    const instrument = await prisma.instrument.findUnique({ where: { symbol } });
-    if (!instrument) return [];
+  // Busca instrumento
+  const instrument = await prisma.instrument.findUnique({ where: { symbol } });
+  if (!instrument) return [];
 
+  // WHERE base (com janela de tempo se fornecida)
+  const baseWhere: any = {
+    instrumentId: instrument.id,
+    timeframe: 'M1',
+  };
+  if (range?.gte || range?.lte) {
+    baseWhere.time = {};
+    if (range?.gte) baseWhere.time.gte = range.gte;
+    if (range?.lte) baseWhere.time.lte = range.lte;
+  }
+
+  // Se o timeframe pedido for M1, busca diretamente no banco com os filtros
+  if (tfUpper === 'M1') {
     return prisma.candle.findMany({
-      where: {
-        instrumentId: instrument.id,
-        timeframe: 'M1',
-        ...(range?.gte && { time: { gte: range.gte } }),
-        ...(range?.lte && { time: { lte: range.lte } }),
-      },
+      where: baseWhere,
       orderBy: { time: 'asc' },
       take: range?.limit,
     });
   }
 
-  // Se for outro timeframe, busca a base M1 para agregar.
-  const instrument = await prisma.instrument.findUnique({ where: { symbol } });
-  if (!instrument) return [];
-
+  // Caso contrário, busca M1 e agrega no cliente
   const m1Candles = await prisma.candle.findMany({
-    where: {
-      instrumentId: instrument.id,
-      timeframe: 'M1',
-      ...(range?.gte && { time: { gte: range.gte } }),
-      ...(range?.lte && { time: { lte: range.lte } }),
-    },
+    where: baseWhere,
     orderBy: { time: 'asc' },
   });
 
   if (m1Candles.length === 0) return [];
 
+  // Agregação para o timeframe alvo
   const targetMinutes = tfToMinutes(tfUpper);
-  const aggregated = new Map<number, Partial<Candle>>();
+  const bucketMs = targetMinutes * 60 * 1000;
 
+  const aggregated = new Map<number, any>();
   for (const c of m1Candles) {
-    const bucketTime = Math.floor(c.time.getTime() / (targetMinutes * 60 * 1000)) * (targetMinutes * 60 * 1000);
+    const t = new Date(c.time).getTime();
+    const bucketTime = Math.floor(t / bucketMs) * bucketMs;
 
     if (!aggregated.has(bucketTime)) {
       aggregated.set(bucketTime, {
