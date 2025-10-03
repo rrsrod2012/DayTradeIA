@@ -8,12 +8,13 @@ datasource db {
 }
 
 model Instrument {
-  id        Int           @id @default(autoincrement())
-  symbol    String        @unique
-  name      String
-  backtests BacktestRun[]
-  candles   Candle[]
-  trades    Trade[]
+  id                Int                @id @default(autoincrement())
+  symbol            String             @unique
+  name              String
+  backtests         BacktestRun[]
+  candles           Candle[]
+  trades            Trade[]
+  processingCursors ProcessingCursor[] // back-relation
 }
 
 model Candle {
@@ -51,25 +52,25 @@ model Pattern {
 }
 
 model Signal {
-  id         Int     @id @default(autoincrement())
+  id         Int    @id @default(autoincrement())
   candleId   Int
   signalType String
   side       String
-  score      Float?
-  reason     String?
-  candle     Candle  @relation(fields: [candleId], references: [id])
-  exitOf     Trade[] @relation("ExitSignal")
-  entryOf    Trade[] @relation("EntrySignal")
+  meta       Json?
+  candle     Candle @relation(fields: [candleId], references: [id])
 
-  @@unique([candleId, signalType, side], name: "candleId_signalType_side")
-  @@index([candleId])
+  // Back-relations para Trade
+  entryOfTrades Trade[] @relation("EntrySignal")
+  exitOfTrades  Trade[] @relation("ExitSignal")
+
+  @@unique([candleId, signalType, side], name: "candle_signal_side_unique")
 }
 
 model Trade {
   id            Int          @id @default(autoincrement())
   instrumentId  Int
   timeframe     String
-  entrySignalId Int
+  entrySignalId Int          @unique // <<< campo único direto (estável no Client)
   exitSignalId  Int?
   qty           Int
   entryPrice    Float
@@ -78,9 +79,11 @@ model Trade {
   pnlMoney      Float?
   backtestRunId Int?
   backtestRun   BacktestRun? @relation(fields: [backtestRunId], references: [id])
-  exitSignal    Signal?      @relation("ExitSignal", fields: [exitSignalId], references: [id])
-  entrySignal   Signal       @relation("EntrySignal", fields: [entrySignalId], references: [id])
-  instrument    Instrument   @relation(fields: [instrumentId], references: [id])
+
+  exitSignal  Signal? @relation("ExitSignal", fields: [exitSignalId], references: [id])
+  entrySignal Signal  @relation("EntrySignal", fields: [entrySignalId], references: [id])
+
+  instrument Instrument @relation(fields: [instrumentId], references: [id])
 }
 
 model BacktestRun {
@@ -99,19 +102,7 @@ model TrainingRun {
   id         Int              @id @default(autoincrement())
   startedAt  DateTime         @default(now())
   finishedAt DateTime?
-  status     String
-  symbol     String?
-  timeframe  String?
-  lookback   Int?
-  horizon    Int?
-  slAtr      Float?
-  rr         Float?
-  epochs     Int?
-  batchSize  Int?
-  loss       Float?
-  accuracy   Float?
-  evMean     Float?
-  winRate    Float?
+  params     String
   notes      String?
   metrics    TrainingMetric[]
 }
@@ -128,20 +119,14 @@ model TrainingMetric {
 }
 
 model BrokerTask {
-  id             String    @id
-  agentId        String
-  side           String
-  symbol         String?
-  timeframe      String?
-  time           DateTime?
-  price          Int?
-  volume         Int?
-  slPoints       Int?
-  tpPoints       Int?
-  beAtPoints     Int?
-  beOffsetPoints Int?
-  comment        String?
-  createdAt      DateTime  @default(now())
+  id        String   @id
+  agentId   String
+  side      String
+  symbol    String?
+  timeframe String?
+  createdAt DateTime @default(now())
+  status    String?
+  payload   String?
 }
 
 model BrokerExecution {
@@ -158,4 +143,16 @@ model BrokerExecution {
   pnlPoints Int?
   raw       String?
   createdAt DateTime  @default(now())
+}
+
+// Cursor incremental por instrumento/timeframe
+model ProcessingCursor {
+  id                Int      @id @default(autoincrement())
+  instrumentId      Int
+  timeframe         String
+  lastProcessedTime DateTime
+
+  instrument Instrument @relation(fields: [instrumentId], references: [id])
+
+  @@unique([instrumentId, timeframe], name: "cursor_instrument_tf_unique")
 }
